@@ -161,9 +161,7 @@ impl Session {
         // bound that matters is CLIENT_QUEUE, on the channel after it.
         //
         // `Session::request_dump` is the second writer, and the browser drives
-        // it. The pump in `ws.rs` holds that writer to one send per
-        // `ws::DUMP_INTERVAL`, so a client that asks in a loop cannot make this
-        // channel grow either.
+        // it.
         let (commands, command_rx) = std::sync::mpsc::channel::<Command>();
         let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(CLIENT_QUEUE);
         let resync = Arc::new(AtomicBool::new(false));

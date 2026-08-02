@@ -4,7 +4,7 @@
  * The assertions read cells and the cursor from the terminal object.
  */
 
-import { expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
 import {
   cellAt,
   cursor,
@@ -16,9 +16,12 @@ import {
   withClient,
 } from "./harness";
 
+beforeEach(() => {
+  server().reset();
+});
+
 test("a 0x00 frame writes cells and moves the cursor", async () => {
   const stub = server();
-  stub.reset();
   stub.setOnOpen([{ tag: 0x00, text: "pirate\r\nsecond line\r\n" }]);
 
   await withClient(async (page) => {
@@ -30,7 +33,6 @@ test("a 0x00 frame writes cells and moves the cursor", async () => {
 
 test("cursor addressing puts the character in the given cell", async () => {
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     // CUP counts from 1. Row 5 and column 10 give the 0-based cell (9, 4).
@@ -43,7 +45,6 @@ test("cursor addressing puts the character in the given cell", async () => {
 
 test("the canvas holds paint after an output frame", async () => {
   const stub = server();
-  stub.reset();
   stub.setOnOpen([{ tag: 0x00, text: `${ESC}[32mgreen text${ESC}[0m` }]);
 
   await withClient(async (page) => {

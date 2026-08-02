@@ -6,8 +6,7 @@
    --pirate-error    the error text
    Each use gives a fallback from the palette of `style.css`. */
 
-body[data-auth="required"] #terminal,
-body[data-auth="required"] #status {
+body[data-auth="required"] #terminal {
   display: none;
 }
 

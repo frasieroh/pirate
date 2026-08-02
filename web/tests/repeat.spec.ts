@@ -10,10 +10,14 @@
  * generated.
  */
 
-import { expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
 import type { Page } from "playwright";
 import { clientState, framesWithTag, idle, menuState, server, waitFor, withClient } from "./harness";
 import type { Stub } from "./stub-server";
+
+beforeEach(() => {
+  server().reset();
+});
 
 /** The count of `0x00` frames the stub holds now. */
 function inputFrameCount(stub: Stub): number {
@@ -29,7 +33,6 @@ async function setRateByClicks(page: Page, buttonId: string, clicks: number): Pr
 
 test("a synthetic keydown with repeat true gives no frame", async () => {
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await page.focus("#terminal");
@@ -53,7 +56,6 @@ test("a synthetic keydown with repeat true gives no frame", async () => {
 
 test("the first repeat arrives after the delay, and not before", async () => {
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await page.focus("#terminal");
@@ -86,7 +88,6 @@ test("the first repeat arrives after the delay, and not before", async () => {
 
 test("a held key repeats at about the configured rate", async () => {
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await page.focus("#terminal");
@@ -118,7 +119,6 @@ test("a held key repeats at about the configured rate", async () => {
 
 test("a keyup stops the repeat", async () => {
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await page.focus("#terminal");
@@ -144,7 +144,6 @@ test("a keyup stops the repeat", async () => {
 
 test("a rate change in the menu changes the measured rate", async () => {
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await page.focus("#terminal");
@@ -187,9 +186,6 @@ test("a menu hotkey held down fires once, not many times", async () => {
   // more keydowns with `repeat` true, at the rate of the operating system.
   // This test dispatches that same sequence directly, on `window`, where
   // `src/keys.ts` attaches its one listener.
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     await page.focus("#terminal");
     expect(await menuState(page)).toBe("open");
@@ -225,7 +221,6 @@ test("an IME composition keydown arms no repeat", async () => {
   // and 800 ms later, from ghostty-web's own encoding of the synthetic
   // repeat that this module dispatched.
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await page.focus("#terminal");

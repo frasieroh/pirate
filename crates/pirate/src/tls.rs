@@ -5,8 +5,16 @@
 //! so TLS keeps TCP_NODELAY, keeps `axum::serve`, and keeps the graceful
 //! shutdown that `main.rs` gives it. A crate such as `axum-server` gives the
 //! same result, and it adds a dependency and a second accept loop.
+//!
+//! pirate completes every handshake and never refuses one for the name that
+//! the client asked for. This is a developer tool behind a browser, and the
+//! browser is what judges whether a certificate name matches the URL. With a
+//! supplied certificate, [`build`] therefore keeps a generated certificate
+//! ready and serves it for any name that the supplied certificate does not
+//! cover, so the handshake always completes and the browser shows its own
+//! warning for the name it does not trust.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +26,8 @@ use tokio_rustls::rustls::pki_types::pem::PemObject as _;
 use tokio_rustls::rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName,
 };
+use tokio_rustls::rustls::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
+use tokio_rustls::rustls::sign::CertifiedKey;
 use tokio_rustls::rustls::{self, ServerConfig};
 
 /// Handshakes that run at the same time.
@@ -67,11 +77,32 @@ pub enum TlsSource {
 /// under it and no operator can put one in a certificate by accident.
 const NAME_PROBE: &str = "pirate-reads-the-names.invalid";
 
-/// A server configuration, and the SHA-256 fingerprint of the leaf certificate.
+/// A server configuration, and the certificates that it can answer with.
+///
+/// With `--cert`, pirate serves two certificates: [`Self::supplied`] is the
+/// one the operator gave, and [`Self::selfsigned`] is the one it falls back to
+/// for a name the supplied certificate does not cover. In self-signed mode,
+/// [`Self::supplied`] is `None` and [`Self::selfsigned`] is the only
+/// certificate the server has.
 #[derive(Debug, Clone)]
 pub struct Tls {
     /// The configuration that [`TlsListener`] accepts connections with.
     pub config: Arc<ServerConfig>,
+    /// The certificate the operator supplied with `--cert` and `--key`.
+    ///
+    /// This is `None` in self-signed mode.
+    pub supplied: Option<CertReport>,
+    /// The certificate pirate generates at startup.
+    ///
+    /// The key exists in this process only. Nothing writes it to disk, so a
+    /// restart gives a new certificate and a new fingerprint.
+    pub selfsigned: CertReport,
+}
+
+/// One certificate that the server can serve, and what an operator reads about
+/// it.
+#[derive(Debug, Clone)]
+pub struct CertReport {
     /// Lowercase hexadecimal pairs, separated by colons.
     ///
     /// The value is the SHA-256 of the DER bytes of the leaf certificate. A
@@ -79,16 +110,12 @@ pub struct Tls {
     /// operator can compare the two strings.
     pub fingerprint: String,
     /// The leaf certificate, in DER.
-    ///
-    /// [`crate::auth::HostAllow`] reads the names of this certificate. The
-    /// names that the certificate covers are therefore the names that the
-    /// server answers to, and the operator declares them once.
     pub leaf: CertificateDer<'static>,
     /// Every name of [`Self::leaf`], read back from the certificate.
     ///
     /// The startup line prints this list. It is what the server serves and not
     /// what a generator was asked for, so the operator reads the truth even
-    /// when the two differ. [`build`] stops the server when the list is empty.
+    /// when the two differ.
     pub names: Vec<String>,
 }
 
@@ -104,21 +131,23 @@ pub struct Tls {
 /// common name and no subject alternative name gives an EMPTY list, because
 /// RFC 6125 reads names from that extension only.
 ///
+/// [`build`] calls this function once for the supplied certificate and once
+/// for the generated certificate, to report the names of each at startup.
+///
+/// The resolver does not call this function. [`NameAwareResolver::supplied_covers`]
+/// parses the leaf again and calls [`verify_server_name`] directly, once for
+/// every handshake.
+///
 /// # Errors
 ///
 /// The result is an error when the leaf does not parse, when the probe name
 /// does not parse, and when rustls answers the probe with anything other than
 /// a mismatch. No error holds a byte of the private key.
 pub fn certificate_names(leaf: &CertificateDer<'static>) -> Result<Vec<String>, String> {
-    // CAUTION: Keep this parse here. `crate::auth::HostAllow` parses the same
-    // leaf for every request, and it refuses the request when the parse fails.
-    // A certificate that rustls serves and this parser refuses would therefore
-    // answer 403 to every browser, with one hint line for the life of the
-    // process. A stop at startup names the fault once and names it loudly.
     let parsed = rustls::server::ParsedCertificate::try_from(leaf).map_err(|e| {
         format!(
             "pirate cannot read the names of the certificate: {e}. \
-             pirate answers to the names in the certificate, so it must read them"
+             pirate reports the names of every certificate that it serves, so it must read them"
         )
     })?;
     let probe = ServerName::try_from(NAME_PROBE)
@@ -136,7 +165,7 @@ pub fn certificate_names(leaf: &CertificateDer<'static>) -> Result<Vec<String>, 
         )) => Ok(presented.iter().map(|name| plain_name(name)).collect()),
         Err(e) => Err(format!(
             "pirate cannot read the names of the certificate: {e}. \
-             pirate answers to the names in the certificate, so it must read them"
+             pirate reports the names of every certificate that it serves, so it must read them"
         )),
     }
 }
@@ -171,73 +200,177 @@ fn plain_name(presented: &str) -> String {
 
 /// Build the TLS configuration from `source`.
 ///
+/// `bound` is the address that the listener already accepted its socket on.
+/// Call this function AFTER the bind, so a bind port of 0 has resolved to the
+/// real port before this function reads it. [`selfsigned_names`] puts the IP
+/// of `bound` into the generated certificate.
+///
 /// # Errors
 ///
 /// The result is an error when a file is missing, when a file holds no PEM
-/// item of the type that pirate needs, when the key does not match the
-/// certificate, when the leaf certificate does not parse, or when the leaf
-/// certificate carries no name. No error holds a byte of the private key.
-pub fn build(source: &TlsSource) -> Result<Tls, Box<dyn std::error::Error>> {
+/// item of the type that pirate needs, or when the key does not match the
+/// certificate. No error holds a byte of the private key.
+pub fn build(source: &TlsSource, bound: SocketAddr) -> Result<Tls, Box<dyn std::error::Error>> {
     // rustls takes one crypto provider for the whole process. A second call
     // returns an error and changes nothing, and the test binary calls this
     // function once per server, so the result is dropped here.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let (chain, key) = match source {
-        TlsSource::Files { cert, key } => from_files(cert, key)?,
-        TlsSource::SelfSigned => self_signed()?,
-    };
-
-    // `from_files` and `self_signed` both give at least one certificate, and
-    // the fingerprint covers the leaf, which is the first one.
-    let leaf = chain
+    // Every source needs a generated certificate: the self-signed source
+    // serves it to everyone, and a supplied certificate falls back to it for
+    // a name that certificate does not cover. TRAP 5: generate it once, here,
+    // and never inside the resolver that runs on every handshake.
+    let (selfsigned_chain, selfsigned_key) = self_signed(bound.ip())?;
+    let selfsigned_leaf = selfsigned_chain
         .first()
         .ok_or("the certificate chain is empty")?
         .clone();
-    let fingerprint = fingerprint(&leaf);
+    let selfsigned_report = CertReport {
+        fingerprint: fingerprint(&selfsigned_leaf),
+        names: certificate_names(&selfsigned_leaf)?,
+        leaf: selfsigned_leaf,
+    };
 
-    // Every source passes through this reader, and not `--selfsigned` alone.
-    // The operator supplies the certificate that carries no name.
-    let names = certificate_names(&leaf)?;
+    match source {
+        TlsSource::SelfSigned => {
+            let mut config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(selfsigned_chain, selfsigned_key)?;
+            config.alpn_protocols = alpn_protocols();
+            Ok(Tls {
+                config: Arc::new(config),
+                supplied: None,
+                selfsigned: selfsigned_report,
+            })
+        }
+        TlsSource::Files { cert, key } => {
+            let (chain, key) = from_files(cert, key)?;
+            let leaf = chain
+                .first()
+                .ok_or("the certificate chain is empty")?
+                .clone();
+            let names = certificate_names(&leaf)?;
 
-    // CAUTION: Keep this stop here. rustls serves a certificate that carries no
-    // name, and it never tests whether that certificate names a server. pirate
-    // reads its names from the same certificate, so it would answer 403 to
-    // every browser, with one hint line for the life of the process. `openssl
-    // req` without `-addext` writes exactly this shape. A stop at startup names
-    // the fault once and names it loudly.
-    if names.is_empty() {
-        return Err("this certificate carries no subject alternative name. \
-             pirate reads the names of the server from the subject alternative name extension. \
-             Supply a certificate that carries its names in that extension"
-            .into());
+            // A certificate with no name still gets served: the fallback
+            // certificate exists for exactly this. A browser refuses a
+            // certificate that carries no name for its URL, so this is a
+            // warning and not a stop.
+            if names.is_empty() {
+                eprintln!(
+                    "pirate: CAUTION: The supplied certificate carries no subject alternative \
+                     name. Browsers refuse this certificate for every name. pirate serves the \
+                     self-signed certificate for any name that does not match this certificate."
+                );
+            }
+
+            let provider = rustls::crypto::CryptoProvider::get_default()
+                .expect("the provider is installed above");
+            let supplied_certified = Arc::new(CertifiedKey::from_der(chain, key, provider)?);
+            let selfsigned_certified = Arc::new(CertifiedKey::from_der(
+                selfsigned_chain,
+                selfsigned_key,
+                provider,
+            )?);
+
+            let resolver = Arc::new(NameAwareResolver {
+                supplied: Arc::clone(&supplied_certified),
+                supplied_leaf: leaf.clone(),
+                fallback: selfsigned_certified,
+            });
+
+            let mut config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(resolver);
+            config.alpn_protocols = alpn_protocols();
+
+            Ok(Tls {
+                config: Arc::new(config),
+                supplied: Some(CertReport {
+                    fingerprint: fingerprint(&leaf),
+                    leaf,
+                    names,
+                }),
+                selfsigned: selfsigned_report,
+            })
+        }
     }
+}
 
-    let mut config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(chain, key)?;
+/// The one ALPN protocol that every TLS configuration offers.
+///
+/// CAUTION: Keep this list at one protocol, and keep that protocol
+/// `http/1.1`. An EMPTY list leaves the protocol of the connection to the
+/// client and to the defaults of two libraries, which is how a
+/// cross-protocol confusion starts. One name makes the transport
+/// deterministic, and a client that offers `h2` alone gets
+/// `no_application_protocol` instead of a socket.
+///
+/// This build speaks HTTP/1.1 and nothing else: axum 0.8 does not carry
+/// `http2` in its default set, `Cargo.toml` adds only the `ws` feature, and
+/// `Cargo.lock` holds no `h2` crate. The line still earns its place. A
+/// WebSocket over HTTP/2 needs the extended CONNECT method of RFC 8441, and
+/// pirate has never proven that path, so this pin is what stops a later
+/// change to the features from handing the socket to an HTTP/2 handler.
+fn alpn_protocols() -> Vec<Vec<u8>> {
+    vec![b"http/1.1".to_vec()]
+}
 
-    // CAUTION: Keep this list at one protocol, and keep that protocol
-    // `http/1.1`. An EMPTY list leaves the protocol of the connection to the
-    // client and to the defaults of two libraries, which is how a
-    // cross-protocol confusion starts. One name makes the transport
-    // deterministic, and a client that offers `h2` alone gets
-    // `no_application_protocol` instead of a socket.
-    //
-    // This build speaks HTTP/1.1 and nothing else: axum 0.8 does not carry
-    // `http2` in its default set, `Cargo.toml` adds only the `ws` feature, and
-    // `Cargo.lock` holds no `h2` crate. The line still earns its place. A
-    // WebSocket over HTTP/2 needs the extended CONNECT method of RFC 8441, and
-    // pirate has never proven that path, so this pin is what stops a later
-    // change to the features from handing the socket to an HTTP/2 handler.
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+/// Serves the supplied certificate for the name it covers, and a generated
+/// certificate for every other name.
+///
+/// TRAP 4: [`ResolvesServerCert::resolve`] aborts the handshake when it
+/// returns `None`. This resolver always has a certificate ready, so it never
+/// returns `None`.
+///
+/// TRAP 5: `resolve` runs inside every handshake, so it must stay cheap. Both
+/// certificates below are built once, at startup, in [`build`]. `resolve`
+/// only reads the SNI and picks between the two; it generates nothing.
+#[derive(Debug)]
+struct NameAwareResolver {
+    /// The certificate the operator supplied with `--cert`.
+    supplied: Arc<CertifiedKey>,
+    /// The leaf of [`Self::supplied`], parsed again on each handshake to
+    /// check the SNI against it. The parse reads bytes that are already in
+    /// memory; it holds no private key and it generates nothing.
+    supplied_leaf: CertificateDer<'static>,
+    /// The certificate pirate generates. Served for a name that
+    /// [`Self::supplied`] does not cover.
+    fallback: Arc<CertifiedKey>,
+}
 
-    Ok(Tls {
-        config: Arc::new(config),
-        fingerprint,
-        leaf,
-        names,
-    })
+impl ResolvesServerCert for NameAwareResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        // A client that sends no SNI has named no server. The operator asked
+        // for the supplied certificate, so that client gets it.
+        let Some(sni) = client_hello.server_name() else {
+            return Some(Arc::clone(&self.supplied));
+        };
+
+        if self.supplied_covers(sni) {
+            Some(Arc::clone(&self.supplied))
+        } else {
+            Some(Arc::clone(&self.fallback))
+        }
+    }
+}
+
+impl NameAwareResolver {
+    /// True when the supplied certificate covers `sni`.
+    ///
+    /// This runs the same match that a browser runs against a server,
+    /// through [`verify_server_name`]. It honors a wildcard name in the
+    /// supplied certificate exactly as rustls does, and it never returns an
+    /// error: a name it cannot parse, or a certificate it cannot parse,
+    /// simply does not match, and the caller falls back.
+    fn supplied_covers(&self, sni: &str) -> bool {
+        let Ok(name) = ServerName::try_from(sni) else {
+            return false;
+        };
+        let Ok(parsed) = ParsedCertificate::try_from(&self.supplied_leaf) else {
+            return false;
+        };
+        verify_server_name(&parsed, &name).is_ok()
+    }
 }
 
 /// The chain and the key from two PEM files.
@@ -284,10 +417,13 @@ fn pem_error(path: &Path, what: &str, error: &rustls::pki_types::pem::Error) -> 
 
 /// The names that a generated certificate carries.
 ///
-/// The browser matches the host that the operator typed against these names,
-/// and [`crate::auth::HostAllow`] accepts the same set, because it reads the
-/// certificate. The three loopback names cover every loopback form. The system
-/// hostname covers the name that the operator types from another machine.
+/// The browser matches the host that the operator typed against these names.
+/// The three loopback names cover every loopback form. `bound` is the address
+/// that the listener accepted its socket on, and it becomes an IP SAN when it
+/// names one machine. The system hostname covers the name that the operator
+/// types from another machine, and the wildcard form of that hostname covers
+/// every name under it, such as a name that a reverse proxy adds in front of
+/// pirate.
 ///
 /// `uname` gives `some-mac.local` on macOS, and the operator can type either
 /// that name or `some-mac`. Therefore the list holds both forms.
@@ -296,24 +432,37 @@ fn pem_error(path: &Path, what: &str, error: &rustls::pki_types::pem::Error) -> 
 /// prints a CAUTION that names the machine. The result then covers the loopback
 /// names only, and the server still starts.
 #[must_use]
-pub fn selfsigned_names() -> Vec<String> {
+pub fn selfsigned_names(bound: IpAddr) -> Vec<String> {
     let uname = rustix::system::uname();
     // A nodename that is not valid UTF-8 cannot be a certificate name either,
     // and the lossy form is what the CAUTION line prints.
-    names_for(&String::from_utf8_lossy(uname.nodename().to_bytes()))
+    names_for(&String::from_utf8_lossy(uname.nodename().to_bytes()), bound)
 }
 
-/// The generated names for a machine whose system hostname is `nodename`.
+/// The generated names for a machine whose system hostname is `nodename` and
+/// whose listener is bound to `bound`.
 ///
-/// [`selfsigned_names`] reads the system hostname and this function turns it
-/// into a list. The split lets a test give a hostname that no machine here
-/// carries.
-fn names_for(nodename: &str) -> Vec<String> {
+/// [`selfsigned_names`] reads the system hostname and this function turns it,
+/// with `bound`, into a list. The split lets a test give a hostname and a
+/// bind address that no machine here carries.
+fn names_for(nodename: &str, bound: IpAddr) -> Vec<String> {
     let mut names = vec![
         "localhost".to_string(),
         "127.0.0.1".to_string(),
         "::1".to_string(),
     ];
+
+    // `0.0.0.0` and `::` answer on every interface of the machine, and
+    // neither address names one of them. An IP SAN of `0.0.0.0` would be
+    // useless, so this function adds no IP SAN for an unspecified address.
+    // pirate does not read the network interfaces of the machine to list
+    // their addresses instead; that is out of scope here.
+    if !bound.is_unspecified() {
+        let bound_name = bound.to_string();
+        if !names.contains(&bound_name) {
+            names.push(bound_name);
+        }
+    }
 
     let Some(hostname) = clean_hostname(nodename) else {
         // The operator controls this name, and an attacker does not, so the
@@ -332,23 +481,32 @@ fn names_for(nodename: &str) -> Vec<String> {
         .next()
         .filter(|label| *label != hostname)
         .map(str::to_string);
-    for name in [Some(hostname), first_label].into_iter().flatten() {
+    for name in [Some(hostname.clone()), first_label].into_iter().flatten() {
         if !names.contains(&name) {
             names.push(name);
         }
     }
+
+    // TRAP 1: `ServerName::try_from` refuses the `*` character outright, so a
+    // wildcard string can never pass through `clean_hostname`. `hostname` is
+    // already validated above, with no `*` in it, so this line builds the
+    // wildcard AFTER the gate and never sends the wildcard string itself
+    // through that gate. `rcgen` needs no further check: a string that does
+    // not parse as an IP address becomes a DNS name, wildcard and all.
+    let wildcard = format!("*.{hostname}");
+    if !names.contains(&wildcard) {
+        names.push(wildcard);
+    }
+
     names
 }
 
 /// `hostname` in lowercase, when a certificate name can carry it.
 ///
-/// CAUTION: The gate here is [`ServerName::try_from`], and it is the SAME call
-/// that [`crate::auth`] makes for every request. A second rule list of its own
-/// would drift from that call, and it did: the earlier list took a hostname
-/// whose last label is all digits, such as `box.1`, and `ServerName::try_from`
-/// refuses that string because RFC 1123 reserves an all-digit last label for an
-/// IPv4 address. The certificate then promised a name that the server refused.
-/// A name that cannot reach `crate::auth` must never reach `rcgen`.
+/// CAUTION: The gate here is [`ServerName::try_from`]. It refuses the `*`
+/// character, so a wildcard name must never reach this function; build it
+/// AFTER this function validates the plain hostname instead. See the CAUTION
+/// in [`names_for`].
 ///
 /// `localhost.` and `localhost` name one host, so every trailing dot goes.
 fn clean_hostname(hostname: &str) -> Option<String> {
@@ -357,15 +515,17 @@ fn clean_hostname(hostname: &str) -> Option<String> {
     Some(hostname)
 }
 
-/// A chain of one certificate that pirate signs itself.
+/// A chain of one certificate that pirate signs itself, covering the names
+/// that [`selfsigned_names`] gives for `bound`.
 ///
 /// The key exists in this process only. Nothing writes it to disk, so a restart
 /// gives a new certificate and a new fingerprint.
 fn self_signed(
+    bound: IpAddr,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Box<dyn std::error::Error>> {
     // `rcgen` turns a string that parses as an IP address into an IP address
     // name, and every other string into a DNS name.
-    let signed = rcgen::generate_simple_self_signed(selfsigned_names())?;
+    let signed = rcgen::generate_simple_self_signed(selfsigned_names(bound))?;
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signed.signing_key.serialize_der()));
     Ok((vec![signed.cert.der().clone()], key))
 }
@@ -496,6 +656,11 @@ impl Listener for TlsListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    /// The bind address that most tests use: it is already in the loopback
+    /// list, so it changes no assertion that predates the bound-address SAN.
+    const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
     #[test]
     fn the_hostname_test_takes_a_dns_name_and_drops_every_other_form() {
@@ -511,9 +676,7 @@ mod tests {
             clean_hostname("some-mac.local.."),
             Some("some-mac.local".to_string())
         );
-        // `rustls-pki-types` takes an underscore, so pirate takes it too. The
-        // earlier rule list of this function refused it, and the certificate
-        // then covered one name less than the request gate accepted.
+        // `rustls-pki-types` takes an underscore, so pirate takes it too.
         assert_eq!(
             clean_hostname("under_score"),
             Some("under_score".to_string())
@@ -538,20 +701,30 @@ mod tests {
     }
 
     #[test]
-    fn every_generated_name_passes_the_gate_that_the_request_gate_uses() {
-        // The generator and `crate::auth` must take the same names. This test
-        // holds them to one gate, which is `ServerName::try_from`.
-        for name in selfsigned_names() {
+    fn every_generated_name_is_a_valid_server_name_or_the_wildcard_of_one() {
+        // A name that `ServerName` refuses, and that is not the wildcard form
+        // of a name it accepts, is a name that no browser can ask for and no
+        // certificate resolver can match. TRAP 1: `ServerName` refuses `*`
+        // outright, so the wildcard name itself never passes this call; this
+        // test checks the label behind the `*.` instead.
+        for name in selfsigned_names(LOOPBACK) {
+            if let Some(label) = name.strip_prefix("*.") {
+                assert!(
+                    ServerName::try_from(label).is_ok(),
+                    "the wildcard {name} covers no name that a client could ask for"
+                );
+                continue;
+            }
             assert!(
                 ServerName::try_from(name.as_str()).is_ok(),
-                "the certificate would carry {name}, and the server would refuse it"
+                "the certificate would carry {name}, and no client could name it"
             );
         }
     }
 
     #[test]
     fn the_generated_names_hold_the_loopback_forms_and_no_duplicate() {
-        let names = selfsigned_names();
+        let names = selfsigned_names(LOOPBACK);
         for name in ["localhost", "127.0.0.1", "::1"] {
             assert!(names.contains(&name.to_string()), "{name}");
         }
@@ -564,12 +737,50 @@ mod tests {
         assert_eq!(unique.len(), names.len(), "{names:?}");
     }
 
+    #[test]
+    fn the_bound_address_is_an_ip_san_only_when_it_names_one_machine() {
+        // A concrete address becomes an IP SAN, and it appears once even when
+        // it duplicates a loopback name that the list already holds.
+        let names = names_for(
+            "pirate-test-host",
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+        );
+        assert!(names.contains(&"203.0.113.7".to_string()), "{names:?}");
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "{names:?}");
+
+        // `0.0.0.0` and `::` answer on every interface, so neither address
+        // names one machine. This function adds no IP SAN for either.
+        for unspecified in [
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        ] {
+            let names = names_for("pirate-test-host", unspecified);
+            assert!(
+                !names.contains(&unspecified.to_string()),
+                "an unspecified bind address must not become an IP SAN: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_generated_names_hold_the_wildcard_of_the_hostname() {
+        let names = names_for("pirate-test-host", LOOPBACK);
+        assert!(names.contains(&"pirate-test-host".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"*.pirate-test-host".to_string()),
+            "the wildcard name must be present by name, not only as a prefix match: {names:?}"
+        );
+    }
+
     /// REGRESSION. `clean_hostname` took a hostname whose last label is all
     /// digits, and `rcgen` wrote that string into a dNSName. `ServerName`
     /// refuses the same string, because RFC 1123 reserves an all-digit last
-    /// label for an IPv4 address, and the parse as an IP address fails too. The
-    /// server therefore answered 403 for a name that its own certificate
-    /// carried and that the startup line advertised.
+    /// label for an IPv4 address, and the parse as an IP address fails too. A
+    /// browser could then never open a connection under that name, although
+    /// the certificate carried it and the startup line advertised it.
     #[test]
     fn a_hostname_whose_last_label_is_all_digits_stays_out_of_the_certificate() {
         for hostname in ["box.1", "12345", "rack7.42"] {
@@ -580,26 +791,19 @@ mod tests {
             );
             // The generated list then holds the loopback names and nothing
             // else, and pirate prints a CAUTION that names the machine.
-            assert_eq!(names_for(hostname), ["localhost", "127.0.0.1", "::1"]);
-
-            // This is WHY the name stays out: a certificate that carries it
-            // names a host that the request gate refuses.
-            let signed = rcgen::generate_simple_self_signed(vec![hostname.to_string()]).unwrap();
-            let hosts = crate::auth::HostAllow::Certificate(Box::new(signed.cert.der().clone()));
-            assert!(
-                !hosts.permits(hostname.as_bytes()),
-                "the request gate takes {hostname}, so the generator can take it too"
+            assert_eq!(
+                names_for(hostname, LOOPBACK),
+                ["localhost", "127.0.0.1", "::1"]
             );
         }
     }
 
     /// REGRESSION. A certificate with a subject common name and no
-    /// subjectAltName parses, so the earlier guard in [`build`] let the server
-    /// start. rustls served it, and `HostAllow::permits` then refused every
-    /// name, because RFC 6125 reads names from the subject alternative name
-    /// extension only. `openssl req` without `-addext` writes that shape.
+    /// subjectAltName parses, so an earlier guard in [`build`] stopped the
+    /// server for it. Under the current rule the server always has a
+    /// fallback certificate, so it serves this one and warns instead.
     #[test]
-    fn a_certificate_with_a_common_name_and_no_san_stops_the_server_by_that_name() {
+    fn a_certificate_with_a_common_name_and_no_san_parses_to_an_empty_name_list() {
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         params
             .distinguished_name
@@ -609,7 +813,8 @@ mod tests {
 
         // The parse takes this certificate, so a parse alone catches nothing.
         assert!(rustls::server::ParsedCertificate::try_from(signed.der()).is_ok());
-        // The reader gives the empty list, which is the fault itself.
+        // The reader gives the empty list, which is the fault itself, and
+        // `build` below turns that into a warning and not a stop.
         assert_eq!(
             certificate_names(signed.der()).expect("the leaf parses"),
             Vec::<String>::new()
@@ -627,13 +832,20 @@ mod tests {
         std::fs::write(&cert, signed.pem()).unwrap();
         std::fs::write(&key_file, key.serialize_pem()).unwrap();
 
-        let error = build(&TlsSource::Files {
-            cert,
-            key: key_file,
-        })
-        .expect_err("a certificate with no name must stop the server");
-        let text = format!("{error}");
-        assert!(text.contains("subject alternative name"), "{text}");
+        let tls = build(
+            &TlsSource::Files {
+                cert,
+                key: key_file,
+            },
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        )
+        .expect("a certificate with no name is a warning, and the server still starts");
+        assert_eq!(
+            tls.supplied
+                .expect("a supplied certificate was given")
+                .names,
+            Vec::<String>::new()
+        );
 
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -658,6 +870,46 @@ mod tests {
         assert!(
             error.contains("cannot read the names of the certificate"),
             "{error}"
+        );
+    }
+
+    /// A resolver whose supplied certificate is the generated certificate for
+    /// `LOOPBACK`. The value of `fallback` is never read by `supplied_covers`.
+    fn resolver_over_generated_certificate() -> NameAwareResolver {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (chain, key) = self_signed(LOOPBACK).expect("the generated certificate must build");
+        let leaf = chain
+            .first()
+            .expect("the chain holds one certificate")
+            .clone();
+        let provider =
+            rustls::crypto::CryptoProvider::get_default().expect("the provider is installed above");
+        let certified = Arc::new(
+            CertifiedKey::from_der(chain, key, provider).expect("the generated pair must certify"),
+        );
+        NameAwareResolver {
+            supplied: Arc::clone(&certified),
+            supplied_leaf: leaf,
+            fallback: certified,
+        }
+    }
+
+    /// REGRESSION, and the reason for the whole function: no rustls
+    /// `ClientHello` can ever carry an SNI of this shape. RFC 6066 defines SNI
+    /// for a DNS name only: rustls never sends one for a
+    /// [`ServerName::IpAddress`] on the client side, and the rustls server
+    /// discards an SNI that parses as an address before `resolve` ever sees
+    /// it. `supplied_covers` still takes a plain string, so this test calls
+    /// it directly, with the loopback address in a form that the certificate
+    /// never stores: an IP SAN holds the address as bytes, not as this text.
+    /// A naive string compare against the text of [`certificate_names`] would
+    /// refuse this form. Only a real parse of the address accepts it.
+    #[test]
+    fn an_sni_in_a_different_textual_form_still_matches_an_ip_san() {
+        let resolver = resolver_over_generated_certificate();
+        assert!(
+            resolver.supplied_covers("0:0:0:0:0:0:0:1"),
+            "the full form of ::1 names the same address and must still match"
         );
     }
 }

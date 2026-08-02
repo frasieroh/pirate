@@ -20,7 +20,9 @@ use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
+use tokio_rustls::rustls::client::verify_server_name;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use tokio_rustls::rustls::server::ParsedCertificate;
 use tokio_rustls::rustls::{self, ClientConfig, DigitallySignedStruct, SignatureScheme};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
@@ -134,18 +136,51 @@ async fn handshake_with_alpn(
         .expect("the TLS handshake timed out")
 }
 
-/// Complete one TLS handshake against `addr`.
-async fn handshake(addr: SocketAddr, verifier: Arc<RecordingVerifier>) -> TlsStream<TcpStream> {
+/// Complete one TLS handshake against `addr`, with `server_name` as the SNI.
+///
+/// `server_name` picks what the client sends, not what the server carries. A
+/// `ServerName::DnsName` sends that name as SNI. A `ServerName::IpAddress`
+/// sends NO SNI at all: RFC 6066 defines SNI for a DNS host name only, and
+/// rustls follows that rule, so this is how a test builds a client that names
+/// no server.
+async fn handshake_named(
+    addr: SocketAddr,
+    verifier: Arc<RecordingVerifier>,
+    server_name: ServerName<'static>,
+) -> TlsStream<TcpStream> {
     let connector = TlsConnector::from(Arc::new(client_config(verifier)));
     let stream = tokio::time::timeout(WAIT, TcpStream::connect(addr))
         .await
         .expect("the TCP connection timed out")
         .expect("the TCP connection failed");
-    let name = ServerName::try_from("localhost").unwrap();
-    tokio::time::timeout(WAIT, connector.connect(name, stream))
+    tokio::time::timeout(WAIT, connector.connect(server_name, stream))
         .await
         .expect("the TLS handshake timed out")
         .expect("the TLS handshake failed")
+}
+
+/// Complete one TLS handshake against `addr`, with `name` as the SNI.
+async fn handshake(
+    addr: SocketAddr,
+    verifier: Arc<RecordingVerifier>,
+    name: &str,
+) -> TlsStream<TcpStream> {
+    let server_name = ServerName::try_from(name.to_string()).expect("a valid server name");
+    handshake_named(addr, verifier, server_name).await
+}
+
+/// True when the certificate in `leaf` covers `name`, under the SAN type that
+/// `name` parses to (a dotted-decimal or colon-hex string checks an iPAddress
+/// entry, everything else checks a dNSName entry).
+///
+/// This runs [`verify_server_name`], the same match a browser runs. It is
+/// therefore the same check that tells an IP SAN from a DNS SAN: a string
+/// that a certificate carries as the wrong SAN type does not match here,
+/// although the plain text of the two names is equal.
+fn covers(leaf: &CertificateDer<'static>, name: &str) -> bool {
+    let parsed = ParsedCertificate::try_from(leaf).expect("the served leaf parses");
+    let name = ServerName::try_from(name.to_string()).expect("a valid server name");
+    verify_server_name(&parsed, &name).is_ok()
 }
 
 // --- The server --- //
@@ -159,21 +194,20 @@ async fn start_tls(source: &TlsSource) -> (SocketAddr, Tls) {
 }
 
 /// Start a TLS server with the authentication state that the caller built.
-///
-/// The names of the certificate are the names that the server answers to, so
-/// `hosts` comes from the leaf that `tls::build` gave.
 async fn start_tls_with(source: &TlsSource, auth: pirate::auth::Auth) -> (SocketAddr, Tls) {
-    let tls = pirate::tls::build(source).expect("the TLS configuration did not build");
+    // TRAP 2: bind BEFORE the build of the TLS configuration, and give `build`
+    // the address that the bind resolved to. `main.rs` follows the same order,
+    // because a bind port of 0 does not become a real port until the bind
+    // completes, and the generated certificate carries that real address.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let tls = pirate::tls::build(source, addr).expect("the TLS configuration did not build");
     let state = Arc::new(AppState {
         assets_dir: None,
         shell: PathBuf::from("/bin/cat"),
         auth,
-        hosts: pirate::auth::HostAllow::from_certificate(Some(&tls.leaf)),
         tls: true,
-        terminals: pirate::Terminals::default(),
     });
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
     let config = tls.config.clone();
     tokio::spawn(async move {
         let _ = axum::serve(
@@ -256,10 +290,25 @@ fn status_code(text: &str) -> u16 {
 /// POST `token` to `/auth` over TLS, with `host` in `Host` and in `Origin`.
 ///
 /// The two headers therefore AGREE on that name, which is the shape that a
-/// rebound DNS name gives. The certificate is the only thing that can refuse
-/// it.
+/// rebound DNS name gives. pirate compares no name against the certificate,
+/// so this post succeeds for any name, whether the certificate covers it or
+/// not.
 async fn post_token_as(addr: SocketAddr, host: &str, token: &str) -> u16 {
-    let mut stream = handshake(addr, RecordingVerifier::new()).await;
+    post_token_as_with_cookie(addr, host, token).await.0
+}
+
+/// POST `token` to `/auth` over TLS, with `host` in `Host` and in `Origin`.
+///
+/// The result is the status code and the `Set-Cookie` value, when the answer
+/// carried one. A correct token gives a session cookie back, and a caller
+/// that wants to reuse that session sends this whole value in the `Cookie`
+/// header of a later request.
+async fn post_token_as_with_cookie(
+    addr: SocketAddr,
+    host: &str,
+    token: &str,
+) -> (u16, Option<String>) {
+    let mut stream = handshake(addr, RecordingVerifier::new(), "localhost").await;
     let request = format!(
         "POST /auth HTTP/1.1\r\nHost: {host}\r\nOrigin: https://{host}\r\n\
          Connection: close\r\nContent-Length: {}\r\n\r\n{token}",
@@ -273,7 +322,19 @@ async fn post_token_as(addr: SocketAddr, host: &str, token: &str) -> u16 {
         .await
         .expect("the HTTP answer timed out")
         .expect("the read of the HTTP answer failed");
-    status_code(&String::from_utf8_lossy(&answer))
+    let text = String::from_utf8_lossy(&answer).into_owned();
+    (status_code(&text), set_cookie_value(&text))
+}
+
+/// The value of the `Set-Cookie` header of `text`, an HTTP answer with `\r\n`
+/// line endings.
+fn set_cookie_value(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("set-cookie")
+            .then(|| value.trim().to_string())
+    })
 }
 
 /// Open `/ws` over TLS, with `host` in `Host` and in `Origin`.
@@ -281,7 +342,22 @@ async fn upgrade_as(
     addr: SocketAddr,
     host: &str,
 ) -> Result<WebSocketStream<TlsStream<TcpStream>>, WsError> {
-    let request = Request::builder()
+    upgrade_as_with_cookie(addr, host, None).await
+}
+
+/// Open `/ws` over TLS, with `host` in `Host` and in `Origin`, and `cookie` in
+/// `Cookie` when given.
+///
+/// `cookie` takes the whole `Set-Cookie` value that `/auth` gave back. The
+/// reader on the server side takes the `pirate_session` pair out of a
+/// `Cookie` header and ignores every other pair, so the response attributes
+/// (`HttpOnly`, `Path`, and so on) cost nothing here.
+async fn upgrade_as_with_cookie(
+    addr: SocketAddr,
+    host: &str,
+    cookie: Option<&str>,
+) -> Result<WebSocketStream<TlsStream<TcpStream>>, WsError> {
+    let mut builder = Request::builder()
         .method("GET")
         .uri(format!("wss://{host}/ws"))
         .header("Host", host)
@@ -289,22 +365,16 @@ async fn upgrade_as(
         .header("Upgrade", "websocket")
         .header("Sec-WebSocket-Version", "13")
         .header("Sec-WebSocket-Key", generate_key())
-        .header("Origin", format!("https://{host}"))
-        .body(())
-        .unwrap();
-    let stream = handshake(addr, RecordingVerifier::new()).await;
+        .header("Origin", format!("https://{host}"));
+    if let Some(cookie) = cookie {
+        builder = builder.header("Cookie", cookie);
+    }
+    let request = builder.body(()).unwrap();
+    let stream = handshake(addr, RecordingVerifier::new(), "localhost").await;
     let (socket, _) = tokio::time::timeout(WAIT, tokio_tungstenite::client_async(request, stream))
         .await
         .expect("the WebSocket handshake timed out")?;
     Ok(socket)
-}
-
-/// The status of a handshake that the server refused.
-fn refusal_status(error: &WsError) -> u16 {
-    match error {
-        WsError::Http(response) => response.status().as_u16(),
-        other => panic!("the server refused with no HTTP status: {other:?}"),
-    }
 }
 
 // --- Tests --- //
@@ -314,7 +384,7 @@ async fn a_generated_certificate_completes_a_handshake_and_serves_http() {
     let (addr, _tls) = start_tls(&TlsSource::SelfSigned).await;
     let verifier = RecordingVerifier::new();
 
-    let mut stream = handshake(addr, Arc::clone(&verifier)).await;
+    let mut stream = handshake(addr, Arc::clone(&verifier), "localhost").await;
     let answer = http_over_tls(&mut stream, addr).await;
 
     assert!(
@@ -333,7 +403,7 @@ async fn a_supplied_certificate_and_key_pair_completes_a_handshake() {
     let (addr, _tls) = start_tls(&TlsSource::Files { cert, key }).await;
     let verifier = RecordingVerifier::new();
 
-    let mut stream = handshake(addr, Arc::clone(&verifier)).await;
+    let mut stream = handshake(addr, Arc::clone(&verifier), "localhost").await;
     let answer = http_over_tls(&mut stream, addr).await;
 
     assert!(
@@ -351,10 +421,10 @@ async fn the_reported_fingerprint_is_the_digest_of_the_served_certificate() {
     let (addr, tls) = start_tls(&TlsSource::SelfSigned).await;
     let verifier = RecordingVerifier::new();
 
-    let _stream = handshake(addr, Arc::clone(&verifier)).await;
+    let _stream = handshake(addr, Arc::clone(&verifier), "localhost").await;
 
     let leaf = verifier.leaf();
-    assert_eq!(tls.fingerprint, fingerprint(leaf.as_ref()));
+    assert_eq!(tls.selfsigned.fingerprint, fingerprint(leaf.as_ref()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -366,9 +436,9 @@ async fn the_generated_certificate_covers_the_loopback_names_and_the_system_host
     let (addr, tls) = start_tls(&TlsSource::SelfSigned).await;
     let verifier = RecordingVerifier::new();
 
-    let _stream = handshake(addr, Arc::clone(&verifier)).await;
+    let _stream = handshake(addr, Arc::clone(&verifier), "localhost").await;
 
-    let names = pirate::tls::selfsigned_names();
+    let names = pirate::tls::selfsigned_names(addr.ip());
     assert!(
         names.len() >= 3,
         "the loopback names are always there: {names:?}"
@@ -377,38 +447,204 @@ async fn the_generated_certificate_covers_the_loopback_names_and_the_system_host
         assert!(names.contains(&name.to_string()), "{name}");
     }
 
-    // The startup line prints `tls.names`, and the operator trusts that line.
-    // These are the names of the certificate on the wire, so the line states
-    // what the server serves and not what the generator was asked for.
+    // The startup line prints `tls.selfsigned.names`, and the operator trusts
+    // that line. These are the names of the certificate on the wire, so the
+    // line states what the server serves and not what the generator was asked
+    // for.
+    let leaf = verifier.leaf();
     assert_eq!(
-        tls.names,
-        pirate::tls::certificate_names(&verifier.leaf()).expect("the served leaf parses"),
+        tls.selfsigned.names,
+        pirate::tls::certificate_names(&leaf).expect("the served leaf parses"),
         "the printed names are not the names of the served certificate"
     );
     assert_eq!(
-        tls.names, names,
+        tls.selfsigned.names, names,
         "the generator gave a name that the certificate dropped"
     );
 
-    let hosts = pirate::auth::HostAllow::from_certificate(Some(&verifier.leaf()));
-    for name in &names {
-        assert!(
-            hosts.permits(name.as_bytes()),
-            "the served certificate covers no {name}"
-        );
-    }
+    // IP literals must land as IP SANs, and DNS names as DNS SANs. `covers`
+    // runs the same match a browser runs, and it only succeeds for the SAN
+    // type that the query name parses to.
+    assert!(covers(&leaf, "127.0.0.1"), "127.0.0.1 must be an IP SAN");
+    assert!(covers(&leaf, "::1"), "::1 must be an IP SAN");
+    assert!(covers(&leaf, "localhost"), "localhost must be a DNS SAN");
+
+    // TRAP 1. `ServerName` refuses the `*` character, so the wildcard name is
+    // dropped silently if it is ever run through that gate on its way into
+    // the certificate. This assertion catches exactly that: the wildcard name
+    // must be present BY NAME in the list the server reports, and not merely
+    // as a suffix match against some other name.
+    let hostname = names
+        .iter()
+        .find_map(|n| n.strip_prefix("*.").map(str::to_string))
+        .expect("the machine hostname must produce a wildcard name");
     assert!(
-        !hosts.permits(b"evil.example"),
-        "the served certificate must cover nothing else"
+        names.contains(&hostname),
+        "the plain hostname must also be present: {names:?}"
+    );
+    assert!(covers(&leaf, &hostname), "the hostname must be a DNS SAN");
+    let wildcard = format!("*.{hostname}");
+    assert!(
+        names.contains(&wildcard),
+        "the wildcard name must be present by name: {names:?}"
+    );
+    // A wildcard is a SAN entry, not a name a client can ask for, so this
+    // checks what the wildcard covers instead of querying the wildcard
+    // string itself: a name it did not enumerate, such as a name a reverse
+    // proxy adds in front of pirate.
+    assert!(
+        covers(&leaf, &format!("anything.{hostname}")),
+        "the wildcard must cover a subdomain of the hostname"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_name_that_the_certificate_does_not_cover_cannot_post_the_token() {
-    // This is DNS rebinding, and it is the case that a plain same-origin test
-    // cannot see. The attacker owns `evil.example` and points it at the address
-    // of pirate. The browser then writes that name into BOTH headers, so the
-    // two AGREE with each other. The certificate is what refuses it.
+async fn the_bound_address_becomes_an_ip_san_and_an_unspecified_address_does_not() {
+    // `tls::build` only needs the address, not a real bind, so this test
+    // reads the certificate straight out of `build` with an address that no
+    // loopback default already carries.
+    let bound = SocketAddr::from((std::net::Ipv4Addr::new(203, 0, 113, 9), 4433));
+    let tls = pirate::tls::build(&TlsSource::SelfSigned, bound)
+        .expect("the TLS configuration did not build");
+    assert!(
+        tls.selfsigned.names.contains(&"203.0.113.9".to_string()),
+        "the bound address must become an IP SAN: {:?}",
+        tls.selfsigned.names
+    );
+    assert!(
+        covers(&tls.selfsigned.leaf, "203.0.113.9"),
+        "the bound address must be an IP SAN, not a DNS name"
+    );
+
+    // `0.0.0.0` answers on every interface of the machine, and it names none
+    // of them. pirate does not enumerate interfaces, so it adds no IP SAN for
+    // an unspecified address.
+    let unspecified = SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 4433));
+    let tls = pirate::tls::build(&TlsSource::SelfSigned, unspecified)
+        .expect("the TLS configuration did not build");
+    assert!(
+        !tls.selfsigned.names.contains(&"0.0.0.0".to_string()),
+        "an unspecified bind address must not become an IP SAN: {:?}",
+        tls.selfsigned.names
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_supplied_certificate_is_served_when_the_sni_matches() {
+    let (cert, key) = write_named_pem_pair("sni-match", &["pirate.example"]);
+    let (addr, tls) = start_tls(&TlsSource::Files { cert, key }).await;
+    let verifier = RecordingVerifier::new();
+
+    let _stream = handshake(addr, Arc::clone(&verifier), "pirate.example").await;
+
+    let supplied = tls.supplied.expect("a supplied certificate was given");
+    assert_eq!(
+        verifier.leaf(),
+        supplied.leaf,
+        "an SNI that the supplied certificate covers must get that certificate"
+    );
+}
+
+/// REGRESSION. A naive string compare of the SNI against the certificate
+/// names would pass every test above: none of them sends an SNI that differs
+/// from the certificate name by more than an exact string. This test and the
+/// one after it send an SNI that only a real match, through
+/// `verify_server_name`, accepts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wildcard_in_the_supplied_certificate_covers_a_subdomain_of_the_sni() {
+    let (cert, key) = write_named_pem_pair("sni-wildcard", &["*.example.test"]);
+    let (addr, tls) = start_tls(&TlsSource::Files { cert, key }).await;
+    let verifier = RecordingVerifier::new();
+
+    // The certificate carries the string `*.example.test`, and the SNI is
+    // `host.example.test`. The two strings never match; only the wildcard
+    // rule of RFC 6125 does.
+    let _stream = handshake(addr, Arc::clone(&verifier), "host.example.test").await;
+
+    let supplied = tls.supplied.expect("a supplied certificate was given");
+    assert_eq!(
+        verifier.leaf(),
+        supplied.leaf,
+        "a wildcard in the supplied certificate must cover a subdomain of the SNI"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_sni_that_differs_only_in_case_still_matches_the_supplied_certificate() {
+    // DNS names are not case sensitive. rustls lowercases the SNI before the
+    // resolver ever sees it, so the certificate here carries the name in
+    // mixed case on purpose: the exact string that reaches `supplied_covers`
+    // never equals it, and only a case-insensitive match accepts the SNI.
+    let (cert, key) = write_named_pem_pair("sni-case", &["Pirate.Example"]);
+    let (addr, tls) = start_tls(&TlsSource::Files { cert, key }).await;
+    let verifier = RecordingVerifier::new();
+
+    let _stream = handshake(addr, Arc::clone(&verifier), "pirate.example").await;
+
+    let supplied = tls.supplied.expect("a supplied certificate was given");
+    assert_eq!(
+        verifier.leaf(),
+        supplied.leaf,
+        "a case difference alone must not cost the supplied certificate its match"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_sni_the_supplied_certificate_does_not_cover_gets_the_selfsigned_fallback() {
+    let (cert, key) = write_named_pem_pair("sni-mismatch", &["pirate.example"]);
+    let (addr, tls) = start_tls(&TlsSource::Files { cert, key }).await;
+    let verifier = RecordingVerifier::new();
+
+    // TRAP 4 and the whole point of B2: this name matches neither the
+    // supplied certificate nor a name pirate refuses, so the handshake must
+    // still complete, and the request after it must still work.
+    let mut stream = handshake(addr, Arc::clone(&verifier), "evil.example").await;
+    let answer = http_over_tls(&mut stream, addr).await;
+
+    let supplied = tls.supplied.expect("a supplied certificate was given");
+    assert_eq!(
+        verifier.leaf(),
+        tls.selfsigned.leaf,
+        "an SNI the supplied certificate does not cover must get the generated fallback"
+    );
+    assert_ne!(
+        verifier.leaf(),
+        supplied.leaf,
+        "the fallback must not be the supplied certificate"
+    );
+    assert!(
+        answer.starts_with("HTTP/1.1 204"),
+        "the handshake must complete and the request must still work. Got: {answer:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_sends_no_sni_gets_the_supplied_certificate() {
+    let (cert, key) = write_named_pem_pair("no-sni", &["pirate.example"]);
+    let (addr, tls) = start_tls(&TlsSource::Files { cert, key }).await;
+    let verifier = RecordingVerifier::new();
+
+    // A `ServerName::IpAddress` sends no SNI extension at all, which is the
+    // shape of a client that names no server. The operator asked pirate to
+    // serve the supplied certificate, so that client gets it.
+    let name = ServerName::try_from(addr.ip().to_string()).expect("a valid IP address");
+    let _stream = handshake_named(addr, Arc::clone(&verifier), name).await;
+
+    let supplied = tls.supplied.expect("a supplied certificate was given");
+    assert_eq!(
+        verifier.leaf(),
+        supplied.leaf,
+        "a client with no SNI must get the supplied certificate"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_that_the_certificate_does_not_cover_still_posts_the_token() {
+    // This is DNS rebinding. The attacker owns `evil.example` and points it at
+    // the address of pirate. The browser writes that name into BOTH headers,
+    // so the two AGREE with each other. The browser is what checks the name of
+    // the certificate, and it does that check before it opens the connection.
+    // pirate compares no name here, so the post must succeed.
     let (cert, key) = write_named_pem_pair("post-name", &["pirate.example"]);
     let path = temp_dir("post-name-token")
         .join("pirate")
@@ -423,33 +659,91 @@ async fn a_name_that_the_certificate_does_not_cover_cannot_post_the_token() {
 
     assert_eq!(
         post_token_as(addr, "evil.example", &text).await,
-        403,
-        "a name that the certificate does not cover must be refused"
+        204,
+        "pirate must accept a name that the certificate does not cover"
     );
-    // The same token under a covered name opens a session, so the refusal
-    // above came from the name and from nothing else.
+    // A name that the certificate DOES cover must still work. pirate compares
+    // neither name against the certificate, so both posts succeed alike.
     assert_eq!(
         post_token_as(addr, "pirate.example", &text).await,
         204,
-        "the name of the certificate must reach the token gate"
+        "a name that the certificate covers must still reach the token gate"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_name_that_the_certificate_does_not_cover_cannot_open_the_terminal() {
-    // The same rule on the route that holds the shell. The token gate is off
-    // here, so a 403 comes from the name and from nothing else.
+async fn a_name_that_the_certificate_does_not_cover_still_opens_the_terminal() {
+    // The same rule on the route that holds the shell. pirate compares no name
+    // against the certificate, so a name that the certificate does not cover
+    // still upgrades, as long as `Host` and `Origin` agree.
     let (cert, key) = write_named_pem_pair("upgrade-name", &["pirate.example"]);
     let (addr, _tls) = start_tls(&TlsSource::Files { cert, key }).await;
 
-    let error = upgrade_as(addr, "evil.example")
+    let mut socket = upgrade_as(addr, "evil.example")
         .await
-        .expect_err("a name that the certificate does not cover must not upgrade");
-    assert_eq!(refusal_status(&error), 403);
+        .expect("a name that the certificate does not cover must still upgrade");
+    let message = tokio::time::timeout(WAIT, socket.next())
+        .await
+        .expect("the first frame timed out")
+        .expect("the socket ended")
+        .expect("the read of the first frame failed");
+    assert_eq!(
+        message.into_data().first().copied(),
+        Some(0x01),
+        "the first frame must carry the dump tag"
+    );
 
+    // A name that the certificate DOES cover must still upgrade too.
     let mut socket = upgrade_as(addr, "pirate.example")
         .await
-        .expect("the name of the certificate must upgrade");
+        .expect("a name that the certificate covers must still upgrade");
+    let message = tokio::time::timeout(WAIT, socket.next())
+        .await
+        .expect("the first frame timed out")
+        .expect("the socket ended")
+        .expect("the read of the first frame failed");
+    assert_eq!(
+        message.into_data().first().copied(),
+        Some(0x01),
+        "the first frame must carry the dump tag"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_authenticated_over_an_unrecognized_host_still_opens_the_terminal() {
+    // REGRESSION. This is the report of the product manager: connect over a
+    // hostname that the certificate does not cover, authenticate, and the
+    // NEXT request must not answer 403. The two tests above post the token
+    // once and upgrade once, each on its own connection with no session
+    // carried between them. This test carries the session cookie from the
+    // POST into the upgrade, on the same unrecognized host, which is the
+    // exact sequence that the product manager ran.
+    let (cert, key) = write_named_pem_pair("session-unknown-host", &["pirate.example"]);
+    let path = temp_dir("session-unknown-host-token")
+        .join("pirate")
+        .join("auth_token");
+    let token = pirate::auth::load_or_create(&path).expect("the token file did not open");
+    let text = std::fs::read_to_string(&path).unwrap().trim().to_string();
+    let (addr, _tls) = start_tls_with(
+        &TlsSource::Files { cert, key },
+        pirate::auth::Auth::enabled(token, true),
+    )
+    .await;
+
+    let host = "unknown.example";
+    let (status, cookie) = post_token_as_with_cookie(addr, host, &text).await;
+    assert_eq!(
+        status, 204,
+        "authentication over a host that the certificate does not cover must still succeed"
+    );
+    let cookie = cookie.expect("a correct token must set a session cookie");
+
+    let mut socket = upgrade_as_with_cookie(addr, host, Some(&cookie))
+        .await
+        .expect(
+            "the request that carries the session cookie from that authentication \
+             must not be refused",
+        );
     let message = tokio::time::timeout(WAIT, socket.next())
         .await
         .expect("the first frame timed out")
@@ -480,7 +774,7 @@ async fn a_silent_client_does_not_block_a_handshake() {
     }
 
     let verifier = RecordingVerifier::new();
-    let mut stream = handshake(addr, Arc::clone(&verifier)).await;
+    let mut stream = handshake(addr, Arc::clone(&verifier), "localhost").await;
     let answer = http_over_tls(&mut stream, addr).await;
 
     assert!(
@@ -528,7 +822,7 @@ async fn silent_clients_past_the_handshake_bound_do_not_deny_the_server() {
     let at = Instant::now();
     let mut stream = tokio::time::timeout(
         Duration::from_secs(5),
-        handshake(addr, Arc::clone(&verifier)),
+        handshake(addr, Arc::clone(&verifier), "localhost"),
     )
     .await
     .expect("the real client never completed a handshake under the flood");

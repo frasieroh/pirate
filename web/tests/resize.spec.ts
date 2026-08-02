@@ -4,8 +4,12 @@
  * The payload is a `u16` cols and a `u16` rows, both big-endian.
  */
 
-import { expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
 import { clientState, hex, idle, server, size, waitFor, withClient } from "./harness";
+
+beforeEach(() => {
+  server().reset();
+});
 
 /** Every resize frame that the client sent. */
 function resizeFrames(frames: Uint8Array[]): Uint8Array[] {
@@ -14,7 +18,6 @@ function resizeFrames(frames: Uint8Array[]): Uint8Array[] {
 
 test("the first resize frame carries the size of the terminal, big-endian", async () => {
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     const frames = await waitFor(
@@ -40,7 +43,6 @@ test("the first resize frame carries the size of the terminal, big-endian", asyn
 
 test("a smaller window gives a new resize frame with the new size", async () => {
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     const first = await waitFor(
@@ -71,7 +73,6 @@ test("a smaller window gives a new resize frame with the new size", async () => 
 
 test("a burst of size changes gives one resize frame", async () => {
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await waitFor(

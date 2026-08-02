@@ -231,7 +231,6 @@ export async function startPirate(options: PirateOptions = {}): Promise<Pirate> 
       shell,
     ],
     {
-      // The bind address is an IP literal, so pirate needs no `--hostname`.
       env: { HOME: home, PATH: process.env.PATH ?? "", TERM: "xterm-256color" },
       stdin: "ignore",
       stdout: "pipe",

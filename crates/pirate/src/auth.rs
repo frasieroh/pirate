@@ -19,7 +19,6 @@ use std::os::unix::fs::{
     DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
 };
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -30,11 +29,6 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse as _, Response};
 use sha2::{Digest as _, Sha256};
 use subtle::{Choice, ConstantTimeEq as _};
-use tokio_rustls::rustls::client::verify_server_name;
-use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
-// rustls re-exports this type in both the client module and the server module.
-// It is the parsed form of a leaf certificate, and it belongs to neither side.
-use tokio_rustls::rustls::server::ParsedCertificate;
 
 use crate::AppState;
 
@@ -57,45 +51,10 @@ const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 /// store constant, and it limits what a leaked token can accumulate.
 const MAX_SESSIONS: usize = 64;
 
-/// The number of attempts that the bucket holds when it is full. A person who
-/// pastes the token gets 20 tries without a wait.
-const AUTH_BURST: u32 = 20;
-
-/// The number of attempts that the bucket gives back each second. 5 per second
-/// is more than a person types and much less than a guess of a 256-bit token
-/// needs.
-const AUTH_REFILL_PER_SECOND: u32 = 5;
-
-/// The largest token file that this module reads.
-const MAX_TOKEN_FILE_BYTES: u64 = 4096;
-
 /// The shortest token that this module accepts. An operator can write the file
 /// instead of pirate, and a short token is one that a flood of guesses reaches.
 /// 32 characters is the floor, and the token that pirate writes is 64.
 const MIN_TOKEN_BYTES: usize = 32;
-
-/// The number of session cookies that one request can offer.
-///
-/// A page on another port of the same host can add its own `pirate_session`
-/// pairs, so the reader takes more than one. Each candidate costs a scan of the
-/// store, and this bound keeps that work constant.
-///
-/// CAUTION: A candidate past this bound is never compared, so a low bound is a
-/// way to lock the operator out: the attacker plants enough junk pairs to push
-/// the real session past the cut, and `/ws` then answers 401. An audit measured
-/// that against the real binary at the earlier bound of 8. 32 costs at most 32
-/// times `MAX_SESSIONS` constant-time compares of 64 bytes, which is
-/// microseconds, and it needs a domain hierarchy deeper than a browser builds.
-const MAX_COOKIE_CANDIDATES: usize = 32;
-
-// CAUTION: Do NOT add a bound on the number of `Cookie` PAIRS that the reader
-// walks. An earlier version did, to bound the work of a large header. It
-// reintroduced the very lockout that the CAUTION above forbids, at a lower
-// cost to the attacker: 256 junk pairs that are not session cookies pushed the
-// real session past the cut, and `/ws` then answered 401 for good. hyper
-// already bounds the size of a header, so the walk is bounded without it. Only
-// a pair that PARSES as a session identifier costs anything after this point,
-// and `MAX_COOKIE_CANDIDATES` bounds those.
 
 /// The shared secret of the server.
 pub struct Token(Vec<u8>);
@@ -132,8 +91,6 @@ pub enum TokenError {
         owner: u32,
         expected: u32,
     },
-    /// The token file is larger than `MAX_TOKEN_FILE_BYTES`.
-    TooLarge { path: PathBuf, limit: u64 },
     /// The token file holds whitespace only.
     Empty(PathBuf),
     /// The token holds fewer than `MIN_TOKEN_BYTES` bytes.
@@ -186,11 +143,6 @@ impl fmt::Display for TokenError {
                 f,
                 "user {owner} owns {}. User {expected} must own it. \
                  A path that another user owns can hold a token that this user did not write",
-                path.display()
-            ),
-            Self::TooLarge { path, limit } => write!(
-                f,
-                "the token file {} is larger than {limit} bytes. The token must be one line",
                 path.display()
             ),
             Self::Empty(path) => write!(
@@ -289,7 +241,7 @@ fn prepare_directory(directory: &Path) -> Result<(), TokenError> {
 }
 
 /// Read a token file that exists.
-fn read_token(path: &Path, file: File) -> Result<Token, TokenError> {
+fn read_token(path: &Path, mut file: File) -> Result<Token, TokenError> {
     // The metadata comes from the open handle. A test on the path and then an
     // open is a time-of-check to time-of-use race: another process can move a
     // different file into the path between the two calls.
@@ -309,22 +261,12 @@ fn read_token(path: &Path, file: File) -> Result<Token, TokenError> {
         });
     }
 
-    // The length of the metadata is a hint only. Some files report zero and
-    // give bytes without end, so the reader carries the limit itself.
     let mut content = Vec::new();
-    let limit = MAX_TOKEN_FILE_BYTES.saturating_add(1);
-    file.take(limit)
-        .read_to_end(&mut content)
+    file.read_to_end(&mut content)
         .map_err(|source| TokenError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-    if content.len() as u64 > MAX_TOKEN_FILE_BYTES {
-        return Err(TokenError::TooLarge {
-            path: path.to_path_buf(),
-            limit: MAX_TOKEN_FILE_BYTES,
-        });
-    }
 
     // An editor adds a newline at the end of the file. That file still works.
     let token = content.trim_ascii_end();
@@ -414,40 +356,9 @@ struct Session {
     expires: Instant,
 }
 
-/// A global token bucket.
-struct Bucket {
-    /// The attempts that remain. A fraction is a partial refill.
-    attempts: f64,
-    updated: Instant,
-}
-
-impl Bucket {
-    fn new(now: Instant) -> Self {
-        Self {
-            attempts: f64::from(AUTH_BURST),
-            updated: now,
-        }
-    }
-
-    /// Take one attempt. The result is false when the bucket is empty.
-    fn take(&mut self, now: Instant) -> bool {
-        let elapsed = now.saturating_duration_since(self.updated).as_secs_f64();
-        let refill = elapsed * f64::from(AUTH_REFILL_PER_SECOND);
-        self.attempts = (self.attempts + refill).min(f64::from(AUTH_BURST));
-        self.updated = now;
-        if self.attempts >= 1.0 {
-            self.attempts -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-}
-
 /// Everything behind the lock.
 struct Guarded {
     sessions: Vec<Session>,
-    bucket: Bucket,
 }
 
 impl Guarded {
@@ -494,7 +405,7 @@ impl Guarded {
     ///
     /// The scan reads every entry for every candidate and it stops at no
     /// match, so its duration tells an attacker nothing about the stored
-    /// identifiers. `MAX_COOKIE_CANDIDATES` bounds the outer count.
+    /// identifiers.
     fn holds_any(&self, candidates: &[[u8; SESSION_ID_LEN]]) -> bool {
         let mut found = Choice::from(0u8);
         for session in &self.sessions {
@@ -556,14 +467,12 @@ impl Auth {
         digest.copy_from_slice(&Sha256::digest(&token.0));
         drop(token);
 
-        let now = Instant::now();
         Self {
             inner: Some(Arc::new(Inner {
                 digest,
                 secure_cookie,
                 guarded: Mutex::new(Guarded {
                     sessions: Vec::new(),
-                    bucket: Bucket::new(now),
                 }),
             })),
         }
@@ -615,7 +524,7 @@ pub async fn post(State(state): State<Arc<AppState>>, headers: HeaderMap, body: 
 
     // A page on another origin can post a form to this route. Without this
     // test, that page plants a session cookie in the browser of the operator.
-    if !origin_ok(&headers, state.tls, &state.hosts) {
+    if !origin_ok(&headers, state.tls) {
         return answer(StatusCode::FORBIDDEN);
     }
 
@@ -629,25 +538,10 @@ pub async fn post(State(state): State<Arc<AppState>>, headers: HeaderMap, body: 
     let now = Instant::now();
     let mut guarded = inner.lock();
 
-    // CAUTION: Compare the token before the bucket, and keep that order. A
-    // wrong guess spends one attempt and a correct token spends none, so a
-    // flood of guesses never refuses the operator. An earlier version spent an
-    // attempt on every request, and a flood of 300000 guesses locked the
-    // operator out for the length of the flood.
-    //
-    // The bucket is not what makes a guess hopeless. The 256 bits of the token
-    // do that. The bucket limits the work and the noise of a flood only.
-    //
-    // CAUTION: Do not replace this bucket with a map of one bucket for each
-    // address. The map is an allocation that the attacker controls, and an
-    // attacker rotates addresses.
     if !matched {
         // A message for each attempt is a way to flood stderr, so a failed
         // attempt writes nothing.
-        if guarded.bucket.take(now) {
-            return answer(StatusCode::UNAUTHORIZED);
-        }
-        return answer(StatusCode::TOO_MANY_REQUESTS);
+        return answer(StatusCode::UNAUTHORIZED);
     }
 
     let Ok(id) = guarded.insert(now) else {
@@ -697,15 +591,11 @@ fn answer(status: StatusCode) -> Response {
 /// first, and a reader of the first pair alone then reads the junk pair. That
 /// is a way to stop the terminal of the operator for good.
 ///
-/// The result holds `MAX_COOKIE_CANDIDATES` values at most, and it drops a
-/// value that is not 64 lowercase hexadecimal characters.
+/// The result drops a value that is not 64 lowercase hexadecimal characters.
 fn session_cookies(headers: &HeaderMap) -> Vec<[u8; SESSION_ID_LEN]> {
     let mut candidates = Vec::new();
     for value in headers.get_all(COOKIE) {
         for pair in value.as_bytes().split(|byte| *byte == b';') {
-            if candidates.len() >= MAX_COOKIE_CANDIDATES {
-                return candidates;
-            }
             let pair = pair.trim_ascii();
             let mut parts = pair.splitn(2, |byte| *byte == b'=');
             let (Some(name), Some(raw)) = (parts.next(), parts.next()) else {
@@ -743,121 +633,6 @@ fn hex_id(raw: &[u8]) -> Option<[u8; SESSION_ID_LEN]> {
     Some(id)
 }
 
-/// The names that this server answers to.
-///
-/// A comparison of `Origin` with `Host` alone proves nothing about the server.
-/// A DNS name that the attacker owns can resolve to the address of pirate, and
-/// the browser then sends that name in both `Origin` and `Host`. The two agree,
-/// and the server is not the one that the operator started. The certificate is
-/// what makes them disagree.
-///
-/// The transport gives this value, and the operator declares no name of its
-/// own. Under TLS the certificate already states every name that the server
-/// answers to, and a browser refuses a name that the certificate does not
-/// cover. Plain HTTP carries no certificate, so it states nothing and tests
-/// nothing.
-#[derive(Debug, Clone)]
-pub enum HostAllow {
-    /// No certificate. Every name is accepted and no test runs.
-    Any,
-    /// TLS. The leaf certificate is the whole rule.
-    Certificate(Box<CertificateDer<'static>>),
-}
-
-impl HostAllow {
-    /// The names come from the transport. A certificate states them, and
-    /// plain HTTP states none.
-    ///
-    /// CAUTION: This function is the whole rule, and it holds the one decision
-    /// that turns the name test on. Keep it here and not in `main.rs`. The two
-    /// arms read alike, and the unit test below is what proves that neither one
-    /// is the other.
-    #[must_use]
-    pub fn from_certificate(leaf: Option<&CertificateDer<'static>>) -> Self {
-        match leaf {
-            Some(leaf) => Self::Certificate(Box::new(leaf.clone())),
-            None => Self::Any,
-        }
-    }
-
-    /// True when `host` is a name that this server answers to.
-    ///
-    /// `host` is the host part of an authority, with no port.
-    #[must_use]
-    pub fn permits(&self, host: &[u8]) -> bool {
-        let Self::Certificate(leaf) = self else {
-            // Plain HTTP. No certificate covers a name here, so there is
-            // nothing to compare a name with.
-            return true;
-        };
-        let permitted = covers(leaf, host);
-        if !permitted {
-            hint_unknown_host();
-        }
-        permitted
-    }
-}
-
-/// True when the names of `leaf` cover `host`.
-///
-/// rustls does the match that a browser does: the subject alternative names,
-/// the wildcard rule of RFC 6125, and the IP address form. A step that fails is
-/// a refusal, because a name that pirate cannot compare is a name that pirate
-/// cannot answer to.
-fn covers(leaf: &CertificateDer<'static>, host: &[u8]) -> bool {
-    let Some(host) = normalize_host(host) else {
-        return false;
-    };
-    // An IP literal gives `ServerName::IpAddress`, and every other name gives
-    // `ServerName::DnsName`.
-    let Ok(name) = ServerName::try_from(host.as_str()) else {
-        return false;
-    };
-    let Ok(parsed) = ParsedCertificate::try_from(leaf) else {
-        return false;
-    };
-    verify_server_name(&parsed, &name).is_ok()
-}
-
-/// The host part in lowercase, with no trailing dot and with no brackets.
-///
-/// `localhost.` and `localhost` name the same host in DNS, so the dot goes
-/// before the comparison. An unknown name that ends in a dot must not pass as
-/// a name of its own.
-///
-/// EVERY trailing dot goes, and not one dot only. `rustls-pki-types` tolerates
-/// one trailing dot of its own, so a reader that stripped one dot let
-/// `pirate.example..` through as a second spelling of one name.
-fn normalize_host(host: &[u8]) -> Option<String> {
-    let host = std::str::from_utf8(host).ok()?;
-    let host = host.trim_end_matches('.');
-    let host = match (host.strip_prefix('['), host.strip_suffix(']')) {
-        (Some(_), Some(_)) => host.get(1..host.len().checked_sub(1)?)?,
-        _ => host,
-    };
-    if host.is_empty() {
-        return None;
-    }
-    Some(host.to_ascii_lowercase())
-}
-
-/// Tell the operator once that the certificate covers no such name.
-fn hint_unknown_host() {
-    /// One line for each request is a way to flood stderr, so this flag holds
-    /// the hint to one line for the life of the process.
-    static PRINTED: AtomicBool = AtomicBool::new(false);
-
-    if !PRINTED.swap(true, Ordering::Relaxed) {
-        // CAUTION: Do not add the host of the request to this line. The
-        // attacker writes that text, and it goes to the log of the operator.
-        eprintln!(
-            "pirate: a request carried a Host header that this certificate does not cover. \
-             Reach pirate by a name in the certificate. \
-             For another name, use --cert with a certificate that covers that name."
-        );
-    }
-}
-
 /// True when the `Origin` header names this server.
 ///
 /// This test closes one attack: a page on another origin opens a WebSocket to
@@ -865,11 +640,11 @@ fn hint_unknown_host() {
 /// with that handshake, because a WebSocket obeys no same-origin rule of its
 /// own, and the page then reads and writes the terminal of the operator.
 ///
-/// `hosts` closes the second half of that attack. Two headers that agree with
-/// each other still name a server that pirate is not, so the `Host` must also
-/// be a name that this server answers to. Under plain HTTP that test accepts
-/// every name, because a server with no certificate claims no name.
-pub fn origin_ok(headers: &HeaderMap, tls: bool, hosts: &HostAllow) -> bool {
+/// This function compares `Origin` with `Host` only. It makes no claim about
+/// which names the server answers to. Under TLS the certificate makes that
+/// claim, and the browser checks it before it opens the connection. This
+/// server compares no name against the certificate.
+pub fn origin_ok(headers: &HeaderMap, tls: bool) -> bool {
     // Two `Host` headers are a request-smuggling shape: a front proxy reads one
     // header and pirate reads the other. The same holds for `Origin`. One
     // header of each, or the request stops here.
@@ -890,11 +665,6 @@ pub fn origin_ok(headers: &HeaderMap, tls: bool, hosts: &HostAllow) -> bool {
     let Some((host_host, host_port)) = split_authority(host) else {
         return false;
     };
-    // The name test comes before the comparison. A rebound name passes the
-    // comparison, because the browser writes it into both headers.
-    if !hosts.permits(host_host) {
-        return false;
-    }
 
     let (scheme, default_port) = if tls {
         (b"https".as_slice(), 443u16)
@@ -986,184 +756,70 @@ mod tests {
         map
     }
 
-    /// The names of the certificate that the tests below use.
-    ///
-    /// The wildcard is here on purpose: an operator whose certificate carries
-    /// one must reach pirate under it.
-    const CERTIFICATE_NAMES: [&str; 5] = [
-        "pirate.example",
-        "*.wild.example",
-        "127.0.0.1",
-        "::1",
-        "localhost",
-    ];
-
-    /// A server behind a certificate that covers [`CERTIFICATE_NAMES`].
-    fn hosts() -> HostAllow {
-        HostAllow::from_certificate(Some(&leaf()))
-    }
-
-    /// A leaf certificate that covers [`CERTIFICATE_NAMES`].
-    fn leaf() -> CertificateDer<'static> {
-        let names = CERTIFICATE_NAMES.map(str::to_string).to_vec();
-        let signed = rcgen::generate_simple_self_signed(names).unwrap();
-        signed.cert.der().clone()
-    }
-
-    #[test]
-    fn the_transport_decides_whether_the_name_test_runs() {
-        // CAUTION: This test is the only thing that holds the two arms of
-        // `from_certificate` apart. A worker who swaps them turns the name test
-        // off under TLS, and every other test in this repository still passes.
-        let leaf = leaf();
-        let under_tls = HostAllow::from_certificate(Some(&leaf));
-        let under_plain_http = HostAllow::from_certificate(None);
-
-        // One name, and two answers. The certificate is what refuses it.
-        assert!(
-            !under_tls.permits(b"evil.example"),
-            "a certificate must refuse a name that it does not cover"
-        );
-        assert!(
-            under_plain_http.permits(b"evil.example"),
-            "plain HTTP claims no name, so it refuses none"
-        );
-
-        assert!(matches!(under_tls, HostAllow::Certificate(_)));
-        assert!(matches!(under_plain_http, HostAllow::Any));
-    }
-
-    #[test]
-    fn the_certificate_takes_every_name_that_it_covers() {
-        let hosts = hosts();
-        for host in [
-            "pirate.example",
-            "127.0.0.1",
-            "::1",
-            "[::1]",
-            "localhost",
-            // The wildcard covers one label, which is the rule of RFC 6125.
-            "a.wild.example",
-            "b.wild.example",
-            // A name is not case sensitive, and a trailing dot names the same
-            // host. Two dots name it too: `rustls-pki-types` tolerates one dot
-            // of its own, so the reader must strip every one of them.
-            "PIRATE.EXAMPLE",
-            "pirate.example.",
-            "pirate.example..",
-        ] {
-            assert!(hosts.permits(host.as_bytes()), "{host}");
-        }
-    }
-
-    #[test]
-    fn the_certificate_refuses_every_other_name() {
-        // Every name here reaches the certificate and the certificate refuses
-        // it. The test below holds the names that never reach it.
-        let hosts = hosts();
-        for host in [
-            "evil.example",
-            "localhost.evil.example",
-            "pirate.example.evil.com",
-            // A wildcard covers ONE label. It covers neither the name without
-            // a label nor a name with two.
-            "wild.example",
-            "a.b.wild.example",
-            // An address that the certificate does not carry. An IP literal is
-            // a name like any other here.
-            "192.168.1.10",
-            // REGRESSION. The IP branch is a match of the whole name and not a
-            // match of a prefix.
-            "127.0.0.1.evil.example",
-        ] {
-            assert!(!hosts.permits(host.as_bytes()), "{host}");
-        }
-    }
-
-    #[test]
-    fn a_host_header_that_is_not_a_name_never_reaches_the_certificate() {
-        // These values fail BEFORE the certificate, which is a different
-        // mechanism from a certificate that covers no such name.
-        let hosts = hosts();
-
-        // `normalize_host` drops these. Nothing is left to compare.
-        for host in ["", ".", "..", "[]"] {
-            assert_eq!(normalize_host(host.as_bytes()), None, "{host}");
-            assert!(!hosts.permits(host.as_bytes()), "{host}");
-        }
-
-        // `ServerName::try_from` drops these. A certificate can carry a
-        // wildcard, and a request can never name one.
-        for host in ["[", "a b", "*.wild.example"] {
-            let name = normalize_host(host.as_bytes()).expect("the reader keeps this text");
-            assert!(ServerName::try_from(name.as_str()).is_err(), "{host}");
-            assert!(!hosts.permits(host.as_bytes()), "{host}");
-        }
-    }
-
-    #[test]
-    fn a_server_with_no_certificate_takes_every_name() {
-        // Plain HTTP claims no name, so it refuses none. The empty host is in
-        // this list because `permits` answers before it reads the bytes.
-        for host in [
-            "pirate.example",
-            "a.wild.example",
-            "wild.example",
-            "a.b.wild.example",
-            "evil.example",
-            "192.168.1.10",
-            "localhost",
-            "",
-            "[",
-        ] {
-            assert!(HostAllow::Any.permits(host.as_bytes()), "{host}");
-        }
-    }
-
     #[test]
     fn an_origin_that_names_this_server_passes() {
-        let hosts = hosts();
-
         let same_port = headers(&[
             ("origin", "http://localhost:8080"),
             ("host", "localhost:8080"),
         ]);
-        assert!(origin_ok(&same_port, false, &hosts));
+        assert!(origin_ok(&same_port, false));
 
         // The default port of the scheme and a `Host` with no port agree.
         let default_port = headers(&[
             ("origin", "http://Pirate.Example"),
             ("host", "pirate.example:80"),
         ]);
-        assert!(origin_ok(&default_port, false, &hosts));
+        assert!(origin_ok(&default_port, false));
         let tls_port = headers(&[
             ("origin", "https://pirate.example:443"),
             ("host", "pirate.example"),
         ]);
-        assert!(origin_ok(&tls_port, true, &hosts));
+        assert!(origin_ok(&tls_port, true));
 
         let literal = headers(&[("origin", "http://[::1]:8080"), ("host", "[::1]:8080")]);
-        assert!(origin_ok(&literal, false, &hosts));
+        assert!(origin_ok(&literal, false));
         let ipv4 = headers(&[
             ("origin", "http://127.0.0.1:8080"),
             ("host", "127.0.0.1:8080"),
         ]);
-        assert!(origin_ok(&ipv4, false, &hosts));
+        assert!(origin_ok(&ipv4, false));
     }
 
     #[test]
-    fn a_name_that_this_server_does_not_answer_to_fails() {
-        // The two headers agree, which is what a rebound DNS name gives. The
-        // certificate is what refuses this request.
-        let rebound = headers(&[
+    fn a_host_and_origin_that_disagree_fail_on_every_transport() {
+        // The server compares no name against a certificate now. A browser
+        // enforces that match before it opens the connection, so this function
+        // asserts only the rule that remains: `Host` and `Origin` must agree.
+        let agree = headers(&[
             ("origin", "http://evil.example:8080"),
             ("host", "evil.example:8080"),
         ]);
-        assert!(!origin_ok(&rebound, false, &hosts()));
+        assert!(origin_ok(&agree, false), "plain HTTP, the headers agree");
+        let agree_tls = headers(&[
+            ("origin", "https://evil.example:8080"),
+            ("host", "evil.example:8080"),
+        ]);
+        assert!(
+            origin_ok(&agree_tls, true),
+            "the certificate makes no difference here: the headers agree"
+        );
 
-        // The same request under plain HTTP passes. That transport carries no
-        // certificate, so it makes no claim about a name.
-        assert!(origin_ok(&rebound, false, &HostAllow::Any));
+        let disagree = headers(&[
+            ("origin", "http://evil.example:8080"),
+            ("host", "pirate.example:8080"),
+        ]);
+        assert!(
+            !origin_ok(&disagree, false),
+            "plain HTTP, the headers disagree"
+        );
+        let disagree_tls = headers(&[
+            ("origin", "https://evil.example:8080"),
+            ("host", "pirate.example:8080"),
+        ]);
+        assert!(
+            !origin_ok(&disagree_tls, true),
+            "the certificate makes no difference here: the headers disagree"
+        );
     }
 
     #[test]
@@ -1175,32 +831,25 @@ mod tests {
             ("host", "localhost:8080"),
             ("host", "evil.example"),
         ]);
-        assert!(!origin_ok(&two_hosts, false, &hosts()));
-        assert!(!origin_ok(&two_hosts, false, &HostAllow::Any));
+        assert!(!origin_ok(&two_hosts, false));
+        assert!(!origin_ok(&two_hosts, true));
 
         let two_origins = headers(&[
             ("origin", "http://localhost:8080"),
             ("origin", "http://evil.example"),
             ("host", "localhost:8080"),
         ]);
-        assert!(!origin_ok(&two_origins, false, &hosts()));
-        assert!(!origin_ok(&two_origins, false, &HostAllow::Any));
+        assert!(!origin_ok(&two_origins, false));
+        assert!(!origin_ok(&two_origins, true));
     }
 
     #[test]
     fn every_other_origin_fails() {
-        let hosts = hosts();
-
         // A missing header on either side.
-        assert!(!origin_ok(
-            &headers(&[("host", "localhost")]),
-            false,
-            &hosts
-        ));
+        assert!(!origin_ok(&headers(&[("host", "localhost")]), false));
         assert!(!origin_ok(
             &headers(&[("origin", "http://localhost")]),
-            false,
-            &hosts
+            false
         ));
 
         let cases = [
@@ -1222,7 +871,7 @@ mod tests {
         ];
         for (origin, host, tls) in cases {
             let map = headers(&[("origin", origin), ("host", host)]);
-            assert!(!origin_ok(&map, tls, &hosts), "{origin} and {host}");
+            assert!(!origin_ok(&map, tls), "{origin} and {host}");
         }
     }
 
@@ -1242,7 +891,6 @@ mod tests {
         let now = Instant::now();
         let mut guarded = Guarded {
             sessions: Vec::new(),
-            bucket: Bucket::new(now),
         };
         let id = guarded.insert(now).unwrap();
         let real = String::from_utf8(id.to_vec()).unwrap();
@@ -1260,17 +908,6 @@ mod tests {
     }
 
     #[test]
-    fn the_reader_stops_at_the_candidate_bound() {
-        let id = "a".repeat(64);
-        let mut text = String::new();
-        for _ in 0..MAX_COOKIE_CANDIDATES * 4 {
-            text.push_str(&format!("pirate_session={id}; "));
-        }
-        let map = headers(&[("cookie", &text)]);
-        assert_eq!(session_cookies(&map).len(), MAX_COOKIE_CANDIDATES);
-    }
-
-    #[test]
     fn a_pile_of_junk_pairs_does_not_hide_the_real_session() {
         // An attacker that reaches the cookie jar plants junk `pirate_session`
         // pairs, and RFC 6265 sorts them before the real one. A reader that
@@ -1280,24 +917,22 @@ mod tests {
         let now = Instant::now();
         let mut guarded = Guarded {
             sessions: Vec::new(),
-            bucket: Bucket::new(now),
         };
         let id = guarded.insert(now).unwrap();
         let real = String::from_utf8(id.to_vec()).unwrap();
 
         let junk = "0".repeat(64);
         let mut text = String::new();
-        for _ in 0..MAX_COOKIE_CANDIDATES - 1 {
+        for _ in 0..31 {
             text.push_str(&format!("pirate_session={junk}; "));
         }
         text.push_str(&format!("pirate_session={real}"));
 
         let candidates = session_cookies(&headers(&[("cookie", &text)]));
-        assert_eq!(candidates.len(), MAX_COOKIE_CANDIDATES);
+        assert_eq!(candidates.len(), 32);
         assert!(
             guarded.holds_any(&candidates),
-            "the real session must survive {} junk pairs before it",
-            MAX_COOKIE_CANDIDATES - 1
+            "the real session must survive 31 junk pairs before it",
         );
     }
 
@@ -1424,13 +1059,6 @@ mod tests {
         let path = directory.join("auth_token");
         load_or_create(&path).unwrap();
 
-        std::fs::write(&path, vec![b'x'; 5000]).unwrap();
-        set_mode(&path, 0o600);
-        assert!(matches!(
-            load_or_create(&path),
-            Err(TokenError::TooLarge { .. })
-        ));
-
         std::fs::write(&path, b"  \n").unwrap();
         set_mode(&path, 0o600);
         assert!(matches!(load_or_create(&path), Err(TokenError::Empty(_))));
@@ -1456,7 +1084,6 @@ mod tests {
         let now = Instant::now();
         let mut guarded = Guarded {
             sessions: Vec::new(),
-            bucket: Bucket::new(now),
         };
 
         let first = guarded.insert(now).unwrap();
@@ -1471,19 +1098,6 @@ mod tests {
         guarded.expire(now + SESSION_TTL + Duration::from_secs(1));
         assert!(guarded.sessions.is_empty());
         assert!(!guarded.holds_any(&[last]));
-    }
-
-    #[test]
-    fn the_bucket_stops_a_flood_and_refills_with_time() {
-        let now = Instant::now();
-        let mut bucket = Bucket::new(now);
-        for _ in 0..AUTH_BURST {
-            assert!(bucket.take(now));
-        }
-        assert!(!bucket.take(now));
-
-        // One second gives `AUTH_REFILL_PER_SECOND` attempts back.
-        assert!(bucket.take(now + Duration::from_secs(1)));
     }
 
     #[test]

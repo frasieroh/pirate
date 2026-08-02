@@ -9,9 +9,13 @@
  */
 
 import { readFileSync } from "node:fs";
-import { expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
 import type { Page } from "playwright";
 import { clientState, server, waitFor, waitForConnected, withClient } from "./harness";
+
+beforeEach(() => {
+  server().reset();
+});
 
 /** The absolute path of one fixture file. */
 function fixturePath(name: string): string {
@@ -36,9 +40,6 @@ test("an over-long theme name is clamped, and the record still persists across a
   // the cookie limit. The write was then rejected, silently, and every
   // later preference change failed to persist with it, because one cookie
   // holds the whole record.
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     // 80 codepoints of one emoji. `encodeURIComponent` expands each one to
     // twelve encoded characters, so this name alone would cost about 960
@@ -91,9 +92,6 @@ test("if a write to the cookie is still rejected, the menu shows the line", asyn
   // This also proves the fix for the live half of the defect: the fault
   // happens well after `initMenu` already ran with no fault, so only the
   // subscription that `src/menu.ts` registers there can show this line.
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     expect(await noteText(page)).toBe("");
 

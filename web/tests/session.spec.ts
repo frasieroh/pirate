@@ -6,7 +6,7 @@
  * The client must show that difference and must not keep the dead screen.
  */
 
-import { expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
 import {
   clientState,
   ESC,
@@ -20,9 +20,12 @@ import {
   withClient,
 } from "./harness";
 
+beforeEach(() => {
+  server().reset();
+});
+
 test("a dropped connection gives a new shell, and the old screen goes away", async () => {
   const stub = server();
-  stub.reset();
   stub.setOnOpen([{ tag: 0x00, text: "first shell ready\r\n$ " }]);
 
   await withClient(async (page) => {
@@ -58,7 +61,6 @@ test("a dropped connection gives a new shell, and the old screen goes away", asy
 
 test("the client sends the size of the terminal on every connection", async () => {
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await waitFor(
@@ -82,7 +84,6 @@ test("the client sends the size of the terminal on every connection", async () =
 
 test("a 0x02 frame shows the exit status and stops the reconnect", async () => {
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     stub.send([{ tag: 0x02, status: 3 }]);
@@ -104,7 +105,6 @@ test("a 0x02 frame shows the exit status and stops the reconnect", async () => {
 
 test("a 0x02 frame carries a big-endian i32 status", async () => {
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     stub.send([{ tag: 0x02, status: 130 }]);

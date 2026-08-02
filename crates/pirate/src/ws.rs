@@ -10,9 +10,8 @@
 //! upgrades anything.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -25,90 +24,6 @@ use crate::protocol::{server_tag, ClientFrame};
 use crate::session::{Frames, Session, DEFAULT_COLS, DEFAULT_ROWS, OUTPUT_BATCH};
 use crate::AppState;
 
-/// The number of terminals that can live at the same time.
-///
-/// One `/ws` connection forks a shell and starts a terminal thread, and
-/// `auth::MAX_SESSIONS` bounds the session COOKIES and not the connections. One
-/// cookie therefore opened any number of terminals, and `--no-password` needed
-/// no cookie at all. That is a fork bomb that a client reaches.
-///
-/// 64 matches `auth::MAX_SESSIONS` and it is far more than an operator uses. A
-/// request over the bound gets 503 and starts no process.
-const MAX_TERMINALS: usize = 64;
-
-// A bound of zero would answer 503 to every request, and the operator would
-// get a server that serves the web assets and no terminal.
-const _: () = assert!(MAX_TERMINALS > 0);
-
-/// The live terminals of one server.
-///
-/// The count lives in [`crate::AppState`], so two servers in one test binary
-/// bound each other nothing.
-#[derive(Debug)]
-pub struct Terminals {
-    live: Arc<AtomicUsize>,
-    bound: usize,
-}
-
-impl Default for Terminals {
-    fn default() -> Self {
-        Self::new(MAX_TERMINALS)
-    }
-}
-
-impl Terminals {
-    /// A count that holds `bound` terminals at the same time.
-    ///
-    /// The bound is a field and not a constant, so a test can build a server
-    /// with a small bound and open a few sockets instead of 64.
-    #[must_use]
-    pub fn new(bound: usize) -> Self {
-        Self {
-            live: Arc::new(AtomicUsize::new(0)),
-            bound,
-        }
-    }
-
-    /// The terminals that are live now. The tests read this value.
-    #[must_use]
-    pub fn live(&self) -> usize {
-        self.live.load(Ordering::Acquire)
-    }
-
-    /// Take one slot, or give `None` when the server is full.
-    ///
-    /// The update is one compare-and-swap, so two requests that arrive together
-    /// cannot both take the last slot.
-    fn take(&self) -> Option<TerminalSlot> {
-        let bound = self.bound;
-        self.live
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
-                (live < bound).then_some(live + 1)
-            })
-            .ok()?;
-        Some(TerminalSlot {
-            live: Arc::clone(&self.live),
-        })
-    }
-}
-
-/// One live terminal. The drop gives the slot back.
-///
-/// CAUTION: Keep the count in this guard. The slot must come back on EVERY
-/// path: a clean close, a dropped connection, a shell that exits, and a panic
-/// in the handler. A pair of hand-written increment and decrement calls leaks
-/// the slot on the panic path, and a leaked slot never comes back.
-#[derive(Debug)]
-pub struct TerminalSlot {
-    live: Arc<AtomicUsize>,
-}
-
-impl Drop for TerminalSlot {
-    fn drop(&mut self) {
-        self.live.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
 /// Upgrade the request, then start one session for it.
 ///
 /// `WebSocketUpgrade` is the last argument, because it consumes the request.
@@ -117,41 +32,28 @@ pub async fn upgrade(
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // All three tests answer before `on_upgrade`. That order is what stops an
-    // unauthenticated request, and a request over the bound, from starting a
-    // PTY and a shell.
-    if !crate::auth::origin_ok(&headers, state.tls, &state.hosts) {
+    // Both tests answer before `on_upgrade`. That order is what stops an
+    // unauthenticated request from starting a PTY and a shell.
+    if !crate::auth::origin_ok(&headers, state.tls) {
         return StatusCode::FORBIDDEN.into_response();
     }
     if !state.auth.is_authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let Some(slot) = state.terminals.take() else {
-        // The refusal is silent. One line per refusal gives a client a way to
-        // flood stderr, which is the same rule that the TLS handshake follows.
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
 
     let shell = state.shell.clone();
-    // The guard moves into the callback. axum drops that callback when the
-    // upgrade never completes, so a connection that dies in the handshake gives
-    // its slot back too.
-    ws.on_upgrade(move |socket| handle(socket, shell, slot))
+    ws.on_upgrade(move |socket| handle(socket, shell))
 }
 
-/// Serve one terminal. The slot comes back when this future ends.
-///
-/// CAUTION: Keep `_slot` in this signature. It is the live count of the server,
-/// and a drop of it anywhere earlier frees a slot that a shell still holds.
-async fn handle(socket: WebSocket, shell: PathBuf, _slot: TerminalSlot) {
+/// Serve one terminal.
+async fn handle(socket: WebSocket, shell: PathBuf) {
     // The browser sends its true size as a resize frame right after it
     // connects. These two values hold until then.
     let (mut session, frames) = match Session::spawn(&shell, DEFAULT_COLS, DEFAULT_ROWS) {
         Ok(started) => started,
         Err(e) => {
             // The client drives this path: it opens a socket, the spawn
-            // fails, the slot is released at once, and it opens another. See
-            // the CAUTION on `OnceFlag`.
+            // fails, and it opens another. See the CAUTION on `OnceFlag`.
             if SPAWN_REPORTED.first_time() {
                 eprintln!(
                     "pirate: cannot start `{}`: {e}. \
@@ -170,38 +72,14 @@ async fn handle(socket: WebSocket, shell: PathBuf, _slot: TerminalSlot) {
     session.shutdown().await;
 }
 
-/// The shortest time between two dumps that the client asked for.
-///
-/// A dump formats the whole screen, so a client that asks in a loop must not
-/// make the server format in a loop. Requests inside one interval collapse
-/// into one dump, and that dump goes out when the interval ends. The client
-/// therefore loses no repaint, and the server does at most four of these
-/// dumps per second for one socket.
-///
-/// This module is private, and the crate root re-exports this constant as
-/// `pirate::DUMP_INTERVAL`. The integration test
-/// `a_flood_of_dump_requests_collapses_into_a_few_dumps` reads it there. That
-/// test computes its ceiling from this value, so a change here moves the
-/// ceiling with it.
-pub const DUMP_INTERVAL: Duration = Duration::from_millis(250);
-
 /// Carry frames both ways until one side ends the connection.
 async fn pump(socket: WebSocket, session: &mut Session, mut frames: Frames) {
     let (mut sink, mut stream) = socket.split();
 
-    // A request that waits for its interval. Many requests collapse into this
-    // one flag, which is the whole of the coalesce.
-    let mut dump_pending = false;
-    // The deadline of the next dump. It starts in the past, so the first
-    // request goes out at once.
-    let mut next_dump_at = tokio::time::Instant::now();
-
     loop {
         tokio::select! {
-            // All three branches are cancel safe. `Frames::next` awaits a
-            // channel receive only, the socket stream keeps its state in
-            // itself, and `sleep_until` takes a deadline that this loop owns,
-            // so a cancelled sleep starts again at the same deadline.
+            // Both branches are cancel safe. `Frames::next` awaits a channel
+            // receive only, and the socket stream keeps its state in itself.
             frame = frames.next() => {
                 let Some(frame) = frame else { break };
                 if !drain(&mut sink, &mut frames, frame).await {
@@ -211,7 +89,7 @@ async fn pump(socket: WebSocket, session: &mut Session, mut frames: Frames) {
             message = stream.next() => {
                 match message {
                     Some(Ok(Message::Binary(bytes))) => {
-                        if !apply(session, &bytes, &mut dump_pending).await {
+                        if !apply(session, &bytes).await {
                             break;
                         }
                     }
@@ -223,13 +101,6 @@ async fn pump(socket: WebSocket, session: &mut Session, mut frames: Frames) {
                     Some(Ok(_)) => {}
                     Some(Err(_)) | None => break,
                 }
-            }
-            // The guard disables this branch when no request waits, so the
-            // loop never spins on an elapsed deadline.
-            () = tokio::time::sleep_until(next_dump_at), if dump_pending => {
-                dump_pending = false;
-                next_dump_at = tokio::time::Instant::now() + DUMP_INTERVAL;
-                session.request_dump();
             }
         }
     }
@@ -304,10 +175,7 @@ async fn drain(sink: &mut Sink, frames: &mut Frames, first: Vec<u8>) -> bool {
 }
 
 /// Apply one client frame. The result is false when the session must end.
-///
-/// A dump request raises `dump_pending` and does nothing else. The pump holds
-/// the rate, because a dump is the most expensive frame that this server sends.
-async fn apply(session: &mut Session, bytes: &[u8], dump_pending: &mut bool) -> bool {
+async fn apply(session: &mut Session, bytes: &[u8]) -> bool {
     match ClientFrame::decode(bytes) {
         Ok(ClientFrame::Input(input)) => match session.input(input).await {
             Ok(()) => true,
@@ -326,7 +194,7 @@ async fn apply(session: &mut Session, bytes: &[u8], dump_pending: &mut bool) -> 
             true
         }
         Ok(ClientFrame::Dump) => {
-            *dump_pending = true;
+            session.request_dump();
             true
         }
         // The browser is untrusted. A frame that does not decode is dropped,
@@ -351,8 +219,7 @@ async fn apply(session: &mut Session, bytes: &[u8], dump_pending: &mut bool) -> 
 /// `eprintln!` also takes the lock of stderr and writes at once, inside an
 /// async task, so a slow reader of that log stops a worker thread of tokio.
 ///
-/// `auth::hint_unknown_host` and the silent handshake failure of `tls.rs` hold
-/// the same rule.
+/// The silent handshake failure of `tls.rs` holds the same rule.
 pub(crate) struct OnceFlag(AtomicBool);
 
 impl OnceFlag {

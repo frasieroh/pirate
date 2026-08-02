@@ -10,7 +10,7 @@
  * test does not verify the production code against a copy of itself.
  */
 
-import { expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
 import type { Page } from "playwright";
 import {
   clientState,
@@ -24,6 +24,10 @@ import {
   waitForConnected,
   withClient,
 } from "./harness";
+
+beforeEach(() => {
+  server().reset();
+});
 
 /** The absolute path of one fixture file. */
 function fixture(name: string): string {
@@ -182,9 +186,6 @@ function dumpFrames(frames: Uint8Array[]): Uint8Array[] {
 }
 
 test("the default dark theme sets --pirate-bg, and term.options.theme matches", async () => {
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     expect(await cssVar(page, "--pirate-bg")).toBe("#16161e");
     expect((await termTheme(page)).background).toBe("#16161e");
@@ -193,9 +194,6 @@ test("the default dark theme sets --pirate-bg, and term.options.theme matches", 
 });
 
 test("switching to light changes --pirate-bg, --pirate-fg, and color-scheme", async () => {
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     await page.click("#theme-light");
     await waitFor(() => clientState(page).then((s) => s.mode), (mode) => mode === "light", "light mode");
@@ -207,31 +205,11 @@ test("switching to light changes --pirate-bg, --pirate-fg, and color-scheme", as
   });
 });
 
-test("the menu matches the active theme", async () => {
-  // The exact detail: a light terminal with a dark menu over it reads as
-  // unfinished software. The computed background of #menu must equal the
-  // computed --pirate-surface, and that surface must be light.
-  const stub = server();
-  stub.reset();
-
-  await withClient(async (page) => {
-    await page.click("#theme-light");
-    await waitFor(() => clientState(page).then((s) => s.mode), (mode) => mode === "light", "light mode");
-
-    const surface = await cssVar(page, "--pirate-surface");
-    expect(relativeLuminance(surface)).toBeGreaterThan(0.5);
-    expect(await menuBackground(page)).toBe(hexToRgbString(surface));
-  });
-});
-
 test("importing atom-one-light.itermcolors gives the exact colors of the file", async () => {
   // Hand-computed from the <real> components of tests/fixtures/atom-one-light.itermcolors:
   // Background Color  0.97647058823529409, 0.97647058823529409, 0.97647058823529409 -> #f9f9f9
   // Foreground Color  0.16470588235294117, 0.17254901960784313, 0.20000000000000001 -> #2a2c33
   // Ansi 1 Color (red) 0.87058823529411766, 0.24313725490196078, 0.20784313725490197 -> #de3e35
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     await page.setInputFiles("#theme-import", fixture("atom-one-light.itermcolors"));
     await waitFor(
@@ -254,9 +232,6 @@ test("importing atom-one-light.itermcolors gives the exact colors of the file", 
 
 test("importing 3024-night.itermcolors switches the mode to dark", async () => {
   // Hand-computed background: 0.03529411764705882, 0.011764705882352941, 0.0 -> #090300
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     // Start from light, so the switch to dark is a real change.
     await page.click("#theme-light");
@@ -280,9 +255,6 @@ test("a file with extra Color Space and Alpha Component keys still parses", asyn
   // tests/fixtures/hand-made-with-extras.itermcolors is not a real iTerm2
   // export. The theme worker wrote it by hand to prove the parser tolerates
   // the two extra keys that a real export adds to every color.
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     await page.setInputFiles("#theme-import", fixture("hand-made-with-extras.itermcolors"));
     await waitFor(
@@ -302,9 +274,6 @@ test("a file with extra Color Space and Alpha Component keys still parses", asyn
 });
 
 test("a file that is not a plist gives the error line, and changes no color", async () => {
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     const before = await cssVar(page, "--pirate-bg");
     const beforeState = await clientState(page);
@@ -320,9 +289,6 @@ test("a file that is not a plist gives the error line, and changes no color", as
 });
 
 test("the imported theme survives a page reload", async () => {
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     await page.setInputFiles("#theme-import", fixture("atom-one-light.itermcolors"));
     await waitFor(
@@ -347,9 +313,6 @@ test("the light palette meets the contrast floors", async () => {
   // background. Every bright color reaches 3:1. The values come from the
   // running client, through term.options.theme, not from a copy pasted into
   // this file.
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     await page.click("#theme-light");
     await waitFor(() => clientState(page).then((s) => s.mode), (mode) => mode === "light", "light mode");
@@ -386,7 +349,6 @@ test("a theme change refills the screen from the dump, and sends no resize frame
   // and the `0x02` dump request brings the screen back from the server. The
   // guard that stays from the old behavior: the rebuild sends no resize frame.
   const stub = server();
-  stub.reset();
   stub.setOnDump([{ tag: 0x01, text: "pirate" }]);
 
   await withClient(async (page) => {
@@ -452,9 +414,6 @@ test("a theme change refills the screen from the dump, and sends no resize frame
 test("a theme change repaints the menu at once, with no reload", async () => {
   // The custom properties, the menu, and the terminal all follow the new
   // theme. No part of the client waits for a page reload.
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     expect(await cssVar(page, "--pirate-bg")).toBe("#16161e");
     const menuBefore = await menuBackground(page);
@@ -476,7 +435,6 @@ test("a theme change shows no note, because the client needs no reload", async (
   // of one: the reload ended the shell. The rebuild removed that cost, so the
   // line went with it. Both lines of the menu stay empty.
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     expect(await hintText(page)).toBe("");
@@ -496,7 +454,6 @@ test("a theme change shows no note, because the client needs no reload", async (
 
 test("an import rebuilds the terminal too, and shows no note", async () => {
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await markTerminal(page);
@@ -525,7 +482,6 @@ test("a page load sends no dump request, because the constructor holds the store
   // theme to the constructor of the terminal, so a rebuild on that path would
   // throw away the screen for nothing.
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     // A fresh page, with the default theme.
@@ -556,7 +512,6 @@ test("a theme change builds a new terminal, and sends one 0x02 frame and no 0x01
   // starts at the default size, so `applyFit` compares against the size that
   // the server knows and not against the size of the new terminal.
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await waitFor(
@@ -599,7 +554,6 @@ test("the shell survives a theme change: one connection, and a key still reaches
   // stub counts no second connection, and the next keystroke of the operator
   // arrives as a `0x00` input frame from the new terminal.
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     expect(stub.connections).toBe(1);
@@ -634,7 +588,6 @@ test("the shell survives a theme change: one connection, and a key still reaches
 
 test("the new terminal carries the new theme, and its canvas paints the new background", async () => {
   const stub = server();
-  stub.reset();
   stub.setOnDump([{ tag: 0x01, text: "light" }]);
 
   await withClient(async (page) => {
@@ -678,7 +631,6 @@ test("a rebuild removes the document mouseup listener that ghostty-web leaks", a
   // `src/main.ts` removes it. Without that call the count grows by one for
   // each theme change.
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await watchMouseUpListeners(page);
@@ -712,7 +664,6 @@ test("a theme change after a server 0x02 frame keeps the screen of the dead shel
   // output of that shell. A rebuild would dispose that terminal, get no dump,
   // and leave a blank screen with no way back.
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     stub.send([{ tag: 0x00, text: "last words" }]);
@@ -755,7 +706,6 @@ test("a theme change on a closed socket lands on the next open socket", async ()
   // the new terminal with it. The dump request then goes out on an open
   // socket, so the new terminal gets its screen.
   const stub = server();
-  stub.reset();
   stub.setOnOpen([{ tag: 0x01, text: "shell 2" }]);
 
   await withClient(async (page) => {
@@ -808,7 +758,6 @@ test("a theme change on a closed socket lands on the next open socket", async ()
 
 test("a theme change sends no resize frame, and the terminal size stays the same", async () => {
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await waitFor(

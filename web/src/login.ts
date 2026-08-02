@@ -2,8 +2,6 @@ import "./login.css";
 
 /** The error line for a token that the server refused. */
 const WRONG_TOKEN = "wrong token";
-/** The error line for an empty rate limiter. */
-const TOO_MANY = "too many attempts. Wait, then try again.";
 /** The error line for a request that never reached the server. */
 const NO_ANSWER = "no answer from the server. Try again.";
 
@@ -88,8 +86,6 @@ async function postToken(token: string): Promise<string | null> {
       return null;
     case 401:
       return WRONG_TOKEN;
-    case 429:
-      return TOO_MANY;
     default:
       return `server error ${response.status}`;
   }

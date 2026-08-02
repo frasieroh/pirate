@@ -59,7 +59,7 @@ export const DARK: Theme = {
  *
  * Every normal color and the foreground reach a contrast ratio of 4.5 to 1
  * against the background. Every bright color reaches 3 to 1.
- * `tests/theme.spec.ts` measures this with `contrastRatio`, below.
+ * `tests/theme.spec.ts` measures this with its own copy of `contrastRatio`.
  */
 export const LIGHT: Theme = {
   name: "pirate light",
@@ -129,15 +129,6 @@ function linearChannel(byte: number): number {
 export function relativeLuminance(hex: string): number {
   const { r, g, b } = hexToRgb(hex);
   return 0.2126 * linearChannel(r) + 0.7152 * linearChannel(g) + 0.0722 * linearChannel(b);
-}
-
-/** The WCAG contrast ratio of two colors, from 1 (no contrast) to 21. */
-export function contrastRatio(a: string, b: string): number {
-  const la = relativeLuminance(a);
-  const lb = relativeLuminance(b);
-  const lighter = Math.max(la, lb);
-  const darker = Math.min(la, lb);
-  return (lighter + 0.05) / (darker + 0.05);
 }
 
 /**

@@ -7,7 +7,7 @@
  * debounce as a window drag, never two.
  */
 
-import { expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
 import {
   clientState,
   framesWithTag,
@@ -19,6 +19,10 @@ import {
   waitForConnected,
   withClient,
 } from "./harness";
+
+beforeEach(() => {
+  server().reset();
+});
 
 /** Every resize frame that the client sent. Mirrors `tests/resize.spec.ts`. */
 function resizeFrames(frames: Uint8Array[]): Uint8Array[] {
@@ -35,7 +39,6 @@ function frameDims(frame: Uint8Array): { cols: number; rows: number } {
 
 test("one font size change gives exactly one resize frame, with the new size", async () => {
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await waitFor(
@@ -72,9 +75,6 @@ test("one font size change gives exactly one resize frame, with the new size", a
 });
 
 test("a larger font gives fewer columns, and a smaller font gives more columns", async () => {
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     const debounce = (await clientState(page)).resizeDebounceMs;
     const original = await size(page);
@@ -105,7 +105,6 @@ test("a larger font gives fewer columns, and a smaller font gives more columns",
 
 test("three rapid changes give exactly one resize frame", async () => {
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await waitFor(
@@ -141,7 +140,6 @@ test("the hotkeys change the size, and send no input frame", async () => {
   // The double-send guard. The registry stops the chord in the capture
   // phase, so ghostty-web never encodes it and the client sends no bytes.
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await page.focus("#terminal");
@@ -181,9 +179,6 @@ test("the hotkeys change the size, and send no input frame", async () => {
 });
 
 test("the size clamps at 8, and the decrease button is disabled there", async () => {
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     // 30 presses is more than the whole range (8 to 32). Every press past the
     // limit does nothing, because a disabled button takes no click.
@@ -207,9 +202,6 @@ test("the size clamps at 8, and the decrease button is disabled there", async ()
 });
 
 test("the size clamps at 32, and the increase button is disabled there", async () => {
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     await page.evaluate(() => {
       const button = document.getElementById("font-increase") as HTMLButtonElement;
@@ -231,9 +223,6 @@ test("the size clamps at 32, and the increase button is disabled there", async (
 });
 
 test("the font size survives a page reload", async () => {
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     await page.click("#font-increase");
     await page.click("#font-increase");

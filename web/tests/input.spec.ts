@@ -7,10 +7,14 @@
  * stub server received.
  */
 
-import { expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
 import type { Page } from "playwright";
 import { framesWithTag, hex, idle, server, waitFor, withClient } from "./harness";
 import type { Stub } from "./stub-server";
+
+beforeEach(() => {
+  server().reset();
+});
 
 /** Press one key and return the frame that the client sent for it. */
 async function press(page: Page, stub: Stub, key: string): Promise<Uint8Array> {
@@ -31,7 +35,6 @@ function show(key: string, frame: Uint8Array): string {
 
 test("each key gives one 0x00 frame with the encoded bytes", async () => {
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await page.focus("#terminal");
@@ -89,7 +92,6 @@ test("the corrected chords give the right bytes, each in one frame", async () =>
   // goes through `attachCustomKeyEventHandler` in `src/input.ts`, and each
   // must give exactly one frame, with the bytes of a real terminal.
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await page.focus("#terminal");
@@ -128,7 +130,6 @@ test("Alt plus a letter reads event.code, not the composed macOS character", asy
   // show this: Playwright gives the literal `b` as `event.key`, with no
   // composition. This test dispatches the real macOS pairs directly.
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await page.focus("#terminal");
@@ -190,7 +191,6 @@ test("a broad sweep of chords gives one frame each, with the right bytes", async
   // chords, the navigation keys, the function keys, and more. Every chord
   // here must give exactly one frame. A double path would show as two.
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await page.focus("#terminal");
@@ -250,7 +250,6 @@ test("a broad sweep of chords gives one frame each, with the right bytes", async
 
 test("typed text gives one frame for each character", async () => {
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await page.focus("#terminal");

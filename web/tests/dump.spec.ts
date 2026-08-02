@@ -12,7 +12,7 @@
  * see a stale screen, because the parser is never the part that fails.
  */
 
-import { expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
 import {
   canvasSignature,
   countRenders,
@@ -27,6 +27,10 @@ import {
   waitFor,
   withClient,
 } from "./harness";
+
+beforeEach(() => {
+  server().reset();
+});
 
 /**
  * A screen of `rows` numbered lines, in the form of a state dump.
@@ -46,7 +50,6 @@ function screenText(rows: number, mark: string): string {
 
 test("a 0x01 frame on a new connection paints the screen", async () => {
   const stub = server();
-  stub.reset();
   stub.setOnOpen([{ tag: 0x01, text: screenText(20, "dump") }]);
 
   await withClient(async (page) => {
@@ -61,7 +64,6 @@ test("one large 0x01 frame after live output repaints the screen with no other e
   // The backpressure case: the server drops the backlog of a slow client and
   // sends one dump. Nothing follows it.
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     const { rows } = await size(page);
@@ -105,7 +107,6 @@ test("control: with the paint loop stopped, the same dump leaves a stale screen"
   // parsing and painting are independent: the cells hold the dump while the
   // canvas still holds the old screen.
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     const { rows } = await size(page);
@@ -134,7 +135,6 @@ test("the renderer keeps running while the stream is quiet", async () => {
   // unconditional requestAnimationFrame loop, so a quiet stream still gets
   // frames and a dump cannot wait for another event.
   const stub = server();
-  stub.reset();
   stub.setOnOpen([{ tag: 0x01, text: screenText(5, "dump") }]);
 
   await withClient(async (page) => {

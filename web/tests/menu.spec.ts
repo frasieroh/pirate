@@ -8,7 +8,7 @@
  * come back after a reload, because the cookie is the whole store.
  */
 
-import { expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
 import type { Page } from "playwright";
 import {
   clientState,
@@ -21,6 +21,10 @@ import {
   waitForConnected,
   withClient,
 } from "./harness";
+
+beforeEach(() => {
+  server().reset();
+});
 
 /** The text of one chord button. */
 async function chordText(page: Page, id: string): Promise<string> {
@@ -78,9 +82,6 @@ async function headingOf(page: Page, id: string): Promise<string> {
 }
 
 test("the menu opens, collapses, and hides", async () => {
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     expect(await menuState(page)).toBe("open");
     expect(await page.isVisible("#menu-body")).toBe(true);
@@ -106,9 +107,6 @@ test("every row sits under the heading that governs it", async () => {
   // the font size is part of the theme. This test reads the headings and the
   // rows out of the DOM, in the order of the screen, and compares the whole
   // structure.
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     const { groups, loose } = await menuGroups(page);
     // eslint-disable-next-line no-console
@@ -158,9 +156,6 @@ test("every row sits under the heading that governs it", async () => {
 });
 
 test("the hotkey takes the menu off the screen and brings it back", async () => {
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     await page.focus("#terminal");
     await page.keyboard.press("Alt+h");
@@ -177,7 +172,6 @@ test("the hotkey sends no input frame", async () => {
   // The double-send guard. The registry stops the event in the capture phase,
   // so ghostty-web never encodes it and the client sends no bytes.
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await page.focus("#terminal");
@@ -205,9 +199,6 @@ test("the hotkey sends no input frame", async () => {
 });
 
 test("a rebound chord takes effect, and the old chord does nothing", async () => {
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     expect(await chordText(page, "toggleMenu")).toBe("alt+h");
 
@@ -236,9 +227,6 @@ test("a rebound chord takes effect, and the old chord does nothing", async () =>
 });
 
 test("a chord without a modifier is refused, and so is a chord in use", async () => {
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     await page.click("#key-fontIncrease");
     await page.keyboard.press("k");
@@ -270,9 +258,6 @@ test("a chord without a modifier is refused, and so is a chord in use", async ()
 });
 
 test("the menu state and the chords come back after a reload", async () => {
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     await page.click("#key-fontDecrease");
     await page.keyboard.press("Alt+j");
@@ -299,9 +284,6 @@ test("the menu state and the chords come back after a reload", async () => {
 });
 
 test("the store keeps no token, in any form", async () => {
-  const stub = server();
-  stub.reset();
-
   await withClient(async (page) => {
     // A page that changes nothing writes nothing. One change makes the store
     // write, and the write must reach one cookie and nothing else.
@@ -328,7 +310,6 @@ test("the menu changes no box, so it gives no resize frame", async () => {
   // of `body` would change the height of the terminal, the fit would run, and
   // the client would send a resize frame for a change that no window made.
   const stub = server();
-  stub.reset();
 
   await withClient(async (page) => {
     await waitFor(

@@ -119,15 +119,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let source = transport(&args)?;
-    if args.plaintext {
-        eprintln!(
-            "pirate: CAUTION: Use --selfsigned or --cert to encrypt the transport. \
-             --plaintext sends every keystroke and every byte of the screen in the clear."
-        );
-    }
+
+    // Bind BEFORE the build of the TLS configuration. `tls::build` puts the
+    // real bound address into the generated certificate, and with `--port 0`
+    // that address does not exist until the bind above resolves the port.
+    let addr = SocketAddr::new(args.bind, args.port);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
 
     let tls = match &source {
-        Some(source) => Some(pirate::tls::build(source)?),
+        Some(source) => Some(pirate::tls::build(source, addr)?),
         None => None,
     };
 
@@ -145,52 +146,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shell = args.shell.unwrap_or_else(pirate::session::default_shell);
     eprintln!("pirate: shell {}", shell.display());
 
-    // The transport gives the names that the server answers to. That one
-    // decision lives in `auth.rs`, where a unit test holds its two arms apart.
-    let hosts = pirate::auth::HostAllow::from_certificate(tls.as_ref().map(|tls| &tls.leaf));
-
     let state = Arc::new(AppState {
         assets_dir: args.assets_dir,
         shell,
         auth,
         tls: tls.is_some(),
-        hosts,
-        terminals: pirate::Terminals::default(),
     });
 
-    let addr = SocketAddr::new(args.bind, args.port);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let addr = listener.local_addr()?;
-
-    // These are the names that the server answers to. A request that carries
-    // any other name in `Host` gets a 403.
+    // These are the names of the certificates. The browser matches the name
+    // that the operator typed against this list, and pirate compares no name
+    // itself; the browser alone judges the match.
     //
-    // CAUTION: The list comes from `tls.names`, which pirate READ BACK from the
-    // certificate that it serves. An earlier line called the generator a second
-    // time and printed what the generator was asked for, so a name that the
-    // certificate dropped still reached the operator. Every source prints this
-    // one line, because a path to a PEM file is not a list of names.
+    // CAUTION: Every name here comes from `tls::certificate_names`, which
+    // pirate READ BACK from the certificate that it serves. An earlier line
+    // called the generator a second time and printed what the generator was
+    // asked for, so a name that the certificate dropped still reached the
+    // operator.
+    //
+    // With `--cert`, pirate can serve two certificates, so this block reports
+    // both: the supplied certificate first, and the generated fallback that
+    // pirate serves for a name the supplied certificate does not cover. With
+    // no supplied certificate, pirate reports the generated certificate alone,
+    // in the same words as before this fallback existed.
     if let Some(tls) = &tls {
-        eprintln!("pirate: this certificate covers {}", tls.names.join(", "));
-    }
-
-    if let (Some(TlsSource::SelfSigned), Some(tls)) = (&source, &tls) {
-        eprintln!("pirate: nothing signed this certificate, so the browser will show a warning.");
-        eprintln!("pirate: compare this fingerprint with the one in that warning:");
-        eprintln!("pirate: {}", tls.fingerprint);
+        match &tls.supplied {
+            None => {
+                eprintln!(
+                    "pirate: this certificate covers {}",
+                    tls.selfsigned.names.join(", ")
+                );
+                eprintln!(
+                    "pirate: nothing signed this certificate, so the browser will show a warning."
+                );
+                eprintln!("pirate: compare this fingerprint with the one in that warning:");
+                eprintln!("pirate: {}", tls.selfsigned.fingerprint);
+            }
+            Some(supplied) => {
+                eprintln!(
+                    "pirate: the supplied certificate covers {}",
+                    supplied.names.join(", ")
+                );
+                eprintln!(
+                    "pirate: supplied certificate fingerprint: {}",
+                    supplied.fingerprint
+                );
+                eprintln!(
+                    "pirate: for every other name, pirate falls back to a self-signed \
+                     certificate covering {}",
+                    tls.selfsigned.names.join(", ")
+                );
+                eprintln!(
+                    "pirate: nothing signed that certificate, so the browser will show a \
+                     warning for it."
+                );
+                eprintln!("pirate: compare this fingerprint with the one in that warning:");
+                eprintln!("pirate: {}", tls.selfsigned.fingerprint);
+            }
+        }
     }
 
     let scheme = if tls.is_some() { "https" } else { "http" };
     eprintln!("pirate: listening on {scheme}://{addr}");
 
-    if !args.bind.is_loopback() {
+    if !loopback(args.bind) {
+        if args.plaintext {
+            eprintln!(
+                "pirate: CAUTION: Use --selfsigned or --cert to encrypt the transport. \
+                 --plaintext sends every keystroke and every byte of the screen in the clear."
+            );
+        }
         if args.no_password {
             eprintln!(
                 "pirate: CAUTION: Drop --no-password, or bind to loopback. The bind address {} \
                  gives a shell to every host that can reach this port.",
                 args.bind
             );
-        } else if tls.is_none() {
+        }
+        if tls.is_none() {
             eprintln!(
                 "pirate: CAUTION: Use --selfsigned or --cert on this bind address. \
                  Plain HTTP puts the token on the network in the clear."
@@ -198,8 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         // A second risk of the same transport, and it is not the token. The
         // certificate is what states the names that the server answers to, so a
-        // server without one answers to every name. `--hostname` used to warn
-        // here, and the transport carries that duty now.
+        // server without one answers to every name.
         if tls.is_none() {
             eprintln!(
                 "pirate: CAUTION: Use --selfsigned or --cert on this bind address. \
@@ -212,35 +243,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The two branches give `axum::serve` two listener types, and therefore two
     // types of server. A trait object cannot hold them, because the trait has
     // an associated type for the connection.
-    //
-    // CAUTION: Keep `Timeout` on BOTH branches. It is the only bound on the
-    // read of the request headers, because `axum::serve` builds its hyper
-    // connection inline and takes no configuration. Without it, one client
-    // holds a connection open forever with one byte a minute. On the TLS
-    // branch the wrapper goes OUTSIDE the TLS listener, so its deadline starts
-    // after the handshake and `tls::HANDSHAKE_TIMEOUT` covers the handshake.
     match tls {
         Some(tls) => {
             axum::serve(
-                pirate::timeout::Timeout::new(
-                    pirate::tls::TlsListener::new(pirate::NoDelay(listener), tls.config),
-                    pirate::timeout::HEADER_TIMEOUT,
-                ),
+                pirate::tls::TlsListener::new(pirate::NoDelay(listener), tls.config),
                 router(state),
             )
             .with_graceful_shutdown(shutdown())
             .await?;
         }
         None => {
-            axum::serve(
-                pirate::timeout::Timeout::new(
-                    pirate::NoDelay(listener),
-                    pirate::timeout::HEADER_TIMEOUT,
-                ),
-                router(state),
-            )
-            .with_graceful_shutdown(shutdown())
-            .await?;
+            axum::serve(pirate::NoDelay(listener), router(state))
+                .with_graceful_shutdown(shutdown())
+                .await?;
         }
     }
     Ok(())
@@ -284,10 +299,6 @@ fn transport(args: &Args) -> Result<Option<TlsSource>, Box<dyn std::error::Error
 /// IPv4-mapped form `::ffff:127.0.0.1` fails that test although the socket it
 /// gives accepts from 127.0.0.1 only. This function unmaps first, so the two
 /// spellings of one address get one answer.
-///
-/// Only [`transport`] uses this. The CAUTION lines keep the plain test, because
-/// that test errs toward printing a warning on a mapped address, and more
-/// warnings is the safe direction.
 fn loopback(address: IpAddr) -> bool {
     let address = match address {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(address, IpAddr::V4),

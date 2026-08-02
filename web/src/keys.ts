@@ -149,11 +149,6 @@ export function chords(): Record<BindingId, string> {
   return { ...chordOf };
 }
 
-/** The chord of one binding. */
-export function chordFor(id: BindingId): string {
-  return chordOf[id];
-}
-
 /** The binding that holds `chord`, or null when no binding holds it. */
 function bindingFor(chord: string): BindingId | null {
   for (const [id, value] of Object.entries(chordOf) as Array<[BindingId, string]>) {
