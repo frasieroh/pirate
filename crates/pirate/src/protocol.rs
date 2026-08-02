@@ -10,6 +10,7 @@
 //! | server to client | `0x02` | process exited: `i32` status |
 //! | client to server | `0x00` | encoded input bytes |
 //! | client to server | `0x01` | resize: `u16` cols, then `u16` rows |
+//! | client to server | `0x02` | ask for a full-state dump: no payload |
 //!
 //! This table is a fixed contract. The browser client is written against it.
 //! A change here breaks the other half of the program.
@@ -35,6 +36,11 @@ pub mod client_tag {
     pub const INPUT: u8 = 0x00;
     /// A new window size: `u16` cols, then `u16` rows.
     pub const RESIZE: u8 = 0x01;
+    /// A request for a full-state dump. The frame carries no payload.
+    ///
+    /// The server answers with one `0x01` dump, the same frame that it sends
+    /// when a socket opens.
+    pub const DUMP: u8 = 0x02;
 }
 
 /// One frame from the server to the browser.
@@ -95,6 +101,8 @@ pub enum ClientFrame<'a> {
         /// The number of rows.
         rows: u16,
     },
+    /// A request for a full-state dump.
+    Dump,
 }
 
 impl<'a> ClientFrame<'a> {
@@ -110,6 +118,7 @@ impl<'a> ClientFrame<'a> {
                 out.extend_from_slice(&rows.to_be_bytes());
                 out
             }
+            Self::Dump => vec![client_tag::DUMP],
         }
     }
 
@@ -131,6 +140,17 @@ impl<'a> ClientFrame<'a> {
                     cols: u16::from_be_bytes([size[0], size[1]]),
                     rows: u16::from_be_bytes([size[2], size[3]]),
                 })
+            }
+            client_tag::DUMP => {
+                if payload.is_empty() {
+                    Ok(Self::Dump)
+                } else {
+                    Err(DecodeError::BadLength {
+                        tag,
+                        len: payload.len(),
+                        need: 0,
+                    })
+                }
             }
             other => Err(DecodeError::UnknownTag(other)),
         }
@@ -228,7 +248,7 @@ mod tests {
         );
     }
 
-    // --- The two client frame shapes --- //
+    // --- The three client frame shapes --- //
 
     #[test]
     fn input_frame_round_trip() {
@@ -270,6 +290,13 @@ mod tests {
     }
 
     #[test]
+    fn dump_request_round_trip() {
+        // The tag alone. A dump request carries no payload.
+        assert_eq!(ClientFrame::Dump.encode(), vec![0x02]);
+        assert_eq!(ClientFrame::decode(&[0x02]), Ok(ClientFrame::Dump));
+    }
+
+    #[test]
     fn empty_payloads_are_legal() {
         assert_eq!(
             ServerFrame::decode(&[0x00]),
@@ -292,8 +319,8 @@ mod tests {
     #[test]
     fn an_unknown_tag_is_an_error() {
         assert_eq!(
-            ClientFrame::decode(&[0x02, 0, 0, 0, 0]),
-            Err(DecodeError::UnknownTag(0x02))
+            ClientFrame::decode(&[0x03, 0, 0, 0, 0]),
+            Err(DecodeError::UnknownTag(0x03))
         );
         assert_eq!(
             ServerFrame::decode(&[0xff]),
@@ -322,6 +349,18 @@ mod tests {
                 tag: 0x01,
                 len: 5,
                 need: 4
+            })
+        );
+    }
+
+    #[test]
+    fn a_dump_request_with_a_payload_is_an_error() {
+        assert_eq!(
+            ClientFrame::decode(&[0x02, 0x00]),
+            Err(DecodeError::BadLength {
+                tag: 0x02,
+                len: 1,
+                need: 0
             })
         );
     }

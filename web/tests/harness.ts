@@ -275,13 +275,21 @@ export async function menuState(page: Page): Promise<string> {
 }
 
 /**
- * Count the canvas pixels of one row band that differ from the theme
- * background.
+ * Count the canvas pixels of one row band that differ from a background color.
+ *
+ * The default background is the dark default theme, the theme that a fresh
+ * page loads. A test that changed the theme passes the background of the new
+ * theme. A count against the wrong background counts the whole row, because
+ * one background differs from the other on every pixel.
  *
  * This is the only pixel-level measurement. It proves that the canvas holds
  * paint. It makes no claim about the shape of any glyph.
  */
-export function paintedPixels(page: Page, row: number): Promise<number> {
+export function paintedPixels(
+  page: Page,
+  row: number,
+  background: [number, number, number] = BACKGROUND,
+): Promise<number> {
   return page.evaluate(
     ({ row: y, background }: { row: number; background: [number, number, number] }) => {
       const canvas = document.querySelector("#terminal canvas") as HTMLCanvasElement | null;
@@ -309,7 +317,7 @@ export function paintedPixels(page: Page, row: number): Promise<number> {
       }
       return count;
     },
-    { row, background: BACKGROUND },
+    { row, background },
   );
 }
 

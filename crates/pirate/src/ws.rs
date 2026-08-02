@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -62,14 +63,37 @@ async fn handle(socket: WebSocket, shell: PathBuf) {
     session.shutdown().await;
 }
 
+/// The shortest time between two dumps that the client asked for.
+///
+/// A dump formats the whole screen, so a client that asks in a loop must not
+/// make the server format in a loop. Requests inside one interval collapse
+/// into one dump, and that dump goes out when the interval ends. The client
+/// therefore loses no repaint, and the server does at most four of these
+/// dumps per second for one socket.
+///
+/// This constant is public because the integration test
+/// `a_flood_of_dump_requests_collapses_into_a_few_dumps` reads it. The test
+/// computes its ceiling from this value, so a change here moves the ceiling
+/// with it.
+pub const DUMP_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Carry frames both ways until one side ends the connection.
 async fn pump(socket: WebSocket, session: &mut Session, mut frames: Frames) {
     let (mut sink, mut stream) = socket.split();
 
+    // A request that waits for its interval. Many requests collapse into this
+    // one flag, which is the whole of the coalesce.
+    let mut dump_pending = false;
+    // The deadline of the next dump. It starts in the past, so the first
+    // request goes out at once.
+    let mut next_dump_at = tokio::time::Instant::now();
+
     loop {
         tokio::select! {
-            // Both branches are cancel safe. `Frames::next` awaits a channel
-            // receive only, and the socket stream keeps its state in itself.
+            // All three branches are cancel safe. `Frames::next` awaits a
+            // channel receive only, the socket stream keeps its state in
+            // itself, and `sleep_until` takes a deadline that this loop owns,
+            // so a cancelled sleep starts again at the same deadline.
             frame = frames.next() => {
                 let Some(frame) = frame else { break };
                 if !drain(&mut sink, &mut frames, frame).await {
@@ -79,7 +103,7 @@ async fn pump(socket: WebSocket, session: &mut Session, mut frames: Frames) {
             message = stream.next() => {
                 match message {
                     Some(Ok(Message::Binary(bytes))) => {
-                        if !apply(session, &bytes).await {
+                        if !apply(session, &bytes, &mut dump_pending).await {
                             break;
                         }
                     }
@@ -88,6 +112,13 @@ async fn pump(socket: WebSocket, session: &mut Session, mut frames: Frames) {
                     Some(Ok(_)) => {}
                     Some(Err(_)) | None => break,
                 }
+            }
+            // The guard disables this branch when no request waits, so the
+            // loop never spins on an elapsed deadline.
+            () = tokio::time::sleep_until(next_dump_at), if dump_pending => {
+                dump_pending = false;
+                next_dump_at = tokio::time::Instant::now() + DUMP_INTERVAL;
+                session.request_dump();
             }
         }
     }
@@ -158,7 +189,10 @@ async fn drain(sink: &mut Sink, frames: &mut Frames, first: Vec<u8>) -> bool {
 }
 
 /// Apply one client frame. The result is false when the session must end.
-async fn apply(session: &mut Session, bytes: &[u8]) -> bool {
+///
+/// A dump request raises `dump_pending` and does nothing else. The pump holds
+/// the rate, because a dump is the most expensive frame that this server sends.
+async fn apply(session: &mut Session, bytes: &[u8], dump_pending: &mut bool) -> bool {
     match ClientFrame::decode(bytes) {
         Ok(ClientFrame::Input(input)) => match session.input(input).await {
             Ok(()) => true,
@@ -169,6 +203,10 @@ async fn apply(session: &mut Session, bytes: &[u8]) -> bool {
             if let Err(e) = session.resize(cols, rows) {
                 eprintln!("pirate: cannot resize the terminal: {e}");
             }
+            true
+        }
+        Ok(ClientFrame::Dump) => {
+            *dump_pending = true;
             true
         }
         // The browser is untrusted. A frame that does not decode is dropped,

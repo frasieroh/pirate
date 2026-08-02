@@ -181,50 +181,11 @@ function paintProperties(theme: Theme): void {
   root.style.colorScheme = slotFor(theme);
 }
 
-/**
- * Give the renderer the color record of `theme`. This paints nothing.
- *
- * ghostty-web 0.4.0 cannot recolor a canvas that already holds text. The
- * client does not try. CLIENT-NOTES.md, section "The theme repaint, and why
- * the client does not attempt one", holds the five measurements. The short
- * form: `setTheme` assigns a record only, a forced `render` repaints the old
- * baked colors, new output after a theme change still paints in the old
- * colors, and `renderer.resize` clears the canvas and blanks every glyph. A
- * blank screen looks like a lost session. This function therefore calls
- * `resize` no more.
- *
- * The terminal therefore keeps its text, in the old colors, until the
- * operator reloads the page. `RELOAD_NOTE` states that in the menu. Only a
- * theme given to the `Terminal` constructor takes effect, so the reload is
- * the whole remedy.
- *
- * This call stays because the renderer reads the record when it builds a
- * canvas again, after a font change or a window resize. It changes no pixel
- * now, and it changes neither `term.cols` nor `term.rows`, so a theme change
- * sends no resize frame. `tests/theme.spec.ts` measures both facts.
- */
-function syncRendererTheme(runtime: Runtime, theme: Theme): void {
-  const renderer = runtime.term.renderer;
-  if (renderer === undefined) {
-    return;
-  }
-  renderer.setTheme(theme);
-}
-
 /** The text of the mode buttons. */
 const DARK_LABEL = "dark";
 const LIGHT_LABEL = "light";
 /** The text of the import control. */
 const IMPORT_LABEL = "choose file";
-/**
- * The line that follows a theme change. It names the limit and the cost.
- *
- * The operator must read the second sentence before the reload, not after
- * it. `src/main.ts` documents that each client owns one PTY, and that the
- * server sends SIGHUP when the socket closes.
- */
-const RELOAD_NOTE =
-  "The terminal keeps the old colors until a page reload. A reload stops the shell and starts a new shell.";
 
 /**
  * Hide `input` from the screen, and keep it in the tab order.
@@ -295,11 +256,18 @@ export function installTheme(runtime: Runtime): void {
     lightButton.setAttribute("aria-pressed", String(mode === "light"));
   }
 
-  /** Paint `theme` as the theme of `mode`. This writes nothing to the store. */
+  /**
+   * Paint `theme` as the theme of `mode`. This writes nothing to the store.
+   *
+   * This covers the page, the menu, the login view, and the record on the
+   * terminal. The canvas of the terminal takes its colors from the constructor
+   * of the terminal, so `activate` builds the terminal again. The load path
+   * needs no such build: `src/main.ts` already gave the stored theme to the
+   * constructor.
+   */
   function paint(theme: Theme, mode: Mode): void {
     paintProperties(theme);
     runtime.term.options.theme = theme;
-    syncRendererTheme(runtime, theme);
     runtime.state.mode = mode;
     runtime.state.themeName = theme.name;
     syncButtons(mode);
@@ -318,15 +286,15 @@ export function installTheme(runtime: Runtime): void {
   function activate(theme: Theme, mode: Mode): void {
     const stored = mode === "dark" ? setPrefs({ mode, dark: theme }) : setPrefs({ mode, light: theme });
     paint(stored[mode], mode);
-    // The menu, the login view, and the page background take the new theme
-    // now. The canvas of the terminal cannot. Only this path shows the note:
-    // `activate` runs for an operator change, and the load path at the end of
-    // `installTheme` calls `paint` alone. A stored theme is already correct
-    // after a reload, so a note on that path would name a reload for nothing.
-    // The tone is muted, not warn: a theme change is a normal action with an
-    // expected result. The warn color stays for a refused chord and a fault
-    // of the store.
-    setMenuNote(RELOAD_NOTE, "muted");
+    // The whole client now holds the new theme, the terminal included, and the
+    // operator needs no page reload. ghostty-web 0.4.0 bakes the cell colors
+    // at `open()` time, so `rebuild` of `src/main.ts` builds a new terminal
+    // with the new theme and asks the server for a full-state dump. The socket
+    // stays open, so the shell survives. Only this path rebuilds: `activate`
+    // runs for an operator change, and the load path at the end of
+    // `installTheme` calls `paint` alone, on a terminal that the constructor
+    // already colored.
+    runtime.rebuild(stored[mode]);
     runtime.term.focus();
   }
 

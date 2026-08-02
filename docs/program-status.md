@@ -147,8 +147,14 @@ cargo clippy --all-targets -- -D warnings    clean
 cargo fmt --all -- --check                   clean
 cargo test                                   90 passed, 0 failed
 cargo xtask verify-pins                      every pin exact and locked
-cd web && bun run test                       20 passed, 0 failed
+cd web && bun run typecheck                  clean
+cd web && bun run test                       63 passed, 0 failed
 ```
+
+CAUTION: On macOS, run `cargo xtask build` once before a plain `cargo build`,
+`cargo test` or `cargo clippy`. Only xtask writes the xcrun shim that Zig
+needs. Without the shim the link step fails with undefined symbols, and the
+fault looks like a code fault.
 
 ## 4. The client, commit a651779 — COMPLETE
 
@@ -180,71 +186,95 @@ sequences that arrive in vim and tmux as literal text. Shift+Tab sent the wrong
 bytes. Alt with a letter sent the bare letter, which killed readline word
 motion and every tmux Meta binding. One `customKeyEventHandler` corrects them.
 
-## 4-OLD. The state during the wave, kept for the record
+### 4.1 What the client holds
 
-The client manager owns requirements 2a, 2b, 2c, 3a, 3b, 4a and 4b. Its work is
-uncommitted in the working tree.
+New modules in `web/src`: `prefs.ts` holds one validated cookie, `keys.ts`
+holds the keybinding registry, `menu.ts` holds the panel, `theme.ts` holds the
+theme model, `iterm.ts` parses a `.itermcolors` file, and `font.ts`,
+`input.ts` and `runtime.ts` hold the rest. New specs: `menu`, `theme`, `font`,
+`repeat` and `prefs`, plus an extended `input.spec.ts` and three
+`.itermcolors` fixtures. Two of those fixtures are real files from the
+iTerm2-Color-Schemes repository.
 
-The scaffold is in place and its tests pass, at 28 passing and 0 failing. New
-files: `web/src/prefs.ts`, `menu.ts`, `theme.ts`, `font.ts`, `input.ts`,
-`keys.ts`, `runtime.ts`, plus `web/tests/menu.spec.ts` and a fixtures
-directory. Modified files: `web/index.html`, `web/src/main.ts`,
-`web/src/style.css`, `web/tests/harness.ts`. The manager keeps its state in
-`web/CLIENT-NOTES.md`.
+Three design rules carry the most weight, and `web/CLIENT-NOTES.md` records
+them.
 
-The manager reached the wave that runs three workers in parallel, one for
-themes, one for font size, and one for input. An API session limit stopped it
-once, and it started again.
+1. A chord reads `KeyboardEvent.code` and never `.key`. On macOS, Option+H
+   gives `˙` and Option+equals gives `≠`, so `.key` cannot express a hotkey.
+2. One capture-phase listener on the window owns every chord. A matched chord
+   gets `preventDefault` and `stopImmediatePropagation`, so ghostty-web never
+   sees it. The client adds no second path into the terminal, and that is the
+   whole defense against a keystroke that sends twice.
+3. The menu is `position: fixed`. A menu in the layout flow changes the box of
+   the terminal, which makes the terminal refit and send a second resize frame
+   for one window size.
 
-### 4.1 The state of the client tests
+### 4.2 A limit of ghostty-web, and the correction that removes its cost
 
-The director ran the tests in `/Users/oscarfrasier/pirate/web`. `bun run
-typecheck` is clean. `bun run test` gives 56 passing and 2 failing, across 11
-files. The two failures are open work, and neither assertion is weak.
+ghostty-web 0.4.0 bakes the cell colors into the wasm terminal when the page
+calls `open()`. `renderer.setTheme` paints nothing. `renderer.resize` blanks
+every glyph. A forced render repaints in the old colors, and even new output
+uses the old colors. Only the constructor honors a theme.
 
-```
-(fail) tests/prefs.spec.ts   an over-long theme name is clamped, and the
-                             record still persists across a reload
-(fail) tests/theme.spec.ts   a file with extra Color Space and Alpha
-                             Component keys still parses
-```
+The limit of the dependency stays, and the next director must not re-litigate
+it. The cost that it carried is gone. A theme change now constructs a new
+terminal with the new theme, opens it on the same container, and asks the
+server for a full-state dump with the `0x02` frame of section 5.0. The dump
+refills the screen in the new colors.
 
-The second failure describes reality. A real `.itermcolors` file carries the
-Color Space and Alpha Component keys.
+The socket stays open across the rebuild, and the shell keeps running. The
+client therefore needs no page reload. The muted line that named the reload is
+deleted, and the menu still offers no reload button.
 
-### 4.2 A limit of ghostty-web, and the accepted answer
+Three facts about the rebuild are contracts, and each one has a test.
 
-ghostty-web does not repaint the background. The client manager proved that
-`renderer.setTheme` recolors nothing, and that even NEW output after a theme
-change still paints in the earlier colors.
+1. A theme change that does not change the size of the terminal sends no
+   resize frame. A rebuild that changes the size sends exactly one. The client
+   tracks the last size that it sent, and it compares against that value.
+2. The dump carries the screen and not the scrollback. The scrollback of the
+   old terminal is therefore gone after a theme change. This is the one cost
+   that the correction leaves.
+3. A rebuild needs an open socket, because the dump is the only source for the
+   screen of the new terminal. With a closed socket the client disposes
+   nothing. It parks the theme, shows one muted line, and rebuilds when the
+   next socket opens. An adversarial review found this defect: a theme change
+   after a process exit disposed the terminal that held the last output of the
+   dead shell, and no reconnect follows an exit.
 
-This is a limit of the dependency. The product manager accepts it. A theme
-change that cannot repaint requires a page reload. The client stores the
-preference before the reload, so the new theme paints on the way back.
+The server bounds the request. The pump of `crates/pirate/src/ws.rs` coalesces
+the requests of one socket and holds `DUMP_INTERVAL`, which is 250 ms, between
+two dumps that the client asked for. A client that asks in a loop therefore
+gets at most four of these dumps per second, and it loses no repaint.
 
-CAUTION: A reload ends the session, and a reconnect starts a new shell. The
-menu must state that result before the reload happens.
+`web/CLIENT-NOTES.md` holds the five measurements that prove the limit, and
+the reason that a rebuild is the only remedy for it.
 
-Four constraints in its brief decide whether this wave succeeds.
+### 4.3 Contracts that stay binding
 
-1. The menu must sit over the terminal and not in the layout flow. A menu in
-   the flow changes the box of the terminal, which makes the terminal refit and
-   send a second resize frame for one window size. `web/src/style.css` already
-   documents that fault.
-2. The manager must find the cause of the control-character fault before it
-   writes a fix. A fix aimed at the wrong layer looks correct and is not.
-3. A second key handler beside the ghostty-web `InputHandler` can send every
-   keystroke twice. The manager must prove that it does not.
-4. The operating system already repeats a held key, and the browser marks those
-   events. Repeat added on top doubles the rate.
+The login view belongs to the security wave. `web/src/login.css` consumes five
+CSS custom properties: `--pirate-bg`, `--pirate-fg`, `--pirate-surface`,
+`--pirate-border` and `--pirate-error`. It also uses the selector
+`body[data-auth="required"]`. A later change can add properties. A later change
+cannot rename those five.
 
-The login view is a contract. `web/src/login.css` consumes five CSS custom
-properties: `--pirate-bg`, `--pirate-fg`, `--pirate-surface`,
-`--pirate-border`, and `--pirate-error`. It also uses the selector
-`body[data-auth="required"]`. The client manager can add properties and cannot
-rename those five.
+`web/vite.config.ts` holds two build plugins. One compresses `web/dist` and one
+writes `web/build-info.toml`. The Rust build reads both outputs. After any
+change to that file, run `cargo xtask web` and confirm that both outputs exist.
 
 ## 5. Remaining
+
+### 5.0 One decision for the product manager
+
+The client manager asks for a CLIENT-INITIATED DUMP FRAME. The server already
+sends a `0x01` full-state dump when a socket opens. A frame that lets the
+client ask for that dump repaints the terminal in the new theme colors, with no
+page reload and no lost shell. It is the clean correction for the limit in
+section 4.2.
+
+The cost is one client-to-server tag in `crates/pirate/src/protocol.rs` and
+`web/src/protocol.ts`, and a handler in `ws.rs`. The director did not authorize
+it, because it crosses into the server and the program was closing. Decide it
+before the audit wave starts, because the audit reads that protocol table.
 
 ### 5.1 The audit wave, requirement 4c
 
@@ -331,9 +361,11 @@ tests, 20 browser tests, and `cargo xtask verify-pins`.
 `origin/main` is at `26efa42`. The three commits are local, so a rewrite is
 safe and breaks no other clone.
 
-**CAUTION: Do not reconcile while the client work is uncommitted.** The working
-tree holds seven new modules that no commit records. A `git reset` mixes that
-work into the rewrite and can lose it.
+The client work is now committed, and the working tree is clean. That removes
+the hazard that this section carried while the wave ran.
+
+CAUTION: Confirm that `git status` reports nothing before any rewrite. A reset
+that runs over uncommitted work loses it.
 
 The director recommends one of two courses.
 
@@ -345,18 +377,21 @@ The director recommends one of two courses.
 
 ### 6.4 The linearization recipe, if you take course 2
 
-1. Commit the client work. Then confirm that `git status` is clean.
-2. Record the target: `git rev-parse HEAD`. Call it `TARGET`. Keep a safety
-   branch: `git branch backup-main`.
-3. Build a linear branch from the correct base:
+1. Confirm that `git status` reports nothing.
+2. Record the target: `TARGET=$(git rev-parse HEAD)`. Keep a safety branch:
+   `git branch backup-main`.
+3. Build a linear branch from the correct base. Each step takes the tree of one
+   earlier commit, so each commit adds one change and no commit is empty.
    ```
    git checkout -B linear 26efa42
-   git cherry-pick c982213
-   git checkout $TARGET -- .
-   git commit -m "Declare the build tools in mise.toml and simplify xtask"
-   git checkout $TARGET -- .
-   git commit -m "<the client commit message>"
+   git cherry-pick c982213                  # TLS and authentication
+   git checkout 0f84409 -- . && git commit -m "<the build message>"
+   git checkout a651779 -- . && git commit -m "<the client message>"
+   git checkout $TARGET  -- . && git commit -m "<the status message>"
    ```
+   CAUTION: Take the trees in this order. An earlier draft of this recipe took
+   the tree of `$TARGET` twice. The second commit then held no change, because
+   the first one had already reached the final tree.
 4. **PROVE THE REWRITE.** Run `git diff --stat $TARGET linear`. The output must
    be empty. An empty output means that the linear branch holds the same tree
    as the verified merge. If any line prints, stop and keep the merge.

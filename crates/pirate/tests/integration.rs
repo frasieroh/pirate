@@ -150,6 +150,23 @@ async fn read_until(socket: &mut Socket, needle: &str) -> String {
     panic!("`{needle}` never arrived. Got: {text:?}")
 }
 
+/// Read frames until a dump arrives, then give back the screen as text.
+async fn read_dump(socket: &mut Socket) -> String {
+    let deadline = Instant::now() + WAIT;
+    while Instant::now() < deadline {
+        let frame = next_binary(socket).await;
+        match ServerFrame::decode(&frame) {
+            Ok(ServerFrame::Dump(bytes)) => return String::from_utf8_lossy(bytes).into_owned(),
+            Ok(ServerFrame::Output(_)) => {}
+            Ok(ServerFrame::Exit(status)) => {
+                panic!("the process exited with {status} before a dump arrived")
+            }
+            Err(e) => panic!("a server frame did not decode: {e}"),
+        }
+    }
+    panic!("no dump arrived")
+}
+
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("pirate-test-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -538,6 +555,113 @@ async fn a_resize_frame_reaches_the_pty() {
     // `stty size` prints the rows first, then the columns.
     let text = read_until(&mut socket, "40 120").await;
     assert!(text.contains("40 120"), "got {text:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dump_request_gives_the_screen_that_the_client_asked_for() {
+    // A theme change rebuilds the terminal in the browser, and the new terminal
+    // is empty. The client asks for a dump, and the dump carries the screen.
+    let addr = start(PathBuf::from("/bin/cat")).await;
+    let mut socket = connect(addr).await;
+
+    // The dump of a new session. It comes before the request, so every later
+    // dump in this test is the answer to the request.
+    let first = next_binary(&mut socket).await;
+    assert!(matches!(
+        ServerFrame::decode(&first),
+        Ok(ServerFrame::Dump(_))
+    ));
+
+    // Put text on the screen. The echo proves that the server-side terminal
+    // wrote it, because the thread writes the bytes before it sends the frame.
+    send(&mut socket, ClientFrame::Input(b"marker\n")).await;
+    read_until(&mut socket, "marker").await;
+
+    send(&mut socket, ClientFrame::Dump).await;
+
+    let screen = read_dump(&mut socket).await;
+    assert!(
+        screen.contains("marker"),
+        "the dump must carry the text of the screen: {screen:?}"
+    );
+
+    // The shell survived the request.
+    send(&mut socket, ClientFrame::Input(b"still here\n")).await;
+    let text = read_until(&mut socket, "still here").await;
+    assert!(text.contains("still here"), "got {text:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flood_of_dump_requests_collapses_into_a_few_dumps() {
+    // A dump formats the whole screen. A client that asks in a loop must not
+    // make the server format in a loop, so the pump coalesces the requests and
+    // holds one interval between two dumps.
+    //
+    // The test reads the interval of the server, so a change to the server
+    // moves the ceiling of this test with it.
+    const INTERVAL: Duration = pirate::ws::DUMP_INTERVAL;
+    /// Dumps that a slow machine can add on top of the computed ceiling.
+    const MARGIN: u128 = 1;
+    /// The longest pause between two requests of the flood.
+    ///
+    /// The requests must cover the whole window. A burst that ends in the first
+    /// milliseconds collapses into one or two dumps whatever the interval is,
+    /// and such a burst measures the coalesce only.
+    const GAP: Duration = Duration::from_millis(2);
+    const WINDOW: Duration = Duration::from_secs(1);
+
+    let addr = start(PathBuf::from("/bin/cat")).await;
+    let mut socket = connect(addr).await;
+
+    // The dump of a new session, before the flood starts.
+    let first = next_binary(&mut socket).await;
+    assert!(matches!(
+        ServerFrame::decode(&first),
+        Ok(ServerFrame::Dump(_))
+    ));
+
+    // One loop sends the requests and reads the answers. The read timeout is
+    // the pause between two requests, and it also takes each dump off the
+    // socket while the flood runs.
+    let started = Instant::now();
+    let mut requests = 0_usize;
+    let mut dumps = 0_usize;
+    while let Some(left) = (started + WINDOW).checked_duration_since(Instant::now()) {
+        send(&mut socket, ClientFrame::Dump).await;
+        requests += 1;
+        match tokio::time::timeout(GAP.min(left), socket.next()).await {
+            // No frame waits, because the pump holds the next dump back.
+            Err(_) => {}
+            Ok(None) => panic!("the socket closed during the flood"),
+            Ok(Some(Ok(Message::Binary(bytes)))) => {
+                if matches!(ServerFrame::decode(&bytes), Ok(ServerFrame::Dump(_))) {
+                    dumps += 1;
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(e))) => panic!("the socket failed: {e}"),
+        }
+    }
+
+    // One dump goes out at once, and one more for each interval that the
+    // window holds. MARGIN covers a machine that is slower than this one.
+    let elapsed = started.elapsed().as_millis();
+    let ceiling = 1 + elapsed / INTERVAL.as_millis() + MARGIN;
+    assert!(
+        u128::try_from(dumps).unwrap() <= ceiling,
+        "{requests} requests gave {dumps} dumps in {elapsed} ms, and the ceiling is {ceiling}"
+    );
+    // The flood covers more than two intervals, so the pump must answer more
+    // than the first request. A lower count means that it stopped.
+    assert!(
+        dumps >= 2,
+        "{requests} requests gave {dumps} dumps in {elapsed} ms"
+    );
+
+    // The session still works: the socket is open, and input reaches the shell.
+    send(&mut socket, ClientFrame::Input(b"still here\n")).await;
+    let text = read_until(&mut socket, "still here").await;
+    assert!(text.contains("still here"), "got {text:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

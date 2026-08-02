@@ -94,7 +94,10 @@ enum Command {
     Output(Vec<u8>),
     /// A new window size for the server-side terminal.
     Resize { cols: u16, rows: u16 },
-    /// The client dropped its backlog and needs a fresh dump.
+    /// Send a fresh dump and clear the behind flag.
+    ///
+    /// Two callers send this command: a client that fell behind and dropped its
+    /// backlog, and a client that asked for a dump.
     Resync,
     /// The child process ended with this status.
     Exited(i32),
@@ -152,6 +155,11 @@ impl Session {
         // never waits. Therefore this channel drains at parse speed, which is
         // much faster than a PTY, and a slow client cannot make it grow. The
         // bound that matters is CLIENT_QUEUE, on the channel after it.
+        //
+        // `Session::request_dump` is the second writer, and the browser drives
+        // it. The pump in `ws.rs` holds that writer to one send per
+        // `ws::DUMP_INTERVAL`, so a client that asks in a loop cannot make this
+        // channel grow either.
         let (commands, command_rx) = std::sync::mpsc::channel::<Command>();
         let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(CLIENT_QUEUE);
         let resync = Arc::new(AtomicBool::new(false));
@@ -208,6 +216,18 @@ impl Session {
             let _ = commands.send(Command::Resize { cols, rows });
         }
         Ok(())
+    }
+
+    /// Ask the terminal thread for a full-state dump.
+    ///
+    /// The dump arrives on the frame stream, as the same `0x01` frame that the
+    /// thread sends when the session starts.
+    pub fn request_dump(&self) {
+        if let Some(commands) = self.commands.as_ref() {
+            // A send error means that the thread is gone, and a closed session
+            // needs no dump.
+            let _ = commands.send(Command::Resync);
+        }
     }
 
     /// The exit status of the child, when the child has ended.

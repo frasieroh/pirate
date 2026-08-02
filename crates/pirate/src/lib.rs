@@ -13,7 +13,10 @@ pub mod protocol;
 pub mod session;
 pub mod terminal;
 pub mod tls;
-mod ws;
+// This module is public for one item only: `ws::DUMP_INTERVAL`. The
+// integration tests are an external crate, and they cannot name a private
+// module.
+pub mod ws;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, Uri};

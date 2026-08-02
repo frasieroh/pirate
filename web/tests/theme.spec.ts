@@ -14,6 +14,7 @@ import { expect, test } from "bun:test";
 import type { Page } from "playwright";
 import {
   clientState,
+  hex,
   idle,
   paintedPixels,
   server,
@@ -28,6 +29,17 @@ import {
 function fixture(name: string): string {
   return `${import.meta.dir}/fixtures/${name}`;
 }
+
+/** The background of the light default theme, as red, green, blue. */
+const LIGHT_BACKGROUND: [number, number, number] = [0xff, 0xff, 0xff];
+
+/**
+ * The muted line of `src/main.ts` for a theme change with no open socket.
+ *
+ * The client keeps the old terminal in that case, because the dump of the
+ * server is the only thing that refills a new one.
+ */
+const PENDING_THEME_LINE = "The terminal takes the new colors with the next shell.";
 
 /** One channel of the WCAG relative luminance function. */
 function linearChannel(byte: number): number {
@@ -80,12 +92,73 @@ function menuBackground(page: Page): Promise<string> {
   );
 }
 
+/** The shape that the identity helpers below read on the page. */
+interface MarkedWindow {
+  __pirate: { term: unknown };
+  __marked?: unknown;
+}
+
+/**
+ * Keep the terminal object of this moment, for a later identity test.
+ *
+ * `__pirate.term` is a getter, and a theme change replaces the object behind
+ * it. The mark is the proof that the client built a new terminal.
+ */
+function markTerminal(page: Page): Promise<void> {
+  return page.evaluate(() => {
+    const global = globalThis as unknown as MarkedWindow;
+    global.__marked = global.__pirate.term;
+  });
+}
+
+/** True when `__pirate.term` holds another object than the marked one. */
+function isNewTerminal(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const global = globalThis as unknown as MarkedWindow;
+    return global.__pirate.term !== global.__marked;
+  });
+}
+
 /** The theme that `term.options.theme` holds, in the page. */
 function termTheme(page: Page): Promise<Record<string, string>> {
   return page.evaluate(() => {
     const pirate = (globalThis as unknown as { __pirate: { term: { options: { theme: Record<string, string> } } } }).__pirate;
     return { ...pirate.term.options.theme };
   });
+}
+
+/**
+ * Count every later `mouseup` listener of the document, from now on.
+ *
+ * The counter goes up for a registration and down for a removal. A listener
+ * that the page registered before this call is not in the count, and its
+ * removal still counts, so a balanced pair always gives zero.
+ */
+function watchMouseUpListeners(page: Page): Promise<void> {
+  return page.evaluate(() => {
+    const global = globalThis as unknown as { __mouseUp: number };
+    global.__mouseUp = 0;
+    const target = document as unknown as Record<string, unknown>;
+    const add = document.addEventListener.bind(document);
+    const remove = document.removeEventListener.bind(document);
+    target.addEventListener = (type: string, ...rest: unknown[]): void => {
+      if (type === "mouseup") {
+        global.__mouseUp += 1;
+      }
+      (add as unknown as (...args: unknown[]) => void)(type, ...rest);
+    };
+    target.removeEventListener = (type: string, ...rest: unknown[]): void => {
+      if (type === "mouseup") {
+        global.__mouseUp -= 1;
+      }
+      (remove as unknown as (...args: unknown[]) => void)(type, ...rest);
+    };
+  });
+}
+
+/** The count of `watchMouseUpListeners`. */
+function mouseUpListeners(page: Page): Promise<number> {
+  return page.evaluate(() => (globalThis as unknown as { __mouseUp: number }).__mouseUp);
 }
 
 /** The text of the fault line of the menu. */
@@ -98,16 +171,14 @@ async function hintText(page: Page): Promise<string> {
   return ((await page.textContent("#menu-hint")) ?? "").trim();
 }
 
-/** The computed `color` of the line that reports a normal result. */
-function hintColor(page: Page): Promise<string> {
-  return page.evaluate(
-    () => getComputedStyle(document.getElementById("menu-hint")!).color,
-  );
-}
-
 /** Every resize frame that the client sent. Mirrors `tests/font.spec.ts`. */
 function resizeFrames(frames: Uint8Array[]): Uint8Array[] {
   return frames.filter((frame) => frame.length === 5 && frame[0] === 0x01);
+}
+
+/** Every dump request that the client sent. The frame is the tag alone. */
+function dumpFrames(frames: Uint8Array[]): Uint8Array[] {
+  return frames.filter((frame) => frame.length === 1 && frame[0] === 0x02);
 }
 
 test("the default dark theme sets --pirate-bg, and term.options.theme matches", async () => {
@@ -309,13 +380,14 @@ test("the light palette meets the contrast floors", async () => {
   });
 });
 
-test("a theme change keeps the text on the screen, and sends no resize frame", async () => {
-  // The decision: ghostty-web 0.4.0 cannot recolor a canvas that already
-  // holds text, so the client changes no pixel of the terminal. The old
-  // `renderer.resize` call cleared the canvas to the new background and
-  // blanked every glyph. This test is the regression guard for that call.
+test("a theme change refills the screen from the dump, and sends no resize frame", async () => {
+  // ghostty-web 0.4.0 bakes the cell colors at `open()` time, so the client
+  // builds a new terminal for a theme change. The new terminal starts empty,
+  // and the `0x02` dump request brings the screen back from the server. The
+  // guard that stays from the old behavior: the rebuild sends no resize frame.
   const stub = server();
   stub.reset();
+  stub.setOnDump([{ tag: 0x01, text: "pirate" }]);
 
   await withClient(async (page) => {
     // Real content on one row, so the canvas holds real content, not only
@@ -336,33 +408,37 @@ test("a theme change keeps the text on the screen, and sends no resize frame", a
     const debounce = (await clientState(page)).resizeDebounceMs;
     const before = resizeFrames(stub.received).length;
     const beforeSize = await size(page);
-    // Row 3 holds no text. `paintedPixels` counts its pixels against the
-    // dark background of `tests/harness.ts`, so the count of an untouched
-    // row stays near zero. A `renderer.resize` call fills the whole canvas
-    // with the light background, and this count then jumps to thousands.
-    const emptyRowBefore = await paintedPixels(page, 3);
+    await markTerminal(page);
 
     await page.click("#theme-light");
     await waitFor(() => clientState(page).then((s) => s.mode), (mode) => mode === "light", "light mode");
 
-    const inkAfter = await paintedPixels(page, 0);
-    const emptyRowAfter = await paintedPixels(page, 3);
+    // 1. The client built a new terminal.
+    expect(await isNewTerminal(page)).toBe(true);
+    // 2. The dump put the text back on that new terminal.
+    await waitFor(
+      () => viewportLine(page, 0),
+      (line) => line === "pirate",
+      "the text of the dump on the new terminal",
+    );
+    // 3. The canvas of the new terminal holds the ink of that text. Both
+    //    counts run against the LIGHT background, the background of the new
+    //    theme, so an empty row counts near zero and only glyphs count. Row 3
+    //    holds no text and gives that floor. A canvas that kept the dark
+    //    colors would count every pixel of both rows, and the difference would
+    //    then go away, so this assertion can fail.
+    const inkAfter = await waitFor(
+      () => paintedPixels(page, 0, LIGHT_BACKGROUND),
+      (n) => n > 50,
+      "the ink of the dump on the light canvas",
+    );
+    const emptyAfter = await paintedPixels(page, 3, LIGHT_BACKGROUND);
     // eslint-disable-next-line no-console
     console.log(
-      `  row 0 ink against the dark background: ${inkBefore} → ${inkAfter} pixels\n` +
-        `  empty row against the dark background: ${emptyRowBefore} → ${emptyRowAfter} pixels`,
+      `  row 0 against the dark background: ${inkBefore} pixels. ` +
+        `Against the light background: row 0 ${inkAfter}, empty row ${emptyAfter}`,
     );
-
-    // 1. The buffer keeps the text.
-    expect(await viewportLine(page, 0)).toBe("pirate");
-    // 2. The canvas keeps the ink. The count holds a band, and it does not
-    //    reach the count of a full row of the new background. The cursor
-    //    blinks over one cell, so the band is not one exact number.
-    expect(inkAfter).toBeGreaterThan(50);
-    expect(inkAfter).toBeLessThan(inkBefore + 1000);
-    // 3. The empty row is still the old background. The screen went not
-    //    blank.
-    expect(emptyRowAfter).toBeLessThan(emptyRowBefore + 100);
+    expect(inkAfter).toBeGreaterThan(emptyAfter + 50);
 
     // Wait longer than the debounce, so a late resize frame would be counted.
     await idle(debounce + 400);
@@ -374,8 +450,8 @@ test("a theme change keeps the text on the screen, and sends no resize frame", a
 });
 
 test("a theme change repaints the menu at once, with no reload", async () => {
-  // The custom properties and the menu follow the new theme on the same
-  // frame. Only the canvas of the terminal waits for a reload.
+  // The custom properties, the menu, and the terminal all follow the new
+  // theme. No part of the client waits for a page reload.
   const stub = server();
   stub.reset();
 
@@ -395,7 +471,10 @@ test("a theme change repaints the menu at once, with no reload", async () => {
   });
 });
 
-test("a theme change shows the note, and the note names the reload", async () => {
+test("a theme change shows no note, because the client needs no reload", async () => {
+  // The old client showed a muted line that named a page reload and the cost
+  // of one: the reload ended the shell. The rebuild removed that cost, so the
+  // line went with it. Both lines of the menu stay empty.
   const stub = server();
   stub.reset();
 
@@ -403,56 +482,327 @@ test("a theme change shows the note, and the note names the reload", async () =>
     expect(await hintText(page)).toBe("");
 
     await page.click("#theme-light");
-    await waitFor(() => hintText(page), (text) => text.length > 0, "the note");
+    await waitFor(() => clientState(page).then((s) => s.mode), (mode) => mode === "light", "light mode");
+    await waitFor(
+      async () => dumpFrames(stub.received),
+      (list) => list.length >= 1,
+      "the dump request",
+    );
 
-    const text = await hintText(page);
-    // eslint-disable-next-line no-console
-    console.log(`  the note: ${text}`);
-    expect(text).toContain("reload");
-    // The second fact: a reload costs the operator the running shell.
-    expect(text).toContain("shell");
-    // The tone is muted, not warn: a theme change is a normal action, and it
-    // reports no fault. The fault line stays empty.
-    expect(await hintColor(page)).toBe(hexToRgbString(await cssVar(page, "--pirate-muted")));
+    expect(await hintText(page)).toBe("");
     expect(await noteText(page)).toBe("");
   });
 });
 
-test("an import shows the same note, because an import also changes the theme", async () => {
+test("an import rebuilds the terminal too, and shows no note", async () => {
   const stub = server();
   stub.reset();
 
   await withClient(async (page) => {
+    await markTerminal(page);
+
     await page.setInputFiles("#theme-import", fixture("atom-one-light.itermcolors"));
     await waitFor(
       () => clientState(page).then((s) => s.themeName),
       (name) => name === "atom-one-light",
       "the imported theme name",
     );
+    await waitFor(
+      async () => dumpFrames(stub.received),
+      (list) => list.length >= 1,
+      "the dump request",
+    );
 
-    expect(await hintText(page)).toContain("reload");
+    expect(await isNewTerminal(page)).toBe(true);
+    expect((await termTheme(page)).background).toBe("#f9f9f9");
+    expect(await hintText(page)).toBe("");
     expect(await noteText(page)).toBe("");
   });
 });
 
-test("the note is absent on a page load, because the stored theme is correct", async () => {
+test("a page load sends no dump request, because the constructor holds the stored theme", async () => {
+  // The load path calls `paint` alone. `src/main.ts` already gave the stored
+  // theme to the constructor of the terminal, so a rebuild on that path would
+  // throw away the screen for nothing.
   const stub = server();
   stub.reset();
 
   await withClient(async (page) => {
     // A fresh page, with the default theme.
-    expect(await hintText(page)).toBe("");
+    expect(dumpFrames(stub.received).length).toBe(0);
 
-    // An operator change stores the light theme and shows the note.
+    // An operator change stores the light theme and rebuilds the terminal.
     await page.click("#theme-light");
-    await waitFor(() => hintText(page), (text) => text.length > 0, "the note");
+    await waitFor(
+      async () => dumpFrames(stub.received),
+      (list) => list.length >= 1,
+      "the dump request",
+    );
+    expect(dumpFrames(stub.received).length).toBe(1);
 
-    // The reload gives the light theme to the constructor of the terminal.
-    // The screen is then correct, and a note that names a reload is false.
+    // The reload gives the light theme to the constructor again. The screen is
+    // then correct at once, and the client asks for no dump.
     await page.reload();
     await waitForConnected(page);
+    await idle(300);
     expect((await clientState(page)).mode).toBe("light");
-    expect(await hintText(page)).toBe("");
+    expect(dumpFrames(stub.received).length).toBe(1);
+  });
+});
+
+test("a theme change builds a new terminal, and sends one 0x02 frame and no 0x01 frame", async () => {
+  // The hard requirement of section 4.1 rule 3 of `docs/program-status.md`: a
+  // change that does not change the size sends no resize frame. A new terminal
+  // starts at the default size, so `applyFit` compares against the size that
+  // the server knows and not against the size of the new terminal.
+  const stub = server();
+  stub.reset();
+
+  await withClient(async (page) => {
+    await waitFor(
+      async () => resizeFrames(stub.received),
+      (list) => list.length >= 1,
+      "the first resize frame",
+    );
+    const debounce = (await clientState(page)).resizeDebounceMs;
+    const before = resizeFrames(stub.received).length;
+    const beforeSize = await size(page);
+    await markTerminal(page);
+
+    await page.click("#theme-light");
+    await waitFor(() => clientState(page).then((s) => s.mode), (mode) => mode === "light", "light mode");
+    await waitFor(
+      async () => dumpFrames(stub.received),
+      (list) => list.length >= 1,
+      "the dump request",
+    );
+
+    // Wait longer than the debounce, so a late resize frame would be counted.
+    await idle(debounce + 400);
+    const after = resizeFrames(stub.received).length;
+    const afterSize = await size(page);
+    // eslint-disable-next-line no-console
+    console.log(
+      `  one theme change: ${dumpFrames(stub.received).length} dump request(s), ` +
+        `resize frames ${before} → ${after}`,
+    );
+
+    expect(await isNewTerminal(page)).toBe(true);
+    expect(dumpFrames(stub.received).length).toBe(1);
+    expect(after).toBe(before);
+    expect(afterSize).toEqual(beforeSize);
+  });
+});
+
+test("the shell survives a theme change: one connection, and a key still reaches the server", async () => {
+  // The proof that the rebuild costs no session. The socket stays open, the
+  // stub counts no second connection, and the next keystroke of the operator
+  // arrives as a `0x00` input frame from the new terminal.
+  const stub = server();
+  stub.reset();
+
+  await withClient(async (page) => {
+    expect(stub.connections).toBe(1);
+
+    await page.click("#theme-light");
+    await waitFor(() => clientState(page).then((s) => s.mode), (mode) => mode === "light", "light mode");
+    await waitFor(
+      async () => dumpFrames(stub.received),
+      (list) => list.length >= 1,
+      "the dump request",
+    );
+
+    expect(stub.connections).toBe(1);
+    expect(stub.open).toBe(true);
+    const state = await clientState(page);
+    expect(state.connections).toBe(1);
+    expect(state.connected).toBe(true);
+
+    await page.focus("#terminal");
+    const first = stub.received.length;
+    await page.keyboard.press("a");
+    const frames = await waitFor(
+      async () => stub.received.slice(first),
+      (list) => list.length >= 1,
+      "an input frame after the theme change",
+    );
+    // eslint-disable-next-line no-console
+    console.log(`  the key after the theme change: ${hex(frames[0])}`);
+    expect(Array.from(frames[0])).toEqual([0x00, 0x61]);
+  });
+});
+
+test("the new terminal carries the new theme, and its canvas paints the new background", async () => {
+  const stub = server();
+  stub.reset();
+  stub.setOnDump([{ tag: 0x01, text: "light" }]);
+
+  await withClient(async (page) => {
+    // Row 3 holds no text. `paintedPixels` counts the pixels of that row that
+    // differ from the DARK background of `tests/harness.ts`, so the count of
+    // an empty row under the dark theme stays near zero.
+    const darkRow = await paintedPixels(page, 3);
+    expect(darkRow).toBeLessThan(100);
+
+    await page.click("#theme-light");
+    await waitFor(() => clientState(page).then((s) => s.mode), (mode) => mode === "light", "light mode");
+    await waitFor(
+      () => viewportLine(page, 0),
+      (line) => line === "light",
+      "the text of the dump on the new terminal",
+    );
+
+    const theme = await termTheme(page);
+    expect(theme.background).toBe("#ffffff");
+    expect(theme.foreground).toBe("#343b58");
+
+    // The same empty row now holds the white background, which differs from
+    // the dark background of the harness on every pixel. A canvas that painted
+    // nothing would still count near zero.
+    const lightRow = await waitFor(
+      () => paintedPixels(page, 3),
+      (n) => n > 1000,
+      "the light background on the canvas",
+    );
+    // eslint-disable-next-line no-console
+    console.log(`  empty row against the dark background: ${darkRow} → ${lightRow} pixels`);
+    expect(lightRow).toBeGreaterThan(darkRow + 1000);
+  });
+});
+
+test("a rebuild removes the document mouseup listener that ghostty-web leaks", async () => {
+  // ghostty-web 0.4.0 registers `handleMouseUp` on the document in `open()`.
+  // `dispose` sets `isOpen` to false before it calls `cleanupComponents`, and
+  // `cleanupComponents` removes that listener only while `isOpen` is true, so
+  // the listener stays and holds the dead terminal. `rebuild` of
+  // `src/main.ts` removes it. Without that call the count grows by one for
+  // each theme change.
+  const stub = server();
+  stub.reset();
+
+  await withClient(async (page) => {
+    await watchMouseUpListeners(page);
+
+    await page.click("#theme-light");
+    await waitFor(() => clientState(page).then((s) => s.mode), (mode) => mode === "light", "light mode");
+    await waitFor(
+      async () => dumpFrames(stub.received),
+      (list) => list.length >= 1,
+      "the dump request of the first rebuild",
+    );
+    await page.click("#theme-dark");
+    await waitFor(() => clientState(page).then((s) => s.mode), (mode) => mode === "dark", "dark mode");
+    await waitFor(
+      async () => dumpFrames(stub.received),
+      (list) => list.length >= 2,
+      "the dump request of the second rebuild",
+    );
+
+    // Two rebuilds: two removals and two registrations.
+    const count = await mouseUpListeners(page);
+    // eslint-disable-next-line no-console
+    console.log(`  document mouseup listeners after two rebuilds: ${count >= 0 ? "+" : ""}${count}`);
+    expect(count).toBe(0);
+  });
+});
+
+test("a theme change after a server 0x02 frame keeps the screen of the dead shell", async () => {
+  // The regression guard for the worst case of the rebuild. `onclose` never
+  // reconnects after a server `0x02` frame, so the old terminal holds the last
+  // output of that shell. A rebuild would dispose that terminal, get no dump,
+  // and leave a blank screen with no way back.
+  const stub = server();
+  stub.reset();
+
+  await withClient(async (page) => {
+    stub.send([{ tag: 0x00, text: "last words" }]);
+    await waitFor(() => viewportLine(page, 0), (line) => line === "last words", "row 0");
+
+    // The real server sends the exit frame and then closes the socket.
+    stub.send([{ tag: 0x02, status: 0 }]);
+    await waitFor(
+      async () => (await clientState(page)).exitStatus,
+      (value) => value === 0,
+      "the exit status",
+    );
+    stub.closeSocket();
+    await waitFor(
+      async () => (await clientState(page)).connected,
+      (value) => value === false,
+      "the closed socket",
+    );
+
+    await markTerminal(page);
+    const dumpsBefore = dumpFrames(stub.received).length;
+
+    await page.click("#theme-light");
+    await waitFor(() => clientState(page).then((s) => s.mode), (mode) => mode === "light", "light mode");
+
+    // The terminal is the same object, and the text of the dead shell is on it.
+    expect(await isNewTerminal(page)).toBe(false);
+    expect(await viewportLine(page, 0)).toBe("last words");
+    expect(dumpFrames(stub.received).length).toBe(dumpsBefore);
+    // The menu reports the wait on the muted line, never on the fault line.
+    expect(await hintText(page)).toBe(PENDING_THEME_LINE);
+    expect(await noteText(page)).toBe("");
+    // The page, the menu, and the login view still take the new colors at once.
+    expect(await cssVar(page, "--pirate-bg")).toBe("#ffffff");
+  });
+});
+
+test("a theme change on a closed socket lands on the next open socket", async () => {
+  // The theme waits in `pendingTheme` of `src/main.ts`, and `ws.onopen` builds
+  // the new terminal with it. The dump request then goes out on an open
+  // socket, so the new terminal gets its screen.
+  const stub = server();
+  stub.reset();
+  stub.setOnOpen([{ tag: 0x01, text: "shell 2" }]);
+
+  await withClient(async (page) => {
+    // Hold `/auth`. `sessionLost` of `src/login.ts` asks it after every close,
+    // so the reconnect waits here and the socket stays closed for the theme
+    // change below. The test releases the answer when it is ready.
+    let release: () => void = (): void => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await page.route("**/auth", async (route) => {
+      await held;
+      await route.fulfill({ status: 404, contentType: "text/plain", body: "no auth" });
+    });
+
+    stub.closeSocket();
+    await waitFor(
+      async () => (await clientState(page)).connected,
+      (value) => value === false,
+      "the closed socket",
+    );
+
+    await markTerminal(page);
+    await page.click("#theme-light");
+    await waitFor(() => clientState(page).then((s) => s.mode), (mode) => mode === "light", "light mode");
+
+    // The client kept the old terminal, and it said so.
+    expect(await isNewTerminal(page)).toBe(false);
+    expect(await hintText(page)).toBe(PENDING_THEME_LINE);
+
+    release();
+    await waitFor(
+      async () => (await clientState(page)).connections,
+      (count) => count === 2,
+      "a second connection",
+    );
+
+    // The terminal that comes back is another object, and it carries the theme
+    // that waited.
+    await waitFor(() => isNewTerminal(page), (value) => value === true, "the new terminal");
+    const theme = await termTheme(page);
+    expect(theme.background).toBe("#ffffff");
+    expect(theme.foreground).toBe("#343b58");
+    expect((await clientState(page)).mode).toBe("light");
+    // The line leaves the screen with the rebuild.
+    await waitFor(() => hintText(page), (text) => text === "", "the empty muted line");
+    expect(await noteText(page)).toBe("");
   });
 });
 
@@ -481,8 +831,13 @@ test("a theme change sends no resize frame, and the terminal size stays the same
     const after = resizeFrames(stub.received).length;
     const afterSize = await size(page);
     // eslint-disable-next-line no-console
-    console.log(`  two theme changes: resize frames ${before} → ${after}`);
+    console.log(
+      `  two theme changes: ${dumpFrames(stub.received).length} dump request(s), ` +
+        `resize frames ${before} → ${after}`,
+    );
     expect(after).toBe(before);
     expect(afterSize).toEqual(beforeSize);
+    // Two rebuilds, two dump requests. Each one refills its own new terminal.
+    expect(dumpFrames(stub.received).length).toBe(2);
   });
 });

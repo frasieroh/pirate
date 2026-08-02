@@ -172,6 +172,17 @@ function buildKeyCorrection(runtime: Runtime): (event: KeyboardEvent) => boolean
   };
 }
 
+/**
+ * Put the key correction on the terminal of `runtime`.
+ *
+ * `installInput` calls this at install time. `src/main.ts` calls it again for
+ * each terminal that `rebuild` builds, because a new terminal starts with no
+ * handler and would then encode the seven corrected chords wrongly again.
+ */
+export function attachKeyCorrection(runtime: Runtime): void {
+  runtime.term.attachCustomKeyEventHandler(buildKeyCorrection(runtime));
+}
+
 // ── B. the focus ────────────────────────────────────────────────────────
 //
 // A click outside `#menu` must give the focus back to `#terminal`. The
@@ -436,7 +447,7 @@ function installRepeatRateRow(runtime: Runtime): void {
  * the focus on the terminal, and generates the key repeat.
  */
 export function installInput(runtime: Runtime): void {
-  runtime.term.attachCustomKeyEventHandler(buildKeyCorrection(runtime));
+  attachKeyCorrection(runtime);
   installFocusGuard(runtime);
   installKeyRepeat(runtime);
   installRepeatRateRow(runtime);

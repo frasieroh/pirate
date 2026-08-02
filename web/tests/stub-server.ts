@@ -42,6 +42,13 @@ export interface Stub {
   reset(): void;
   /** Set the frames that the stub sends when a socket opens. */
   setOnOpen(frames: FrameSpec[]): void;
+  /**
+   * Set the frames that the stub sends for a `0x02` dump request.
+   *
+   * A test that calls this never falls back. An empty array is therefore an
+   * answer of no frames.
+   */
+  setOnDump(frames: FrameSpec[]): void;
   /** Send frames on the open socket, now. */
   send(frames: FrameSpec[]): void;
   /** Close the open socket, as a dropped connection does. */
@@ -58,6 +65,15 @@ const MIME: Record<string, string> = {
   ico: "image/x-icon",
   json: "application/json",
 };
+
+/**
+ * The tag of a dump request, from the client.
+ *
+ * This file holds its own copy of the tag, as it holds its own copy of every
+ * other tag. The stub is the other side of the wire, so it must not verify
+ * `src/protocol.ts` against itself.
+ */
+const CLIENT_DUMP = 0x02;
 
 /** Build one binary frame from a specification. */
 export function buildFrame(spec: FrameSpec): Uint8Array {
@@ -84,6 +100,8 @@ export function buildFrame(spec: FrameSpec): Uint8Array {
 export function startStub(root: string): Stub {
   let received: Uint8Array[] = [];
   let onOpen: FrameSpec[] = [];
+  /** The answer to a dump request, or null when a test set none. */
+  let onDump: FrameSpec[] | null = null;
   let connections = 0;
   let current: ServerWebSocket<undefined> | null = null;
 
@@ -119,12 +137,23 @@ export function startStub(root: string): Stub {
           ws.send(buildFrame(spec));
         }
       },
-      message(_ws: ServerWebSocket<undefined>, message: string | Buffer): void {
-        received.push(
+      message(ws: ServerWebSocket<undefined>, message: string | Buffer): void {
+        const frame =
           typeof message === "string"
             ? new TextEncoder().encode(message)
-            : new Uint8Array(message),
-        );
+            : new Uint8Array(message);
+        // Every frame goes to `received`, the dump request included. The tests
+        // count frames by tag.
+        received.push(frame);
+        if (frame.length > 0 && frame[0] === CLIENT_DUMP) {
+          // The fallback: the real server answers a dump request with the same
+          // `0x01` dump that it sends when a socket opens. A test that set only
+          // `setOnOpen` therefore gets that screen back, and a test of the
+          // theme rebuild needs no second setup call.
+          for (const spec of onDump ?? onOpen) {
+            ws.send(buildFrame(spec));
+          }
+        }
       },
       close(ws: ServerWebSocket<undefined>): void {
         if (current === ws) {
@@ -148,10 +177,14 @@ export function startStub(root: string): Stub {
     reset(): void {
       received = [];
       onOpen = [];
+      onDump = null;
       connections = 0;
     },
     setOnOpen(frames: FrameSpec[]): void {
       onOpen = frames;
+    },
+    setOnDump(frames: FrameSpec[]): void {
+      onDump = frames;
     },
     send(frames: FrameSpec[]): void {
       if (current === null) {

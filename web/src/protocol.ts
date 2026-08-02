@@ -4,13 +4,14 @@
  * Each WebSocket frame is binary. The first byte is the tag. The rest of the
  * frame is the payload. All integers are big-endian.
  *
- * | Direction       | Tag    | Payload                          |
- * |-----------------|--------|----------------------------------|
- * | server → client | `0x00` | raw PTY output bytes             |
- * | server → client | `0x01` | full state dump, as VT sequences |
- * | server → client | `0x02` | process exited: `i32` status     |
- * | client → server | `0x00` | encoded input bytes              |
- * | client → server | `0x01` | resize: `u16` cols, `u16` rows   |
+ * | Direction       | Tag    | Payload                                 |
+ * |-----------------|--------|-----------------------------------------|
+ * | server → client | `0x00` | raw PTY output bytes                    |
+ * | server → client | `0x01` | full state dump, as VT sequences        |
+ * | server → client | `0x02` | process exited: `i32` status            |
+ * | client → server | `0x00` | encoded input bytes                     |
+ * | client → server | `0x01` | resize: `u16` cols, `u16` rows          |
+ * | client → server | `0x02` | ask for a full-state dump: no payload   |
  *
  * This table is a contract with the server. Do not change it here alone.
  */
@@ -26,8 +27,10 @@ export const SERVER_EXIT = 0x02;
 export const CLIENT_INPUT = 0x00;
 /** Client to server. The payload is a `u16` cols and a `u16` rows. */
 export const CLIENT_RESIZE = 0x01;
+/** Client to server. A request for a full-state dump. The frame carries no payload. */
+export const CLIENT_DUMP = 0x02;
 
-/** The byte count of the `i32` status in a `0x02` frame. */
+/** The byte count of the `i32` status in a server `0x02` frame. */
 const EXIT_STATUS_BYTES = 4;
 
 /** Build a `0x00` input frame from encoded input bytes. */
@@ -53,7 +56,21 @@ export function encodeResize(cols: number, rows: number): Uint8Array<ArrayBuffer
 }
 
 /**
- * Read the `i32` status out of the payload of a `0x02` frame.
+ * Build a `0x02` dump request frame.
+ *
+ * The frame is the tag alone. The server answers with one `0x01` frame, the
+ * same full-state dump that it sends when a socket opens. `src/main.ts` sends
+ * this frame after it builds a new terminal, so the new terminal gets the
+ * screen back.
+ */
+export function encodeDumpRequest(): Uint8Array<ArrayBuffer> {
+  const frame = new Uint8Array(1);
+  frame[0] = CLIENT_DUMP;
+  return frame;
+}
+
+/**
+ * Read the `i32` status out of the payload of a server `0x02` frame.
  *
  * A short payload gives -1, because a truncated frame carries no status.
  */
