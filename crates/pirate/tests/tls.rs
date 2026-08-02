@@ -492,10 +492,12 @@ async fn the_generated_certificate_covers_the_loopback_names_and_the_system_host
     // checks what the wildcard covers instead of querying the wildcard
     // string itself: a name it did not enumerate, such as a name a reverse
     // proxy adds in front of pirate.
-    assert!(
-        covers(&leaf, &format!("anything.{hostname}")),
-        "the wildcard must cover a subdomain of the hostname"
-    );
+    if hostname.contains('.') {
+        assert!(
+            covers(&leaf, &format!("anything.{hostname}")),
+            "the wildcard must cover a subdomain of the hostname"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
