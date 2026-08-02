@@ -199,8 +199,7 @@ export function attachKeyCorrection(runtime: Runtime): void {
 // sign of a lost focus today. This module adds none either. The mousedown
 // handler below returns the focus before the next keystroke, so the operator
 // has no window in which the focus is away and a sign of it would matter. An
-// indicator for a state that the fix already closes is noise, and the
-// product manager forbids noise.
+// indicator for a state that the fix already closes is unnecessary.
 function installFocusGuard(runtime: Runtime): void {
   const menu = document.getElementById("menu");
   window.addEventListener("mousedown", (event: MouseEvent) => {

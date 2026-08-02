@@ -131,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Each fixture goes in at [`PTY_CHUNK`] bytes per pass, because that is the
 /// size that a real PTY delivers. A chunked parse costs more than one large
-/// parse, so this is the honest number.
+/// parse, so this reflects the real cost.
 fn pipeline_report(scenarios: &[(String, PathBuf)]) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n  pipeline: the processor cost inside the server, with no PTY and no socket\n");
     println!(

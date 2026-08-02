@@ -7,8 +7,8 @@
  * size. This module changes no box of `#terminal`.
  *
  * The header holds the session status and the collapse control. The body holds
- * the rows. `addMenuRow` is the seam for the other modules: a module that owns
- * a control adds its row and never touches the layout of this file.
+ * the rows. `addMenuRow` lets other modules add controls without touching this
+ * file's layout.
  */
 
 import { cancelCapture, captureChord, chordLabel, chords } from "./keys";
@@ -82,12 +82,9 @@ const groups = new Map<string, HTMLElement>();
 /** The chord button of each binding. */
 const chordButtons = new Map<BindingId, HTMLButtonElement>();
 
-/* ── SEAM(font) ──────────────────────────────────────────────────────────────
-   `src/main.ts` owns the fit and its debounce. It calls `setFitHandler` one
-   time, with the debounced fit. A module that changes the size of a cell, such
-   as the font size, calls `requestFit` after the change. The fit then runs on
-   the same debounce as a window drag, and the client sends one resize frame
-   for one change. */
+/* Font size changes trigger a debounced fit in main.ts. The font module calls
+   `requestFit` after any change; the fit debounces with window drags to send
+   one resize frame per change. */
 
 /** The debounced fit of `src/main.ts`. */
 let fitHandler: () => void = (): void => {};
@@ -174,11 +171,9 @@ applyState(prefs().menu);
 /**
  * Add a row to the menu.
  *
- * This is the seam for the theme worker and for the font worker. Each row
- * declares the heading that governs it. A new group goes above the keys
- * group, in the order of the calls, so no worker changes the layout of this
- * file. A second row with the same heading joins the group of the first one.
- * The caller owns its controls and their events.
+ * Each row declares its heading. New groups go above the keys group in call
+ * order, so other modules do not change this file's layout. Rows with the
+ * same heading join one group. The caller owns its controls and their events.
  *
  * Returns the row element.
  */

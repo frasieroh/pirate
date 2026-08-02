@@ -15,8 +15,7 @@ curl https://mise.run | sh
 
 On macOS you can also run `brew install mise`.
 
-Then activate mise in your shell. Obey the instructions that the installer prints. For zsh
-the line is:
+Then activate mise in your shell.
 
 ```
 eval "$(mise activate zsh)"
@@ -25,18 +24,16 @@ eval "$(mise activate zsh)"
 Activation puts the pinned Rust, Zig and bun on your path. It also sets
 `RUSTUP_TOOLCHAIN` to the pinned Rust for every command in this
 repository. Without activation, a plain `cargo test` or `cargo clippy` uses the default
-toolchain of your machine instead of the pinned one. `cargo xtask` always uses the pinned
-tools, because it asks mise for them itself.
+toolchain of your machine instead of the pinned one.
 
-## Build a static binary
+## Building
 
 ```
 cargo xtask dist
 ```
 
-This one command works in a fresh clone. It installs the tools and builds the web assets.
-Then it builds all six release targets. It writes one tarball for each target and one
-`SHA256SUMS` file into `dist/`.
+It installs the tools and builds the web assets and release targets. It writes one tarball
+for each target and one `SHA256SUMS` file into `dist/`.
 
 To build one target only, name it:
 
@@ -53,10 +50,7 @@ mise install
 mise exec -- cargo xtask dist
 ```
 
-`cargo xtask` needs no `mise trust`, because it grants that trust to its own child process
-and writes nothing to your mise trust store.
-
-## The other commands
+## Other build targets
 
 | Command | Result |
 |---|---|
@@ -77,12 +71,7 @@ that crate runs `zig build` itself. Without `zig` the build stops with
 `failed to execute zig build: No such file or directory`. mise puts the pinned Zig on PATH,
 so activate mise in your shell, or write `mise exec -- cargo build`.
 
-To get a binary that serves the client, run `cargo xtask web` first, or run
-`cargo xtask build`.
-
-## The pins
-
-Every version is exact, and each one lives in one place only.
+## Versioning
 
 | Input | File |
 |---|---|
@@ -97,28 +86,23 @@ Every version is exact, and each one lives in one place only.
 Renovate opens a pull request for each of these. `cargo xtask verify-pins` fails when a pin
 is a range, and it fails when `mise.lock` does not match `mise.toml`.
 
-Renovate cannot write `mise.lock`. After you change a version in `mise.toml`, write the lock
-file again. Then commit it:
+After you change a version in `mise.toml`, write the lock file again. Then commit it:
 
 ```
 mise lock --platform linux-x64,linux-arm64,macos-arm64,macos-x64
 ```
 
-## macOS: the SDK
+## macOS builds
 
-CAUTION: Keep a macOS 15 SDK on the machine. Zig 0.15.2 cannot link against the macOS 26
-SDK. The `libSystem.B.tbd` of that SDK lists `arm64e-macos` and does not list `arm64-macos`.
-Every libc symbol stays undefined then, and the link stops.
+Zig 0.15.2 cannot link against macOS 26 SDK.
 
 xtask finds an SDK that lists the host architecture and writes an `xcrun` shim into
 `.toolchain/shim`. Zig runs `xcrun --sdk macosx --show-sdk-path`, and that explicit `--sdk`
 makes `xcrun` ignore `SDKROOT`, so a shim earlier on the path is the only control. Every
 `cargo xtask` command writes the shim and puts it first on the path.
 
-CAUTION: On macOS, run `cargo xtask build` before a plain `cargo build`, `cargo clippy` or
-`cargo test`. Only `cargo xtask` puts the shim on the path. A plain cargo command that must
-compile libghostty-vt-sys again stops with about twenty `undefined symbol` errors, such as
-`_sigaction` and `_waitpid`.
+On macOS, run `cargo xtask build` before plain cargo commands.
+The shim is only on PATH for `cargo xtask`.
 
 To run a plain cargo command yourself, run both of these lines first, in this order:
 
@@ -132,9 +116,7 @@ order. Without it, the Homebrew Zig fails the version check of Ghostty before th
 runs. Run the `export` line after the `eval` line. `mise env` writes a new PATH, and it
 removes the shim when you export the shim first.
 
-CAUTION: Do not add `.toolchain/shim` to the `[env]` table of `mise.toml`. mise then controls
-the order of its own PATH entries. A shim that lands after the Zig directory of mise gives a
-silent build against the wrong SDK.
+Do not add `.toolchain/shim` to `mise.toml` [env]. It breaks PATH order.
 
 This step is for macOS only. Linux needs no shim, and CI runs `cargo clippy` and `cargo test`
 on `ubuntu-24.04`.
@@ -149,12 +131,11 @@ Cargo writes the artifact into the directory of the plain triple.
 
 The two Apple targets link with the system linker and build with plain `cargo build`.
 
-## The container image
+## Docker
 
 ```
 cargo xtask dist --target x86_64-unknown-linux-musl
 docker build -t pirate:0.1.0 .
 ```
 
-The build context needs `dist/` only. Read the header of the `Dockerfile` for the two-
-architecture command and for the bind-address warning.
+The build context needs `dist/` only.
