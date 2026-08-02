@@ -76,11 +76,11 @@ impl<L: Listener> Listener for Timeout<L> {
 /// [`ErrorKind::TimedOut`] while the head is not complete and the deadline has
 /// elapsed.
 ///
-/// CAUTION: The deadline covers the FIRST request head and nothing else. When
-/// that head is complete this type becomes a pass-through forever, and it arms
-/// no second deadline. The first request on `/ws` is a WebSocket upgrade, and
-/// every byte after it is a WebSocket frame that arrives when the operator
-/// types. A wrapper that re-arms would close an idle terminal.
+/// CAUTION: An upgrade, and only an upgrade, makes this type a pass-through.
+/// Every request head on the connection gets its own deadline until the server
+/// answers 101. After that answer the deadline is gone for good, because every
+/// byte that follows is a WebSocket frame that arrives when the operator types,
+/// and a deadline there would close an idle terminal.
 #[derive(Debug)]
 pub struct TimeoutIo<S> {
     inner: S,
@@ -88,6 +88,40 @@ pub struct TimeoutIo<S> {
     deadline: Option<Pin<Box<Sleep>>>,
     /// Consecutive newlines, counted across calls.
     newlines: u8,
+    /// The deadline that each head gets. A new head arms a new one.
+    limit: Duration,
+    /// True once the server answered 101 and the connection became a WebSocket.
+    ///
+    /// CAUTION: This flag, and NOT the end of the first head, is what makes the
+    /// wrapper a pass-through. Every byte after an upgrade is a terminal frame
+    /// that arrives when the operator types, so a deadline there would close an
+    /// idle terminal. Every byte on a connection that did NOT upgrade is still
+    /// a request, and it still gets a deadline. An adversarial review proved
+    /// both halves: a dribbled body after a complete head, and a dribbled
+    /// SECOND head on a keep-alive connection, each held a connection open for
+    /// as long as the client wanted.
+    upgraded: bool,
+    /// True once the status line of the CURRENT answer has been read.
+    ///
+    /// CAUTION: This flag covers ONE answer and not the connection. `arm`
+    /// clears it, so the status line of every answer is read. An earlier
+    /// version latched it on the first write of the connection, and an
+    /// adversarial review proved the cost: a client that sent `GET /auth`
+    /// first and the `/ws` upgrade second on the same connection got its 101,
+    /// and the wrapper never saw it. The deadline then stayed armed on a live
+    /// terminal, and the terminal died as soon as the operator stopped typing.
+    answered: bool,
+    /// True once a byte that is not a newline and not a return has arrived.
+    ///
+    /// CAUTION: Keep this flag. A head is a blank line AFTER a request line,
+    /// and a blank line before one is not a head at all. RFC 9112 lets a server
+    /// ignore an empty line that comes before the request line, and httparse
+    /// skips every one of them, so hyper is still waiting for the request line.
+    /// An adversarial review proved the hole: without this flag the two bytes
+    /// `\n\n` reached [`HEAD_NEWLINES`], disarmed the deadline for the life of
+    /// the connection, and held that connection open with no request on it.
+    /// Two bytes therefore bought what this whole module exists to refuse.
+    started: bool,
 }
 
 impl<S> TimeoutIo<S> {
@@ -96,7 +130,38 @@ impl<S> TimeoutIo<S> {
         Self {
             inner,
             deadline: Some(Box::pin(tokio::time::sleep(limit))),
+            limit,
+            upgraded: false,
+            answered: false,
             newlines: 0,
+            started: false,
+        }
+    }
+
+    /// Arm a deadline for the head that is starting now.
+    ///
+    /// This also opens the read of the next status line. A connection carries
+    /// many requests, and the upgrade can be any one of them.
+    fn arm(&mut self) {
+        self.deadline = Some(Box::pin(tokio::time::sleep(self.limit)));
+        self.newlines = 0;
+        self.started = false;
+        self.answered = false;
+    }
+
+    /// Read the first bytes of an answer, and note a 101.
+    ///
+    /// hyper writes the status line at the head of each answer, so the first
+    /// write after a head carries it. A refused upgrade answers 401 or 403, and
+    /// that connection therefore keeps its deadline.
+    fn note_answer(&mut self, buf: &[u8]) {
+        if self.answered || buf.is_empty() {
+            return;
+        }
+        self.answered = true;
+        if buf.starts_with(b"HTTP/1.1 101") {
+            self.upgraded = true;
+            self.deadline = None;
         }
     }
 
@@ -104,12 +169,21 @@ impl<S> TimeoutIo<S> {
     ///
     /// A `\n` raises the count. A `\r` leaves it alone, so `\r\n\r\n` counts
     /// two. Every other byte resets it, so a header line of its own does not.
+    /// A newline that arrives before any other byte counts for nothing, because
+    /// the head has not started. See the CAUTION on `started`.
     fn head_ends(&mut self, bytes: &[u8]) -> bool {
         for byte in bytes {
             match byte {
-                b'\n' => self.newlines += 1,
+                b'\n' => {
+                    if self.started {
+                        self.newlines += 1;
+                    }
+                }
                 b'\r' => {}
-                _ => self.newlines = 0,
+                _ => {
+                    self.started = true;
+                    self.newlines = 0;
+                }
             }
             if self.newlines >= HEAD_NEWLINES {
                 return true;
@@ -127,6 +201,20 @@ impl<S: AsyncRead + Unpin> AsyncRead for TimeoutIo<S> {
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
+        // A connection that never upgraded is always in the middle of a
+        // request, so it always carries a deadline. The upgrade is the one
+        // thing that takes the deadline away for good.
+        //
+        // CAUTION: Arm here, BEFORE the read, and not beside the scan below.
+        // A client can send the end of the head and the first byte of the body
+        // in one segment. The scan then ends the head and clears the deadline
+        // in the same call, and an arm that sits beside the scan never runs
+        // again, because every later read of a dribbled body gives `Pending`.
+        // An adversarial review held a connection open that way.
+        if !this.upgraded && this.deadline.is_none() {
+            this.arm();
+        }
+
         // The deadline is polled FIRST. A client that sends one byte at a time
         // keeps the read below ready, so a test that runs after the read would
         // never reach the deadline of a busy connection.
@@ -143,10 +231,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for TimeoutIo<S> {
         // filled, and a rescan would count their newlines a second time.
         let start = buf.filled().len();
         let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
-        if this.deadline.is_some() && matches!(polled, Poll::Ready(Ok(()))) {
+        if !this.upgraded && matches!(polled, Poll::Ready(Ok(()))) {
             let new = buf.filled().len();
-            if this.head_ends(&buf.filled()[start..new]) {
-                // Pass-through from here on. See the CAUTION on this type.
+            // A head that ends clears the deadline. The next call arms a new
+            // one, unless the server answered 101 in the meantime.
+            if new > start && this.head_ends(&buf.filled()[start..new]) {
                 this.deadline = None;
             }
         }
@@ -160,7 +249,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TimeoutIo<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        let this = self.get_mut();
+        this.note_answer(buf);
+        Pin::new(&mut this.inner).poll_write(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -176,7 +267,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TimeoutIo<S> {
         cx: &mut Context<'_>,
         bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
+        let this = self.get_mut();
+        if let Some(first) = bufs.iter().find(|slice| !slice.is_empty()) {
+            this.note_answer(first);
+        }
+        Pin::new(&mut this.inner).poll_write_vectored(cx, bufs)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -195,7 +290,11 @@ mod tests {
         let mut io = TimeoutIo {
             inner: tokio::io::empty(),
             deadline: None,
+            limit: Duration::from_secs(1),
+            upgraded: false,
+            answered: false,
             newlines: 0,
+            started: false,
         };
         chunks.iter().position(|chunk| io.head_ends(chunk))
     }
@@ -221,6 +320,23 @@ mod tests {
         assert_eq!(head_at(&one_byte), Some(one_byte.len() - 1));
         // The blank line split across the two calls.
         assert_eq!(head_at(&[b"GET / HTTP/1.1\r\n\r", b"\n"]), Some(1));
+    }
+
+    #[test]
+    fn a_blank_line_before_the_request_line_does_not_end_the_head() {
+        // RFC 9112 lets a server ignore an empty line before the request line,
+        // and httparse skips every one of them. hyper is therefore still
+        // waiting for a request line, and the deadline must stay armed. An
+        // adversarial review reached this with the two bytes `\n\n`.
+        assert_eq!(head_at(&[b"\n\n"]), None);
+        assert_eq!(head_at(&[b"\r\n\r\n"]), None);
+        assert_eq!(head_at(&[b"\n", b"\n", b"\n", b"\n"]), None);
+        // The leading blank lines are skipped, and the head that follows them
+        // still ends where it should.
+        assert_eq!(
+            head_at(&[b"\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n"]),
+            Some(0)
+        );
     }
 
     #[test]

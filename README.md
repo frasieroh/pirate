@@ -179,6 +179,22 @@ server ends every session. A wrong token spends one attempt of a bucket of 20 at
 the bucket refills at 5 attempts each second. A correct token spends no attempt, so a flood of
 guesses never locks the operator out.
 
+## The limits of the server
+
+| Limit | Value | What happens at the limit |
+|---|---|---|
+| Live terminals | 64 | A further `/ws` request gets 503 and starts no shell. |
+| Live sessions | 64 | The session that ends first is dropped. |
+| Terminal size | 2000 columns by 2000 rows | A larger request is clamped. The terminal still works. |
+| The read of the request headers | 10 seconds | pirate closes a connection that sends no complete request head. |
+| The TLS handshake | 10 seconds | pirate drops the connection. |
+
+The deadline on the request headers holds until the head of the first request is complete. A
+WebSocket that carries no byte for hours therefore stays open.
+
+Under TLS, pirate offers `http/1.1` and no other protocol. A client that offers `h2` alone
+gets `no_application_protocol` and no connection.
+
 ## `--no-password`
 
 `--no-password`, or `-n`, removes the token gate. pirate then reads no token file and writes

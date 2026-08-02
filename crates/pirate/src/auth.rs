@@ -79,7 +79,23 @@ const MIN_TOKEN_BYTES: usize = 32;
 /// A page on another port of the same host can add its own `pirate_session`
 /// pairs, so the reader takes more than one. Each candidate costs a scan of the
 /// store, and this bound keeps that work constant.
-const MAX_COOKIE_CANDIDATES: usize = 8;
+///
+/// CAUTION: A candidate past this bound is never compared, so a low bound is a
+/// way to lock the operator out: the attacker plants enough junk pairs to push
+/// the real session past the cut, and `/ws` then answers 401. An audit measured
+/// that against the real binary at the earlier bound of 8. 32 costs at most 32
+/// times `MAX_SESSIONS` constant-time compares of 64 bytes, which is
+/// microseconds, and it needs a domain hierarchy deeper than a browser builds.
+const MAX_COOKIE_CANDIDATES: usize = 32;
+
+// CAUTION: Do NOT add a bound on the number of `Cookie` PAIRS that the reader
+// walks. An earlier version did, to bound the work of a large header. It
+// reintroduced the very lockout that the CAUTION above forbids, at a lower
+// cost to the attacker: 256 junk pairs that are not session cookies pushed the
+// real session past the cut, and `/ws` then answered 401 for good. hyper
+// already bounds the size of a header, so the walk is bounded without it. Only
+// a pair that PARSES as a session identifier costs anything after this point,
+// and `MAX_COOKIE_CANDIDATES` bounds those.
 
 /// The shared secret of the server.
 pub struct Token(Vec<u8>);
@@ -1244,14 +1260,64 @@ mod tests {
     }
 
     #[test]
-    fn the_reader_stops_at_eight_candidates() {
+    fn the_reader_stops_at_the_candidate_bound() {
         let id = "a".repeat(64);
         let mut text = String::new();
-        for _ in 0..40 {
+        for _ in 0..MAX_COOKIE_CANDIDATES * 4 {
             text.push_str(&format!("pirate_session={id}; "));
         }
         let map = headers(&[("cookie", &text)]);
         assert_eq!(session_cookies(&map).len(), MAX_COOKIE_CANDIDATES);
+    }
+
+    #[test]
+    fn a_pile_of_junk_pairs_does_not_hide_the_real_session() {
+        // An attacker that reaches the cookie jar plants junk `pirate_session`
+        // pairs, and RFC 6265 sorts them before the real one. A reader that
+        // stops too early never compares the real session, and the operator
+        // gets 401 for good. A measurement against the real binary found that
+        // at the earlier bound of 8.
+        let now = Instant::now();
+        let mut guarded = Guarded {
+            sessions: Vec::new(),
+            bucket: Bucket::new(now),
+        };
+        let id = guarded.insert(now).unwrap();
+        let real = String::from_utf8(id.to_vec()).unwrap();
+
+        let junk = "0".repeat(64);
+        let mut text = String::new();
+        for _ in 0..MAX_COOKIE_CANDIDATES - 1 {
+            text.push_str(&format!("pirate_session={junk}; "));
+        }
+        text.push_str(&format!("pirate_session={real}"));
+
+        let candidates = session_cookies(&headers(&[("cookie", &text)]));
+        assert_eq!(candidates.len(), MAX_COOKIE_CANDIDATES);
+        assert!(
+            guarded.holds_any(&candidates),
+            "the real session must survive {} junk pairs before it",
+            MAX_COOKIE_CANDIDATES - 1
+        );
+    }
+
+    #[test]
+    fn a_pile_of_junk_pairs_that_are_not_sessions_does_not_hide_the_real_one() {
+        // A bound on the pairs that the reader walks would refuse this header,
+        // and that is a lockout an attacker reaches by setting cookies that
+        // are not session cookies at all. Only a pair that parses as an
+        // identifier may cost a candidate slot.
+        let mut text = String::new();
+        for index in 0..1000 {
+            text.push_str(&format!("junk{index}=1; "));
+        }
+        let real = "b".repeat(64);
+        text.push_str(&format!("pirate_session={real}"));
+        assert_eq!(
+            session_cookies(&headers(&[("cookie", &text)])),
+            vec![[b'b'; 64]],
+            "the real session must survive a header of junk pairs"
+        );
     }
 
     #[test]

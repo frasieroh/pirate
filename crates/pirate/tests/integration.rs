@@ -1316,3 +1316,66 @@ async fn the_live_terminals_are_bounded_and_a_closed_one_gives_its_slot_back() {
     .expect("the closed terminal never gave its slot back");
     drop(socket);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oversized_resize_frame_is_clamped_at_the_pty() {
+    // A resize frame carries two `u16` values, so this five-byte message asks
+    // for 65535 by 65535. Unclamped it took 3.9 GB of resident memory against
+    // the real binary, its dump never answered, and the memory stayed after
+    // the socket closed. One client therefore took every terminal of the
+    // operator. `stty size` reads the size back from the kernel.
+    let dir = temp_dir("resize-clamp");
+    let script = write_script(
+        &dir,
+        "size.sh",
+        "#!/bin/sh\nwhile read -r line; do stty size; done\n",
+    );
+    let addr = start(script).await;
+    let mut socket = connect(addr).await;
+
+    send(
+        &mut socket,
+        ClientFrame::Resize {
+            cols: u16::MAX,
+            rows: u16::MAX,
+        },
+    )
+    .await;
+    send(&mut socket, ClientFrame::Input(b"\n")).await;
+
+    let expected = format!(
+        "{} {}",
+        pirate::terminal::MAX_ROWS,
+        pirate::terminal::MAX_COLS
+    );
+    let text = read_until(&mut socket, &expected).await;
+    assert!(
+        text.contains(&expected),
+        "the PTY must report the clamped size {expected:?}, and it reported {text:?}"
+    );
+
+    // The session still works after the clamp, so the frame is not a refusal.
+    send(&mut socket, ClientFrame::Dump).await;
+    let dump = read_dump(&mut socket).await;
+    assert!(!dump.is_empty(), "a clamped terminal must still dump");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_asset_answer_carries_the_two_headers_that_a_browser_obeys() {
+    // `nosniff` holds the browser to the type that pirate states. A guess
+    // turns an asset into a document. `frame-ancestors` refuses every frame,
+    // so no other origin can put the terminal of the operator in a page.
+    let addr = start(PathBuf::from("/bin/cat")).await;
+    let answer = http(addr, "GET", "/", &[], "").await;
+
+    assert_eq!(
+        answer.header("x-content-type-options"),
+        Some("nosniff"),
+        "the asset answer must carry nosniff"
+    );
+    assert_eq!(
+        answer.header("content-security-policy"),
+        Some("frame-ancestors 'none'"),
+        "the asset answer must refuse every frame"
+    );
+}

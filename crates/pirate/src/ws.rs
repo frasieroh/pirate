@@ -149,7 +149,16 @@ async fn handle(socket: WebSocket, shell: PathBuf, _slot: TerminalSlot) {
     let (mut session, frames) = match Session::spawn(&shell, DEFAULT_COLS, DEFAULT_ROWS) {
         Ok(started) => started,
         Err(e) => {
-            eprintln!("pirate: cannot start `{}`: {e}", shell.display());
+            // The client drives this path: it opens a socket, the spawn
+            // fails, the slot is released at once, and it opens another. See
+            // the CAUTION on `OnceFlag`.
+            if SPAWN_REPORTED.first_time() {
+                eprintln!(
+                    "pirate: cannot start `{}`: {e}. \
+                     pirate reports this fault one time only.",
+                    shell.display()
+                );
+            }
             return;
         }
     };
@@ -361,3 +370,22 @@ impl OnceFlag {
 static DECODE_REPORTED: OnceFlag = OnceFlag::new();
 /// The guard of the resize that the PTY refused.
 static RESIZE_REPORTED: OnceFlag = OnceFlag::new();
+/// The guard of the shell that would not start.
+static SPAWN_REPORTED: OnceFlag = OnceFlag::new();
+
+#[cfg(test)]
+mod tests {
+    use super::OnceFlag;
+
+    #[test]
+    fn the_guard_lets_one_message_through_and_then_stops() {
+        // The client is untrusted and it holds the socket open. A log line for
+        // each malformed frame is a way to flood stderr: 20000 one-byte frames
+        // wrote 20000 lines and 1.6 MB of log against the real binary.
+        let flag = OnceFlag::new();
+        assert!(flag.first_time(), "the first fault must reach the operator");
+        for _ in 0..20_000 {
+            assert!(!flag.first_time(), "every later fault must be silent");
+        }
+    }
+}

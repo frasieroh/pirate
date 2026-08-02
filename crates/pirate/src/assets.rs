@@ -52,7 +52,17 @@ pub async fn serve(path: &str, headers: &HeaderMap, assets_dir: Option<&PathBuf>
 
     let mut response = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, mime.as_ref());
+        .header(header::CONTENT_TYPE, mime.as_ref())
+        // The browser must read the type that pirate states, and not guess one
+        // from the bytes. A guess turns an asset into a document.
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        // No page may put pirate in a frame. The terminal of the operator is
+        // not a widget for another origin.
+        //
+        // CAUTION: Keep this policy at `frame-ancestors`. The client loads a
+        // WebAssembly module and inline styles, so a `default-src` or a
+        // `script-src` here stops the terminal from starting.
+        .header(header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'");
     if let Some(encoding) = payload.encoding {
         response = response
             .header(header::CONTENT_ENCODING, encoding)

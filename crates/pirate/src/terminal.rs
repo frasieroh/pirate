@@ -32,6 +32,27 @@ const SCROLLBACK: usize = 1000;
 const CELL_WIDTH_PX: u32 = 8;
 const CELL_HEIGHT_PX: u32 = 16;
 
+/// The largest terminal that a client can ask for.
+///
+/// The browser owns the true size, and it sends it in a `0x01` resize frame.
+/// That frame carries two `u16` values, so a client can ask for 65535 by
+/// 65535. Nothing else bounds the grid: the request took 3.9 GB of resident
+/// memory in a measurement against the real binary, the dump of that grid
+/// never completed, and the memory stayed after the socket closed. One frame
+/// of five bytes therefore took the whole process, and every other terminal of
+/// the operator with it.
+///
+/// 2000 is beyond any real display. A 5120-pixel screen at the smallest font
+/// that the client offers, 8 pixels, gives about 1066 columns. The measured
+/// cost of a 2000 by 2000 grid is about 35 MB.
+///
+/// CAUTION: A clamp is silent, and it must stay silent. An oversized request
+/// gives a clamped terminal, which is a terminal that works. A refusal gives
+/// the browser no screen at all.
+pub const MAX_COLS: u16 = 2000;
+/// The largest number of rows that a client can ask for. See [`MAX_COLS`].
+pub const MAX_ROWS: u16 = 2000;
+
 /// Sent before a dump of the alternate screen.
 ///
 /// `ESC [ ? 1049 h` enters the alternate screen and clears it. `ESC [ H` and
@@ -53,9 +74,11 @@ pub struct ScreenTerminal {
 impl ScreenTerminal {
     /// Create a terminal of this size.
     pub fn new(cols: u16, rows: u16) -> Result<Self, libghostty_vt::Error> {
+        // The same ceiling as `resize`. This constructor is public too, and
+        // the CAUTION on `resize` applies to it word for word.
         let inner = Terminal::new(TerminalOptions {
-            cols: cols.max(1),
-            rows: rows.max(1),
+            cols: cols.clamp(1, MAX_COLS),
+            rows: rows.clamp(1, MAX_ROWS),
             max_scrollback: SCROLLBACK,
         })?;
         Ok(Self { inner })
@@ -73,9 +96,17 @@ impl ScreenTerminal {
     ///
     /// The PTY takes the same size in the same handler, so the two cannot
     /// drift. See `Session::resize`.
+    ///
+    /// CAUTION: Keep the clamp here as well as in `Session::resize`. This is
+    /// defense in depth and it is not a duplicate: this type is public, and a
+    /// later caller can reach it without passing through `Session`.
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), libghostty_vt::Error> {
-        self.inner
-            .resize(cols.max(1), rows.max(1), CELL_WIDTH_PX, CELL_HEIGHT_PX)
+        self.inner.resize(
+            cols.clamp(1, MAX_COLS),
+            rows.clamp(1, MAX_ROWS),
+            CELL_WIDTH_PX,
+            CELL_HEIGHT_PX,
+        )
     }
 
     /// The screen as VT sequences, ready to send as a `0x01` frame.
@@ -207,6 +238,31 @@ impl ScreenTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_oversized_resize_is_clamped_and_not_refused() {
+        // The resize frame carries two `u16` values, so a client can ask for
+        // 65535 by 65535. That grid took 3.9 GB against the real binary and
+        // its dump never completed. The clamp is what makes the frame cheap.
+        let mut term = ScreenTerminal::new(80, 24).unwrap();
+        term.resize(u16::MAX, u16::MAX).unwrap();
+
+        // The screen still works, and it works at the clamped size.
+        term.write(b"hello");
+        assert_eq!(term.cell(0, 0).unwrap(), 'h');
+
+        let dump = term.dump().unwrap();
+        assert!(
+            dump.len() < 4 * 1024 * 1024,
+            "a clamped screen must give a small dump, and this one is {} bytes",
+            dump.len()
+        );
+
+        // A zero on either side still gives a terminal of at least one cell.
+        term.resize(0, 0).unwrap();
+        term.write(b"x");
+        assert_eq!(term.cell(0, 0).unwrap(), 'x');
+    }
 
     #[test]
     fn plain_text_lands_on_the_first_row() {

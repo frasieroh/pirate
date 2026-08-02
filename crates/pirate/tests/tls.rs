@@ -548,8 +548,9 @@ async fn silent_clients_past_the_handshake_bound_do_not_deny_the_server() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_that_offers_two_protocols_negotiates_http_1_1() {
-    // axum builds with its `http2` feature on, so `axum::serve` hands each
-    // connection to a hyper auto-builder that can speak HTTP/2. The server
+    // axum 0.8 does not carry `http2` in its default set, and `Cargo.lock`
+    // holds no `h2` crate, so this build speaks HTTP/1.1 only. The pin is what
+    // keeps it that way if a later change turns that feature on. The server
     // offers one protocol, so a browser that offers both gets HTTP/1.1 and the
     // WebSocket upgrade of RFC 6455 stays on the path that pirate proved.
     let (addr, _tls) = start_tls(&TlsSource::SelfSigned).await;

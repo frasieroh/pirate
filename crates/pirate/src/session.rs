@@ -129,8 +129,10 @@ impl Session {
         cols: u16,
         rows: u16,
     ) -> Result<(Self, Frames), Box<dyn std::error::Error + Send + Sync>> {
-        let cols = cols.max(1);
-        let rows = rows.max(1);
+        // The same ceiling as `resize`. `spawn` is the second path into the
+        // PTY and into the server-side terminal, so it takes the same clamp.
+        let cols = cols.clamp(1, crate::terminal::MAX_COLS);
+        let rows = rows.clamp(1, crate::terminal::MAX_ROWS);
 
         let (pty, pts) = pty_process::open().map_err(to_io)?;
         pty.resize(pty_process::Size::new(rows, cols))
@@ -220,9 +222,13 @@ impl Session {
     ///
     /// The PTY and the server-side terminal take the size here, in one place.
     /// Therefore the two cannot drift.
+    /// The size is clamped to [`crate::terminal::MAX_COLS`] and
+    /// [`crate::terminal::MAX_ROWS`]. This call feeds both the PTY ioctl and
+    /// the terminal thread, so one clamp holds for both. [`Session::spawn`] is
+    /// the other call that sets a size, and it carries the same clamp.
     pub fn resize(&mut self, cols: u16, rows: u16) -> std::io::Result<()> {
-        let cols = cols.max(1);
-        let rows = rows.max(1);
+        let cols = cols.clamp(1, crate::terminal::MAX_COLS);
+        let rows = rows.clamp(1, crate::terminal::MAX_ROWS);
         if let Some(pty) = self.pty.as_mut() {
             // pty_process::Size takes rows first, then columns.
             pty.resize(pty_process::Size::new(rows, cols))
@@ -304,7 +310,17 @@ impl Session {
             // No such process. The group is already gone, which is the result
             // that this call wants.
             Ok(()) | Err(rustix::io::Errno::SRCH) => {}
-            Err(e) => eprintln!("pirate: cannot signal the process group: {e}"),
+            // Every close of a socket reaches this line, and a host where
+            // the signal gives EPERM writes one line for each of them. An
+            // adversarial review watched that happen.
+            Err(e) => {
+                if SIGNAL_REPORTED.first_time() {
+                    eprintln!(
+                        "pirate: cannot signal the process group: {e}. \
+                         pirate reports this fault one time only."
+                    );
+                }
+            }
         }
     }
 
@@ -328,6 +344,13 @@ impl Drop for Session {
         }
     }
 }
+
+/// The guard of a signal that the operating system refused.
+static SIGNAL_REPORTED: crate::ws::OnceFlag = crate::ws::OnceFlag::new();
+/// The guard of a screen that would not format.
+static DUMP_REPORTED: crate::ws::OnceFlag = crate::ws::OnceFlag::new();
+/// The guard of a resize that the server-side terminal refused.
+static RESIZE_REPORTED: crate::ws::OnceFlag = crate::ws::OnceFlag::new();
 
 /// The frames of one session, in order.
 pub struct Frames {
@@ -397,7 +420,14 @@ impl Client {
     fn send_dump(&mut self, terminal: &ScreenTerminal) {
         match terminal.dump() {
             Ok(bytes) => self.send(ServerFrame::Dump(&bytes).encode()),
-            Err(e) => eprintln!("pirate: cannot format the screen: {e}"),
+            Err(e) => {
+                if DUMP_REPORTED.first_time() {
+                    eprintln!(
+                        "pirate: cannot format the screen: {e}. \
+                         pirate reports this fault one time only."
+                    );
+                }
+            }
         }
     }
 }
@@ -464,7 +494,12 @@ fn run_terminal(
             }
             Command::Resize { cols, rows } => {
                 if let Err(e) = terminal.resize(cols, rows) {
-                    eprintln!("pirate: cannot resize the server-side terminal: {e}");
+                    if RESIZE_REPORTED.first_time() {
+                        eprintln!(
+                            "pirate: cannot resize the server-side terminal: {e}. \
+                             pirate reports this fault one time only."
+                        );
+                    }
                 }
             }
             Command::Resync => {
