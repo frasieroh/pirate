@@ -12,11 +12,15 @@ pub mod auth;
 pub mod protocol;
 pub mod session;
 pub mod terminal;
+pub mod timeout;
 pub mod tls;
-// This module is public for one item only: `ws::DUMP_INTERVAL`. The
-// integration tests are an external crate, and they cannot name a private
-// module.
-pub mod ws;
+mod ws;
+
+// The items of `ws` that a caller outside this crate reads. The integration
+// test `a_flood_of_dump_requests_collapses_into_a_few_dumps` computes its
+// ceiling from `DUMP_INTERVAL`, and `AppState` holds a `Terminals`. The rest of
+// the module stays private.
+pub use ws::{Terminals, DUMP_INTERVAL};
 
 use axum::extract::State;
 use axum::http::{HeaderMap, Uri};
@@ -44,9 +48,17 @@ pub struct AppState {
     ///
     /// A DNS name that an attacker owns can resolve to the address of pirate.
     /// The browser then sends that name in both `Origin` and `Host`, the two
-    /// agree, and the origin check passes. This list is what makes them
-    /// disagree.
+    /// agree, and the origin check passes. The certificate is what makes them
+    /// disagree, so the transport gives this value: a TLS server answers to
+    /// the names of its certificate, and a plain HTTP server answers to every
+    /// name.
     pub hosts: auth::HostAllow,
+    /// The live terminals of this server.
+    ///
+    /// One `/ws` connection forks a shell, and nothing else bounds the number
+    /// of them. `/ws` takes a slot here before it upgrades, and a request that
+    /// finds no slot gets 503.
+    pub terminals: Terminals,
 }
 
 impl AppState {
@@ -60,9 +72,9 @@ impl AppState {
             shell,
             auth: auth::Auth::disabled(),
             tls: false,
-            // An IP literal and `localhost` need no entry, and every caller of
-            // this constructor binds to a loopback IP literal.
-            hosts: auth::HostAllow::new(Vec::new()),
+            // No certificate, and therefore no claim about a name.
+            hosts: auth::HostAllow::from_certificate(None),
+            terminals: Terminals::default(),
         }
     }
 }

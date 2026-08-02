@@ -91,13 +91,6 @@ struct Args {
     /// port then gets a shell.
     #[arg(long, short = 'n')]
     no_password: bool,
-
-    /// A name that you type in the browser to reach pirate. Repeat the flag
-    /// for more than one name. An IP address and `localhost` always work.
-    // No short flag. `-h` is the help flag of clap, and every other letter of
-    // this word is already taken.
-    #[arg(long, env = "PIRATE_HOSTNAME")]
-    hostname: Vec<String>,
 }
 
 #[tokio::main]
@@ -152,7 +145,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shell = args.shell.unwrap_or_else(pirate::session::default_shell);
     eprintln!("pirate: shell {}", shell.display());
 
-    let hosts = pirate::auth::HostAllow::new(args.hostname.clone());
+    // The transport gives the names that the server answers to. That one
+    // decision lives in `auth.rs`, where a unit test holds its two arms apart.
+    let hosts = pirate::auth::HostAllow::from_certificate(tls.as_ref().map(|tls| &tls.leaf));
 
     let state = Arc::new(AppState {
         assets_dir: args.assets_dir,
@@ -160,11 +155,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth,
         tls: tls.is_some(),
         hosts,
+        terminals: pirate::Terminals::default(),
     });
 
     let addr = SocketAddr::new(args.bind, args.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let addr = listener.local_addr()?;
+
+    // These are the names that the server answers to. A request that carries
+    // any other name in `Host` gets a 403.
+    //
+    // CAUTION: The list comes from `tls.names`, which pirate READ BACK from the
+    // certificate that it serves. An earlier line called the generator a second
+    // time and printed what the generator was asked for, so a name that the
+    // certificate dropped still reached the operator. Every source prints this
+    // one line, because a path to a PEM file is not a list of names.
+    if let Some(tls) = &tls {
+        eprintln!("pirate: this certificate covers {}", tls.names.join(", "));
+    }
 
     if let (Some(TlsSource::SelfSigned), Some(tls)) = (&source, &tls) {
         eprintln!("pirate: nothing signed this certificate, so the browser will show a warning.");
@@ -188,14 +196,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                  Plain HTTP puts the token on the network in the clear."
             );
         }
-        // The diagnosis line for a 403 that the operator cannot explain. The
-        // browser sends the typed name in `Host`, and pirate refuses a name
-        // that it does not answer to.
-        if args.hostname.is_empty() {
+        // A second risk of the same transport, and it is not the token. The
+        // certificate is what states the names that the server answers to, so a
+        // server without one answers to every name. `--hostname` used to warn
+        // here, and the transport carries that duty now.
+        if tls.is_none() {
             eprintln!(
-                "pirate: CAUTION: Add --hostname <NAME> for the name that you type in the \
-                 browser. Without it pirate answers to an IP address only, and a request that \
-                 carries any other name is refused."
+                "pirate: CAUTION: Use --selfsigned or --cert on this bind address. \
+                 Plain HTTP names no server, so pirate answers to every name in the Host header. \
+                 A DNS name that an attacker owns then reaches this port."
             );
         }
     }
@@ -203,19 +212,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The two branches give `axum::serve` two listener types, and therefore two
     // types of server. A trait object cannot hold them, because the trait has
     // an associated type for the connection.
+    //
+    // CAUTION: Keep `Timeout` on BOTH branches. It is the only bound on the
+    // read of the request headers, because `axum::serve` builds its hyper
+    // connection inline and takes no configuration. Without it, one client
+    // holds a connection open forever with one byte a minute. On the TLS
+    // branch the wrapper goes OUTSIDE the TLS listener, so its deadline starts
+    // after the handshake and `tls::HANDSHAKE_TIMEOUT` covers the handshake.
     match tls {
         Some(tls) => {
             axum::serve(
-                pirate::tls::TlsListener::new(pirate::NoDelay(listener), tls.config),
+                pirate::timeout::Timeout::new(
+                    pirate::tls::TlsListener::new(pirate::NoDelay(listener), tls.config),
+                    pirate::timeout::HEADER_TIMEOUT,
+                ),
                 router(state),
             )
             .with_graceful_shutdown(shutdown())
             .await?;
         }
         None => {
-            axum::serve(pirate::NoDelay(listener), router(state))
-                .with_graceful_shutdown(shutdown())
-                .await?;
+            axum::serve(
+                pirate::timeout::Timeout::new(
+                    pirate::NoDelay(listener),
+                    pirate::timeout::HEADER_TIMEOUT,
+                ),
+                router(state),
+            )
+            .with_graceful_shutdown(shutdown())
+            .await?;
         }
     }
     Ok(())

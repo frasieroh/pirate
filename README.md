@@ -78,18 +78,46 @@ With no transport flag, a bind address that is not loopback stops the server:
 the bind address 0.0.0.0 is not loopback, so pirate needs a transport. Use --cert with --key, or --selfsigned, or --plaintext.
 ```
 
-`--selfsigned` builds a certificate for the names `localhost`, `127.0.0.1`, and `::1`. It
-covers no other name and no other address. The private key stays in memory, so a restart gives
+`--selfsigned` builds a certificate for `localhost`, `127.0.0.1`, `::1`, the name of this
+machine, and the first label of that name. The private key stays in memory, so a restart gives
 a new certificate. Nothing signed the certificate, so the browser shows a warning. pirate
-prints the SHA-256 fingerprint of the certificate:
+prints the names of the certificate and its SHA-256 fingerprint:
 
 ```
+pirate: this certificate covers localhost, 127.0.0.1, ::1, oscars-macbook-pro.local, oscars-macbook-pro
 pirate: nothing signed this certificate, so the browser will show a warning.
 pirate: compare this fingerprint with the one in that warning:
 pirate: <FINGERPRINT>
 ```
 
 Make sure that this fingerprint agrees with the fingerprint in the warning of the browser.
+
+Note: A machine name that a certificate name cannot carry is dropped. The certificate then
+covers the three loopback names only, and the server still starts. pirate prints this line:
+
+```
+pirate: CAUTION: A certificate name cannot carry the name of this machine, <NAME>. This certificate covers the loopback names only.
+```
+
+With `--cert` and `--key`, pirate prints the same line. pirate reads those names back from the
+certificate that it serves, so the line states what the server answers to:
+
+```
+pirate: this certificate covers pirate.example, *.wild.example, 127.0.0.1, ::1
+```
+
+A leaf certificate that pirate cannot read stops the server:
+
+```
+pirate cannot read the names of the certificate: <REASON>. pirate answers to the names in the certificate, so it must read them
+```
+
+A certificate that carries no subject alternative name stops the server too. pirate reads the
+names of the server from that extension, and a certificate without it names nothing:
+
+```
+this certificate carries no subject alternative name. pirate reads the names of the server from the subject alternative name extension. Supply a certificate that carries its names in that extension
+```
 
 CAUTION: Do not use `--plaintext` on a network that you do not trust. The token, every
 keystroke, and every byte of the screen cross the network in the clear.
@@ -105,6 +133,13 @@ this line too:
 
 ```
 pirate: CAUTION: Use --selfsigned or --cert on this bind address. Plain HTTP puts the token on the network in the clear.
+```
+
+On a bind address that is not loopback, with no TLS, pirate prints this line too. Plain HTTP
+runs no name test, so an attacker-owned name that resolves to this address reaches pirate:
+
+```
+pirate: CAUTION: Use --selfsigned or --cert on this bind address. Plain HTTP names no server, so pirate answers to every name in the Host header. A DNS name that an attacker owns then reaches this port.
 ```
 
 ## The token file
@@ -147,7 +182,7 @@ guesses never locks the operator out.
 ## `--no-password`
 
 `--no-password`, or `-n`, removes the token gate. pirate then reads no token file and writes
-none. Every request that passes the `Origin` test and the `Host` test reaches the shell.
+none. Every request that passes the `Origin` test and the name test reaches the shell.
 
 CAUTION: Do not use `--no-password` on a bind address that is not loopback. Every host that
 can reach the port then gets a shell.
@@ -158,34 +193,50 @@ pirate prints this line for that case:
 pirate: CAUTION: Drop --no-password, or bind to loopback. The bind address 0.0.0.0 gives a shell to every host that can reach this port.
 ```
 
-## `--hostname`
+CAUTION: Do not use `--no-password` together with `--plaintext`. Plain HTTP runs no name test,
+so any name that reaches the port gets a shell.
+
+An attacker can own a DNS name that resolves to the address of pirate. Under plain HTTP that
+name passes every test, and the browser of the operator then opens a shell for the page of the
+attacker.
+
+## The names that pirate answers to
 
 A comparison of `Origin` with `Host` alone proves nothing about the server. An attacker can
 own a DNS name that resolves to the address of pirate. The browser then writes that name into
 both headers, the two headers agree, and a same-origin test passes. This is DNS rebinding.
 
-`--hostname` names the hosts that this server answers to, and that list is what makes the two
-headers disagree. A request with any other name in `Host` gets 403, on `POST /auth` and on the
-WebSocket upgrade.
+The transport gives the names. The certificate is what makes the two headers disagree, and the
+operator declares no name of its own.
 
-If you reach pirate by a name, run pirate with `--hostname <NAME>`. Repeat the flag for each
-further name. `PIRATE_HOSTNAME` sets one name too.
+| Mode | The certificate covers | The server answers to |
+|---|---|---|
+| `--selfsigned` | The loopback names and the name of this machine | The same names |
+| `--cert` with `--key` | The names that the operator supplied | Every name in that certificate |
+| `--plaintext`, and the default loopback bind | No certificate | Every name. No name test runs. |
 
-An IP address and `localhost` always work and need no entry. A page that carries an IP address
-as its origin already reached pirate at that address, so that name cannot move. The comparison
-ignores case, a trailing dot, and the brackets of an IPv6 address.
+Under TLS the leaf certificate is the whole rule. A name that the certificate covers is
+accepted. A request with any other name in `Host` gets 403, on `POST /auth` and on the
+WebSocket upgrade. A wildcard entry in the certificate matches by the wildcard rule of RFC
+6125, which covers one label.
 
-On a bind address that is not loopback, with an empty list, pirate prints this line:
+Under TLS an IP address is accepted only when the certificate carries it. `--selfsigned`
+carries `127.0.0.1` and `::1`, so both addresses reach pirate. The comparison ignores case, a
+trailing dot, and the brackets of an IPv6 address.
+
+If you reach pirate by a name, serve TLS with a certificate that covers that name.
+
+Under plain HTTP pirate carries no certificate, so it claims no name and runs no name test.
+DNS rebinding is possible in that mode.
+
+pirate refuses a request that carries more than one `Host` header, and a request that carries
+more than one `Origin` header. The `Origin` must also agree with the `Host`.
+
+A `Host` header that the certificate does not cover gives this line, one time for the life of
+the process:
 
 ```
-pirate: CAUTION: Add --hostname <NAME> for the name that you type in the browser. Without it pirate answers to an IP address only, and a request that carries any other name is refused.
-```
-
-A `Host` header that pirate does not answer to gives this line, one time for the life of the
-process:
-
-```
-pirate: a request carried a Host header that pirate does not answer to. If you reach pirate by a name, add --hostname <NAME>.
+pirate: a request carried a Host header that this certificate does not cover. Reach pirate by a name in the certificate. For another name, use --cert with a certificate that covers that name.
 ```
 
 ## Every flag
@@ -201,7 +252,6 @@ pirate: a request carried a Host header that pirate does not answer to. If you r
 | `--selfsigned` | `-s` | none | Generates a certificate at startup. |
 | `--plaintext` | none | none | Serves plain HTTP. |
 | `--no-password` | `-n` | none | Serves with no authentication. |
-| `--hostname <NAME>` | none | empty | A name that the browser uses to reach pirate. Repeat the flag for more names. `PIRATE_HOSTNAME` sets it too. |
 | `--version` | `-V` | none | Shows the version, then exits. |
 | `--long` | none | none | With `--version`, shows every pinned input of the build. |
 | `--help` | `-h` | none | Shows the help, then exits. |

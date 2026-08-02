@@ -70,8 +70,10 @@ pub const OUTPUT_BATCH: usize = 64 * 1024;
 
 /// Frames that one client can hold before the server calls it slow.
 ///
-/// Each frame carries at most [`OUTPUT_BATCH`] bytes, so this count holds the
-/// queue to [`CLIENT_BACKLOG`].
+/// The batch loop tests the length of a frame before it appends one more read.
+/// One frame therefore carries [`OUTPUT_BATCH`] bytes plus one read of
+/// [`READ_CHUNK`] bytes, at most. This count holds the queue near
+/// [`CLIENT_BACKLOG`], and to that value plus one read per frame at the most.
 pub const CLIENT_QUEUE: usize = CLIENT_BACKLOG / OUTPUT_BATCH;
 
 /// Bytes per read from the PTY master.
@@ -194,10 +196,24 @@ impl Session {
 
     /// Write client input to the PTY master.
     pub async fn input(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        match self.pty.as_mut() {
-            Some(pty) => pty.write_all(bytes).await,
-            None => Err(std::io::Error::other("the session is closed")),
+        let Some(pty) = self.pty.as_mut() else {
+            return Err(std::io::Error::other("the session is closed"));
+        };
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            match pty.write(rest).await {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(n) => rest = &rest[n..],
+                // A signal on another thread gives EINTR here, because
+                // `pty-process` retries `WouldBlock` only. The write must
+                // continue: the caller ends the session on an error, and a
+                // signal must not end a live terminal. The loop writes what
+                // remains, so no byte goes out twice.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
         }
+        Ok(())
     }
 
     /// Apply a new window size.
@@ -241,12 +257,21 @@ impl Session {
     pub async fn shutdown(&mut self) {
         // 1. Hang up the process group of the child. The child is a session
         //    leader, so this signal reaches the shell and its jobs.
-        self.signal_group(Signal::HUP);
+        //
+        //    Signal a group that still has a status of None only. On the
+        //    ordinary exit path the child is already reaped here, the kernel
+        //    can have given its pid to another process, and this call would
+        //    then hang up a group that pirate does not own.
+        if self.status.borrow().is_none() {
+            self.signal_group(Signal::HUP);
+        }
 
         // 2. Give the group a short time, then escalate. A process that
         //    ignores SIGHUP must not outlive the browser that started it.
         if !self.wait_for_exit(HANGUP_GRACE).await {
-            self.signal_group(Signal::KILL);
+            if self.status.borrow().is_none() {
+                self.signal_group(Signal::KILL);
+            }
             self.wait_for_exit(HANGUP_GRACE).await;
         }
 
@@ -346,6 +371,13 @@ struct Client {
     resync: Arc<AtomicBool>,
     /// True after a full queue. No frame goes out until the dump does.
     behind: bool,
+    /// The exit status of the child, when the child has ended.
+    ///
+    /// The exit frame goes out once when the child ends, and again after every
+    /// dump. A full queue therefore cannot lose it: a resync empties the queue,
+    /// so the dump and the exit frame both fit. The client that already has the
+    /// frame gets a copy of it, and a copy is harmless.
+    exit: Option<i32>,
 }
 
 impl Client {
@@ -392,6 +424,7 @@ fn run_terminal(
         tx,
         resync: Arc::clone(resync),
         behind: false,
+        exit: None,
     };
 
     // The first frame is a dump, so the browser starts from a known screen.
@@ -437,8 +470,16 @@ fn run_terminal(
             Command::Resync => {
                 client.behind = false;
                 client.send_dump(&terminal);
+                // The dump goes into the queue first, so the client sees the
+                // screen and then the status, in that order.
+                if let Some(status) = client.exit {
+                    client.send(ServerFrame::Exit(status).encode());
+                }
             }
             Command::Exited(status) => {
+                // Hold the status first. A full queue throws this frame away,
+                // and the next dump then carries the status again.
+                client.exit = Some(status);
                 client.behind = false;
                 client.send(ServerFrame::Exit(status).encode());
             }
@@ -462,8 +503,12 @@ async fn read_pty_output(
                     return;
                 }
             }
+            // A signal on another thread gives EINTR here, because
+            // `pty-process` retries `WouldBlock` only. Read again: a signal is
+            // not the end of the output.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             // The last slave closed. macOS and Linux both report EIO here.
-            // Every read error ends the output.
+            // Every other read error ends the output.
             Err(_) => break,
         }
     }
@@ -548,9 +593,27 @@ mod tests {
         let first = frames.next().await.expect("the session ended");
         assert!(is_dump(&first), "the first frame must be a dump");
 
-        // `cat` sends every line back, and the line discipline sends it back a
-        // second time. 512 KB of input therefore makes about 1 MB of output,
-        // which is twice the queue. Nothing reads the queue here.
+        flood_until_behind(&mut session, &frames).await;
+
+        // The next frame is the dump, and never the oldest queued output.
+        let frame = tokio::time::timeout(Duration::from_secs(10), frames.next())
+            .await
+            .expect("no frame arrived after the flood")
+            .expect("the session ended");
+        assert!(
+            is_dump(&frame),
+            "a client that fell behind must get a dump, and not its backlog"
+        );
+
+        session.shutdown().await;
+    }
+
+    /// Fill the queue of `frames` until the server calls the client slow.
+    ///
+    /// `cat` sends every line back, and the line discipline sends it back a
+    /// second time. 512 KB of input therefore makes about 1 MB of output, which
+    /// is twice the queue. The caller must read no frame while this runs.
+    async fn flood_until_behind(session: &mut Session, frames: &Frames) {
         let line = {
             let mut line = vec![b'x'; 255];
             line.push(b'\n');
@@ -578,16 +641,120 @@ mod tests {
             frames.resync.load(Ordering::Acquire),
             "1 MB of output never filled a queue of {CLIENT_BACKLOG} bytes"
         );
+    }
 
-        // The next frame is the dump, and never the oldest queued output.
+    /// Wait until the server calls the client slow. The result is the flag.
+    ///
+    /// The caller must read no frame while this runs. The wait is on the
+    /// condition and not on a time, because a debug build parses much more
+    /// slowly than a release build.
+    async fn wait_for_resync(frames: &Frames, grace: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + grace;
+        while !frames.resync.load(Ordering::Acquire) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        frames.resync.load(Ordering::Acquire)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_that_falls_behind_still_gets_the_exit_status() {
+        // A burst fills the queue, and the shell then exits. The exit frame is
+        // the last frame of a session, and the pump in `ws.rs` closes the
+        // socket on it. A client that fell behind must therefore still get it.
+        let (mut session, mut frames) = Session::spawn(Path::new("/bin/sh"), 80, 24).unwrap();
+
+        let first = frames.next().await.expect("the session ended");
+        assert!(is_dump(&first), "the first frame must be a dump");
+
+        // About 1 MB of output, which is twice the queue. Read no frame here.
+        let line = "x".repeat(255);
+        let burst = format!("i=0; while [ $i -lt 4000 ]; do echo {line}; i=$((i+1)); done\n");
+        tokio::time::timeout(Duration::from_secs(20), session.input(burst.as_bytes()))
+            .await
+            .expect("the write to the PTY timed out")
+            .expect("the write to the PTY failed");
+        assert!(
+            wait_for_resync(&frames, Duration::from_secs(60)).await,
+            "1 MB of output never filled a queue of {CLIENT_BACKLOG} bytes"
+        );
+
+        // Clear the flag by hand, and send the exit after it. A client that is
+        // behind sends no frame, so only the exit frame can raise the flag now.
+        frames.resync.store(false, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(20), session.input(b"exit 42\n"))
+            .await
+            .expect("the write to the PTY timed out")
+            .expect("the write to the PTY failed");
+        assert!(
+            wait_for_resync(&frames, Duration::from_secs(120)).await,
+            "the shell never exited into a full queue"
+        );
+
+        // The queue was full when the exit frame went out. Read now: the
+        // resync drops the backlog, and the empty queue holds the dump and the
+        // exit frame together.
+        let mut exit = None;
+        for _ in 0..16 {
+            let frame = tokio::time::timeout(Duration::from_secs(10), frames.next())
+                .await
+                .expect("no frame arrived after the exit")
+                .expect("the session ended");
+            if let Ok(ServerFrame::Exit(status)) = ServerFrame::decode(&frame) {
+                exit = Some(status);
+                break;
+            }
+        }
+        assert_eq!(
+            exit,
+            Some(42),
+            "a client that fell behind must still get the exit status"
+        );
+
+        session.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_that_is_behind_still_gets_the_dump_that_it_asked_for() {
+        // The browser asks for a dump when it repaints, and it can ask while it
+        // is behind. `request_dump` and the backpressure path both send
+        // `Command::Resync`, and that command clears the behind flag. Therefore
+        // the request must give a dump and must open the output again.
+        let (mut session, mut frames) = Session::spawn(Path::new("/bin/cat"), 80, 24).unwrap();
+
+        let first = frames.next().await.expect("the session ended");
+        assert!(is_dump(&first), "the first frame must be a dump");
+
+        flood_until_behind(&mut session, &frames).await;
+
+        // The client asks for a dump while the server holds it behind.
+        session.request_dump();
         let frame = tokio::time::timeout(Duration::from_secs(10), frames.next())
             .await
-            .expect("no frame arrived after the flood")
+            .expect("no frame arrived after the request")
             .expect("the session ended");
         assert!(
             is_dump(&frame),
-            "a client that fell behind must get a dump, and not its backlog"
+            "a client that asks for a dump while it is behind must get one"
         );
+
+        // Output must reach that client again. The line goes through the PTY,
+        // so this is the whole path and not the flag alone.
+        tokio::time::timeout(Duration::from_secs(10), session.input(b"after the dump\n"))
+            .await
+            .expect("the write to the PTY timed out")
+            .expect("the write to the PTY failed");
+        let mut flowed = false;
+        for _ in 0..64 {
+            let frame = tokio::time::timeout(Duration::from_secs(10), frames.next())
+                .await
+                .expect("no frame arrived after the dump")
+                .expect("the session ended");
+            if matches!(ServerFrame::decode(&frame), Ok(ServerFrame::Output(_))) {
+                flowed = true;
+                break;
+            }
+        }
+        assert!(flowed, "output must reach the client again after its dump");
 
         session.shutdown().await;
     }
@@ -652,6 +819,36 @@ mod tests {
 
         // 128 plus SIGHUP, which is signal 1.
         assert_eq!(session.exit_status(), Some(129));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_signals_no_group_after_the_child_is_reaped() {
+        // A reaped child leaves a free pid, and the kernel can give that pid to
+        // another process. The race itself is not reachable from a test, so
+        // this test points the session at a group that it does not own and
+        // proves that the guard sends no signal to it.
+        let (mut ended, _ended_frames) = Session::spawn(Path::new("/bin/echo"), 80, 24).unwrap();
+        assert!(
+            ended.wait_for_exit(Duration::from_secs(10)).await,
+            "/bin/echo must end on its own"
+        );
+
+        // A live process group that this session must not touch.
+        let (mut other, _other_frames) = Session::spawn(Path::new("/bin/cat"), 80, 24).unwrap();
+        ended.pgid = other.pgid;
+
+        ended.shutdown().await;
+
+        // SIGHUP ends `cat`, so a status here is the signal that this test
+        // forbids. The wait covers the delivery and the reap.
+        tokio::time::sleep(HANGUP_GRACE).await;
+        assert_eq!(
+            other.exit_status(),
+            None,
+            "shutdown signaled a process group that it no longer owns"
+        );
+
+        other.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

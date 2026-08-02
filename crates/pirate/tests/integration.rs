@@ -350,8 +350,9 @@ async fn start_guarded(name: &str, shell: PathBuf, secure_cookie: bool) -> Guard
         assets_dir: None,
         shell,
         auth: Auth::enabled(token, secure_cookie),
-        hosts: pirate::auth::HostAllow::new(Vec::new()),
+        hosts: pirate::auth::HostAllow::Any,
         tls: false,
+        terminals: pirate::Terminals::default(),
     });
     GuardedServer {
         addr: start_with(state).await,
@@ -599,7 +600,7 @@ async fn a_flood_of_dump_requests_collapses_into_a_few_dumps() {
     //
     // The test reads the interval of the server, so a change to the server
     // moves the ceiling of this test with it.
-    const INTERVAL: Duration = pirate::ws::DUMP_INTERVAL;
+    const INTERVAL: Duration = pirate::DUMP_INTERVAL;
     /// Dumps that a slow machine can add on top of the computed ceiling.
     const MARGIN: u128 = 1;
     /// The longest pause between two requests of the flood.
@@ -933,8 +934,9 @@ async fn no_password_leaves_the_websocket_open() {
         assets_dir: None,
         shell: PathBuf::from("/bin/cat"),
         auth: Auth::disabled(),
-        hosts: pirate::auth::HostAllow::new(Vec::new()),
+        hosts: pirate::auth::HostAllow::Any,
         tls: false,
+        terminals: pirate::Terminals::default(),
     });
     let addr = start_with(state).await;
 
@@ -1112,8 +1114,9 @@ async fn a_second_call_gives_the_same_token() {
         assets_dir: None,
         shell: PathBuf::from("/bin/cat"),
         auth: Auth::enabled(second, false),
-        hosts: pirate::auth::HostAllow::new(Vec::new()),
+        hosts: pirate::auth::HostAllow::Any,
         tls: false,
+        terminals: pirate::Terminals::default(),
     });
     let addr = start_with(state).await;
 
@@ -1216,16 +1219,16 @@ async fn the_ipv4_mapped_loopback_address_needs_no_transport_flag() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_origin_and_host_that_agree_on_an_unlisted_name_are_refused() {
-    // This is DNS rebinding, and it is the case that a plain same-origin test
-    // cannot see. The attacker owns `evil.example` and points it at the address
-    // of pirate. The browser then sends that name in BOTH headers, so the two
-    // AGREE with each other. Only the allowlist refuses it.
+async fn a_plaintext_server_answers_to_every_name_that_the_two_headers_agree_on() {
+    // A plain HTTP server holds no certificate, so it claims no name and it
+    // tests none. The name `evil.example` here is the DNS rebinding shape: the
+    // browser writes one name into BOTH headers, so the two AGREE. On this
+    // transport that request passes, and the certificate of a TLS server is
+    // what refuses it. `tests/tls.rs` holds that half.
     //
-    // The session cookie is VALID here. That is the point of this test: it
-    // proves that the host allowlist refused the upgrade, and not the session
-    // gate and not a mismatch between the two headers.
-    let server = start_guarded("rebinding", PathBuf::from("/bin/cat"), false).await;
+    // The session cookie is VALID here, so the upgrade tests the name and
+    // nothing else.
+    let server = start_guarded("any-name", PathBuf::from("/bin/cat"), false).await;
     let cookie = login(server.addr, &server.token).await;
 
     let mut request = ws_request(server.addr, Some("http://evil.example"), Some(&cookie));
@@ -1233,21 +1236,83 @@ async fn an_origin_and_host_that_agree_on_an_unlisted_name_are_refused() {
     headers.remove("Host");
     headers.insert("Host", "evil.example".parse().unwrap());
 
+    let mut socket = try_connect(request)
+        .await
+        .expect("a plaintext server must answer to every name");
+    let frame = next_binary(&mut socket).await;
+    assert_eq!(frame[0], 0x01, "the first frame must carry the dump tag");
+
+    // The two headers must still AGREE. A name in `Origin` that the `Host`
+    // does not repeat is a cross-origin request, and that test stays.
+    let mut request = ws_request(server.addr, Some("http://evil.example"), Some(&cookie));
+    let headers = request.headers_mut();
+    headers.remove("Host");
+    headers.insert("Host", "other.example".parse().unwrap());
+
     let error = try_connect(request)
         .await
-        .expect_err("an unlisted name must not upgrade");
+        .expect_err("two headers that disagree must not upgrade");
     assert_eq!(
         refusal_status(&error),
         403,
-        "an unlisted name must be refused even when Origin and Host agree"
+        "an Origin that the Host does not repeat must be refused"
+    );
+}
+
+/// The bound that the test below gives its server.
+///
+/// `ws::MAX_TERMINALS` is 64 and it is private. A test at that bound would fork
+/// 64 shells and open 64 PTYs, so `Terminals::new` takes the bound and this
+/// test sets a small one. The code path is the same one.
+const TERMINAL_BOUND: usize = 4;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_live_terminals_are_bounded_and_a_closed_one_gives_its_slot_back() {
+    // `auth::MAX_SESSIONS` bounds the session COOKIES and not the connections.
+    // One cookie therefore opened any number of terminals, and each one forks a
+    // shell. `--no-password` needed no cookie at all, which is the state here.
+    let state = Arc::new(AppState {
+        assets_dir: None,
+        shell: PathBuf::from("/bin/cat"),
+        auth: Auth::disabled(),
+        hosts: pirate::auth::HostAllow::Any,
+        tls: false,
+        terminals: pirate::Terminals::new(TERMINAL_BOUND),
+    });
+    let addr = start_with(Arc::clone(&state)).await;
+
+    // The server takes the slot before it upgrades, so the count is complete
+    // as soon as the handshake of the client is complete.
+    let mut sockets = Vec::new();
+    for _ in 0..TERMINAL_BOUND {
+        sockets.push(connect(addr).await);
+    }
+    let error = try_connect(ws_request(addr, Some(&own_origin(addr)), None))
+        .await
+        .expect_err("a request over the bound must not upgrade");
+    assert_eq!(refusal_status(&error), 503);
+    // The refusal answers before `on_upgrade`, so it forked no shell. The count
+    // is therefore the bound and not one more than the bound.
+    assert_eq!(
+        state.terminals.live(),
+        TERMINAL_BOUND,
+        "a refused request must start no terminal"
     );
 
-    // The same session still works under a name that pirate answers to, so the
-    // refusal above came from the name and from nothing else.
-    let ok = ws_request(server.addr, Some(&own_origin(server.addr)), Some(&cookie));
-    let mut socket = try_connect(ok)
-        .await
-        .expect("the same session must still upgrade under the real name");
-    let frame = next_binary(&mut socket).await;
-    assert_eq!(frame[0], 0x01, "the first frame must carry the dump tag");
+    // A dropped connection ends its shell, and the guard then gives the slot
+    // back. The shutdown of the session takes a moment, so this waits for it.
+    // The deadline is `WAIT`, so a slot that never comes back fails the test
+    // instead of hanging the suite.
+    sockets.pop();
+    let socket = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Ok(socket) = try_connect(ws_request(addr, Some(&own_origin(addr)), None)).await {
+                return socket;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the closed terminal never gave its slot back");
+    drop(socket);
 }

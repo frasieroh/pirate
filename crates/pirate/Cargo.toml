@@ -27,9 +27,10 @@ mime_guess = "=2.0.5"
 libghostty-vt = "=0.2.1"
 # The PTY. See the module comment in src/session.rs for the reason.
 pty-process = { version = "=0.5.3", features = ["async"] }
-# Process group signals on disconnect. pty-process already links rustix, so
-# this adds no crate to the graph.
-rustix = { version = "=1.1.4", features = ["process"] }
+# Process group signals on disconnect, and the system hostname that the
+# generated certificate carries. pty-process already links rustix, so this adds
+# no crate to the graph.
+rustix = { version = "=1.1.4", features = ["process", "system"] }
 # axum gives the WebSocket a Stream and a Sink. Splitting it needs these traits.
 futures-util = { version = "=0.3.33", default-features = false }
 # The TLS transport. The `ring` provider replaces the default `aws-lc-rs`,

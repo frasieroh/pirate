@@ -15,12 +15,10 @@
 use std::fmt;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{Read as _, Write as _};
-use std::net::IpAddr;
 use std::os::unix::fs::{
     DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
 };
 use std::path::{Path, PathBuf};
-use std::str::FromStr as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -32,6 +30,11 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse as _, Response};
 use sha2::{Digest as _, Sha256};
 use subtle::{Choice, ConstantTimeEq as _};
+use tokio_rustls::rustls::client::verify_server_name;
+use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+// rustls re-exports this type in both the client module and the server module.
+// It is the parsed form of a leaf certificate, and it belongs to neither side.
+use tokio_rustls::rustls::server::ParsedCertificate;
 
 use crate::AppState;
 
@@ -729,38 +732,49 @@ fn hex_id(raw: &[u8]) -> Option<[u8; SESSION_ID_LEN]> {
 /// A comparison of `Origin` with `Host` alone proves nothing about the server.
 /// A DNS name that the attacker owns can resolve to the address of pirate, and
 /// the browser then sends that name in both `Origin` and `Host`. The two agree,
-/// and the server is not the one that the operator started. This list is what
-/// makes them disagree.
+/// and the server is not the one that the operator started. The certificate is
+/// what makes them disagree.
 ///
-/// An IP literal needs no entry. A page that carries an IP literal as its
-/// origin already reached pirate at that address, so the name cannot move.
+/// The transport gives this value, and the operator declares no name of its
+/// own. Under TLS the certificate already states every name that the server
+/// answers to, and a browser refuses a name that the certificate does not
+/// cover. Plain HTTP carries no certificate, so it states nothing and tests
+/// nothing.
 #[derive(Debug, Clone)]
-pub struct HostAllow {
-    /// The names from `--hostname`, in lowercase.
-    extra: Vec<String>,
+pub enum HostAllow {
+    /// No certificate. Every name is accepted and no test runs.
+    Any,
+    /// TLS. The leaf certificate is the whole rule.
+    Certificate(Box<CertificateDer<'static>>),
 }
 
 impl HostAllow {
-    /// `extra` holds the names from `--hostname`.
+    /// The names come from the transport. A certificate states them, and
+    /// plain HTTP states none.
+    ///
+    /// CAUTION: This function is the whole rule, and it holds the one decision
+    /// that turns the name test on. Keep it here and not in `main.rs`. The two
+    /// arms read alike, and the unit test below is what proves that neither one
+    /// is the other.
     #[must_use]
-    pub fn new(extra: Vec<String>) -> Self {
-        Self {
-            extra: extra.iter().map(|name| name.to_ascii_lowercase()).collect(),
+    pub fn from_certificate(leaf: Option<&CertificateDer<'static>>) -> Self {
+        match leaf {
+            Some(leaf) => Self::Certificate(Box::new(leaf.clone())),
+            None => Self::Any,
         }
     }
 
     /// True when `host` is a name that this server answers to.
     ///
     /// `host` is the host part of an authority, with no port.
+    #[must_use]
     pub fn permits(&self, host: &[u8]) -> bool {
-        let permitted = match normalize_host(host) {
-            // An IP literal cannot be rebound, `localhost` resolves to a
-            // loopback address, and the operator names every other host.
-            Some(name) => {
-                IpAddr::from_str(&name).is_ok() || name == "localhost" || self.extra.contains(&name)
-            }
-            None => false,
+        let Self::Certificate(leaf) = self else {
+            // Plain HTTP. No certificate covers a name here, so there is
+            // nothing to compare a name with.
+            return true;
         };
+        let permitted = covers(leaf, host);
         if !permitted {
             hint_unknown_host();
         }
@@ -768,14 +782,39 @@ impl HostAllow {
     }
 }
 
+/// True when the names of `leaf` cover `host`.
+///
+/// rustls does the match that a browser does: the subject alternative names,
+/// the wildcard rule of RFC 6125, and the IP address form. A step that fails is
+/// a refusal, because a name that pirate cannot compare is a name that pirate
+/// cannot answer to.
+fn covers(leaf: &CertificateDer<'static>, host: &[u8]) -> bool {
+    let Some(host) = normalize_host(host) else {
+        return false;
+    };
+    // An IP literal gives `ServerName::IpAddress`, and every other name gives
+    // `ServerName::DnsName`.
+    let Ok(name) = ServerName::try_from(host.as_str()) else {
+        return false;
+    };
+    let Ok(parsed) = ParsedCertificate::try_from(leaf) else {
+        return false;
+    };
+    verify_server_name(&parsed, &name).is_ok()
+}
+
 /// The host part in lowercase, with no trailing dot and with no brackets.
 ///
 /// `localhost.` and `localhost` name the same host in DNS, so the dot goes
 /// before the comparison. An unknown name that ends in a dot must not pass as
 /// a name of its own.
+///
+/// EVERY trailing dot goes, and not one dot only. `rustls-pki-types` tolerates
+/// one trailing dot of its own, so a reader that stripped one dot let
+/// `pirate.example..` through as a second spelling of one name.
 fn normalize_host(host: &[u8]) -> Option<String> {
     let host = std::str::from_utf8(host).ok()?;
-    let host = host.strip_suffix('.').unwrap_or(host);
+    let host = host.trim_end_matches('.');
     let host = match (host.strip_prefix('['), host.strip_suffix(']')) {
         (Some(_), Some(_)) => host.get(1..host.len().checked_sub(1)?)?,
         _ => host,
@@ -786,7 +825,7 @@ fn normalize_host(host: &[u8]) -> Option<String> {
     Some(host.to_ascii_lowercase())
 }
 
-/// Tell the operator once that a name is missing from the list.
+/// Tell the operator once that the certificate covers no such name.
 fn hint_unknown_host() {
     /// One line for each request is a way to flood stderr, so this flag holds
     /// the hint to one line for the life of the process.
@@ -796,8 +835,9 @@ fn hint_unknown_host() {
         // CAUTION: Do not add the host of the request to this line. The
         // attacker writes that text, and it goes to the log of the operator.
         eprintln!(
-            "pirate: a request carried a Host header that pirate does not answer to. \
-             If you reach pirate by a name, add --hostname <NAME>."
+            "pirate: a request carried a Host header that this certificate does not cover. \
+             Reach pirate by a name in the certificate. \
+             For another name, use --cert with a certificate that covers that name."
         );
     }
 }
@@ -811,7 +851,8 @@ fn hint_unknown_host() {
 ///
 /// `hosts` closes the second half of that attack. Two headers that agree with
 /// each other still name a server that pirate is not, so the `Host` must also
-/// be a name that this server answers to.
+/// be a name that this server answers to. Under plain HTTP that test accepts
+/// every name, because a server with no certificate claims no name.
 pub fn origin_ok(headers: &HeaderMap, tls: bool, hosts: &HostAllow) -> bool {
     // Two `Host` headers are a request-smuggling shape: a front proxy reads one
     // header and pirate reads the other. The same holds for `Origin`. One
@@ -833,7 +874,7 @@ pub fn origin_ok(headers: &HeaderMap, tls: bool, hosts: &HostAllow) -> bool {
     let Some((host_host, host_port)) = split_authority(host) else {
         return false;
     };
-    // The list comes before the comparison. A rebound name passes the
+    // The name test comes before the comparison. A rebound name passes the
     // comparison, because the browser writes it into both headers.
     if !hosts.permits(host_host) {
         return false;
@@ -929,44 +970,137 @@ mod tests {
         map
     }
 
-    /// The list that a server on loopback with `--hostname pirate.example`
-    /// holds.
+    /// The names of the certificate that the tests below use.
+    ///
+    /// The wildcard is here on purpose: an operator whose certificate carries
+    /// one must reach pirate under it.
+    const CERTIFICATE_NAMES: [&str; 5] = [
+        "pirate.example",
+        "*.wild.example",
+        "127.0.0.1",
+        "::1",
+        "localhost",
+    ];
+
+    /// A server behind a certificate that covers [`CERTIFICATE_NAMES`].
     fn hosts() -> HostAllow {
-        HostAllow::new(vec!["Pirate.Example".to_string()])
+        HostAllow::from_certificate(Some(&leaf()))
+    }
+
+    /// A leaf certificate that covers [`CERTIFICATE_NAMES`].
+    fn leaf() -> CertificateDer<'static> {
+        let names = CERTIFICATE_NAMES.map(str::to_string).to_vec();
+        let signed = rcgen::generate_simple_self_signed(names).unwrap();
+        signed.cert.der().clone()
     }
 
     #[test]
-    fn the_list_takes_ip_literals_localhost_and_the_named_hosts() {
+    fn the_transport_decides_whether_the_name_test_runs() {
+        // CAUTION: This test is the only thing that holds the two arms of
+        // `from_certificate` apart. A worker who swaps them turns the name test
+        // off under TLS, and every other test in this repository still passes.
+        let leaf = leaf();
+        let under_tls = HostAllow::from_certificate(Some(&leaf));
+        let under_plain_http = HostAllow::from_certificate(None);
+
+        // One name, and two answers. The certificate is what refuses it.
+        assert!(
+            !under_tls.permits(b"evil.example"),
+            "a certificate must refuse a name that it does not cover"
+        );
+        assert!(
+            under_plain_http.permits(b"evil.example"),
+            "plain HTTP claims no name, so it refuses none"
+        );
+
+        assert!(matches!(under_tls, HostAllow::Certificate(_)));
+        assert!(matches!(under_plain_http, HostAllow::Any));
+    }
+
+    #[test]
+    fn the_certificate_takes_every_name_that_it_covers() {
         let hosts = hosts();
         for host in [
-            "127.0.0.1",
-            "[::1]",
-            "::1",
-            "192.168.1.10",
-            "localhost",
-            "LOCALHOST",
-            "localhost.",
             "pirate.example",
+            "127.0.0.1",
+            "::1",
+            "[::1]",
+            "localhost",
+            // The wildcard covers one label, which is the rule of RFC 6125.
+            "a.wild.example",
+            "b.wild.example",
+            // A name is not case sensitive, and a trailing dot names the same
+            // host. Two dots name it too: `rustls-pki-types` tolerates one dot
+            // of its own, so the reader must strip every one of them.
             "PIRATE.EXAMPLE",
             "pirate.example.",
+            "pirate.example..",
         ] {
             assert!(hosts.permits(host.as_bytes()), "{host}");
         }
     }
 
     #[test]
-    fn the_list_refuses_every_other_name() {
+    fn the_certificate_refuses_every_other_name() {
+        // Every name here reaches the certificate and the certificate refuses
+        // it. The test below holds the names that never reach it.
         let hosts = hosts();
         for host in [
             "evil.example",
             "localhost.evil.example",
             "pirate.example.evil.com",
+            // A wildcard covers ONE label. It covers neither the name without
+            // a label nor a name with two.
+            "wild.example",
+            "a.b.wild.example",
+            // An address that the certificate does not carry. An IP literal is
+            // a name like any other here.
+            "192.168.1.10",
+            // REGRESSION. The IP branch is a match of the whole name and not a
+            // match of a prefix.
             "127.0.0.1.evil.example",
-            "",
-            "[",
-            "[]",
         ] {
             assert!(!hosts.permits(host.as_bytes()), "{host}");
+        }
+    }
+
+    #[test]
+    fn a_host_header_that_is_not_a_name_never_reaches_the_certificate() {
+        // These values fail BEFORE the certificate, which is a different
+        // mechanism from a certificate that covers no such name.
+        let hosts = hosts();
+
+        // `normalize_host` drops these. Nothing is left to compare.
+        for host in ["", ".", "..", "[]"] {
+            assert_eq!(normalize_host(host.as_bytes()), None, "{host}");
+            assert!(!hosts.permits(host.as_bytes()), "{host}");
+        }
+
+        // `ServerName::try_from` drops these. A certificate can carry a
+        // wildcard, and a request can never name one.
+        for host in ["[", "a b", "*.wild.example"] {
+            let name = normalize_host(host.as_bytes()).expect("the reader keeps this text");
+            assert!(ServerName::try_from(name.as_str()).is_err(), "{host}");
+            assert!(!hosts.permits(host.as_bytes()), "{host}");
+        }
+    }
+
+    #[test]
+    fn a_server_with_no_certificate_takes_every_name() {
+        // Plain HTTP claims no name, so it refuses none. The empty host is in
+        // this list because `permits` answers before it reads the bytes.
+        for host in [
+            "pirate.example",
+            "a.wild.example",
+            "wild.example",
+            "a.b.wild.example",
+            "evil.example",
+            "192.168.1.10",
+            "localhost",
+            "",
+            "[",
+        ] {
+            assert!(HostAllow::Any.permits(host.as_bytes()), "{host}");
         }
     }
 
@@ -1004,23 +1138,29 @@ mod tests {
     #[test]
     fn a_name_that_this_server_does_not_answer_to_fails() {
         // The two headers agree, which is what a rebound DNS name gives. The
-        // list is what refuses this request.
+        // certificate is what refuses this request.
         let rebound = headers(&[
             ("origin", "http://evil.example:8080"),
             ("host", "evil.example:8080"),
         ]);
         assert!(!origin_ok(&rebound, false, &hosts()));
-        assert!(!origin_ok(&rebound, false, &HostAllow::new(Vec::new())));
+
+        // The same request under plain HTTP passes. That transport carries no
+        // certificate, so it makes no claim about a name.
+        assert!(origin_ok(&rebound, false, &HostAllow::Any));
     }
 
     #[test]
     fn a_second_host_or_origin_header_fails() {
+        // Two headers of one name are a request-smuggling shape, and that is
+        // not a question about a name. Both transports refuse it.
         let two_hosts = headers(&[
             ("origin", "http://localhost:8080"),
             ("host", "localhost:8080"),
             ("host", "evil.example"),
         ]);
         assert!(!origin_ok(&two_hosts, false, &hosts()));
+        assert!(!origin_ok(&two_hosts, false, &HostAllow::Any));
 
         let two_origins = headers(&[
             ("origin", "http://localhost:8080"),
@@ -1028,6 +1168,7 @@ mod tests {
             ("host", "localhost:8080"),
         ]);
         assert!(!origin_ok(&two_origins, false, &hosts()));
+        assert!(!origin_ok(&two_origins, false, &HostAllow::Any));
     }
 
     #[test]

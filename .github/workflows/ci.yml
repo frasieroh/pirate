@@ -505,6 +505,39 @@ jobs:
       - name: Run the tests
         run: cargo test --workspace
 
+      # ---------------------------------------------------------- e2e ------
+      # The end-to-end suite drives one real Chromium against one real pirate
+      # process over TLS. It lives in this job and not in the `web` job,
+      # because it needs the compiled binary, and only this job has Rust and
+      # Zig. It stays out of `bun run test`, because it needs a browser
+      # download and a binary. `bun run test:e2e` is its own command.
+      #
+      # `cargo xtask build` above already ran `bun install --frozen-lockfile`
+      # and `bun run build`, so web/node_modules and web/dist are present.
+
+      # Cache 6. The `web` job writes the same key, so the two jobs share one
+      # entry.
+      - name: Cache the Playwright browser
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-Linux-${{ hashFiles('web/bun.lock') }}
+          restore-keys: playwright-Linux-
+
+      - name: Install Chromium
+        working-directory: web
+        run: bunx playwright install --with-deps chromium
+
+      # The suite starts `target/debug/pirate`. The steps above build the four
+      # cross targets, which land under `target/<triple>/`. `cargo test` above
+      # already compiled every dependency for the host, so this step is short.
+      - name: Build the host binary
+        run: cargo build -p pirate
+
+      - name: Run the end-to-end suite
+        working-directory: web
+        run: bun run test:e2e
+
       - name: Save the target directory
         if: github.event_name == 'push' && steps.target-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

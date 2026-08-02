@@ -93,7 +93,7 @@ test.
 
 | Defect | Correction |
 |---|---|
-| DNS rebinding. An attacker-owned name resolves to the address of pirate, the browser puts that name in both `Origin` and `Host`, the two agree, and a same-origin test passes. | `--hostname` declares the names that this server answers to. An unlisted name is refused, even when the two headers agree and the session cookie is valid. |
+| DNS rebinding. An attacker-owned name resolves to the address of pirate, the browser puts that name in both `Origin` and `Host`, the two agree, and a same-origin test passes. | Wave 1 shipped a `--hostname` flag that declared the names that this server answers to. An undeclared name was refused, even when the two headers agreed and the session cookie was valid. The audit wave deleted that flag. The transport now gives the names, and the leaf certificate is the whole rule. |
 | The rate limiter spent its budget on correct tokens, so a flood locked the operator out of a shell. | The server compares the token first. A correct token is never refused. The limiter spends on wrong guesses only. |
 | A second `pirate_session` cookie shadowed the first one. | The lookup scans every candidate in constant time, with a bound of 8. |
 | A symlinked directory reached a token file that another user owns. | The server compares the owning user id on the directory and on the open file handle. |
@@ -263,18 +263,21 @@ change to that file, run `cargo xtask web` and confirm that both outputs exist.
 
 ## 5. Remaining
 
-### 5.0 One decision for the product manager
+### 5.0 The client-initiated dump frame — SETTLED AND SHIPPED
 
-The client manager asks for a CLIENT-INITIATED DUMP FRAME. The server already
-sends a `0x01` full-state dump when a socket opens. A frame that lets the
-client ask for that dump repaints the terminal in the new theme colors, with no
-page reload and no lost shell. It is the clean correction for the limit in
-section 4.2.
+The client manager asked for a CLIENT-INITIATED DUMP FRAME. The product manager
+authorized it on 2026-08-01, and it shipped in commit `67003ef`, "Repaint the
+terminal on a theme change, with no page reload".
 
-The cost is one client-to-server tag in `crates/pirate/src/protocol.rs` and
-`web/src/protocol.ts`, and a handler in `ws.rs`. The director did not authorize
-it, because it crosses into the server and the program was closing. Decide it
-before the audit wave starts, because the audit reads that protocol table.
+The server already sent a `0x01` full-state dump when a socket opens. The new
+`0x02` frame lets the client ask for that dump. A theme change therefore
+repaints the terminal in the new colors, with no page reload and no lost shell.
+It is the correction for the limit in section 4.2.
+
+The cost was one client-to-server tag in `crates/pirate/src/protocol.rs` and
+`web/src/protocol.ts`, and a handler in `ws.rs`. That handler coalesces the
+requests of one socket and holds `DUMP_INTERVAL`, which is 250 ms, between two
+dumps. The audit wave reads that protocol table as it stands.
 
 ### 5.1 The audit wave, requirement 4c
 
@@ -294,11 +297,12 @@ It carries three items forward.
 
 ### 5.2 The README, requirement 4e
 
-The README documents the application, its usage, and its license. Write it
-after the client wave lands, so that it documents what shipped. It must cover
-the three transport flags, the token file and its modes, `--no-password`,
-`--hostname` and the reason it exists, the default keybindings, and the theme
-import.
+The README documents the application, its usage, and its license. It shipped
+after the client wave, in commit `e682b2d`, "Document the application, its usage
+and its license". It covers the three transport flags, the token file and its
+modes, `--no-password`, the default keybindings, and the theme import. It also
+covers the names that the server answers to, and the reason that the certificate
+gives them.
 
 ### 5.3 Unverified on this host
 

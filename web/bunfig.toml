@@ -1,4 +1,5 @@
-# One browser and one stub server for the whole test run. A hook in a
-# preloaded file runs once, around every test file.
+# One browser and one stub server for the whole unit run. A hook in a
+# preloaded file runs once, around every test file. `e2e/preload.ts` skips that
+# setup when PIRATE_E2E is set, because the e2e suite starts a real server.
 [test]
-preload = ["./tests/setup.ts"]
+preload = ["./e2e/preload.ts"]
