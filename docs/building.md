@@ -22,8 +22,8 @@ the line is:
 eval "$(mise activate zsh)"
 ```
 
-Activation matters for more than convenience. It puts the pinned Rust, Zig and bun on your
-path. It also sets `RUSTUP_TOOLCHAIN` to the pinned Rust for every command in this
+Activation puts the pinned Rust, Zig and bun on your path. It also sets
+`RUSTUP_TOOLCHAIN` to the pinned Rust for every command in this
 repository. Without activation, a plain `cargo test` or `cargo clippy` uses the default
 toolchain of your machine instead of the pinned one. `cargo xtask` always uses the pinned
 tools, because it asks mise for them itself.
@@ -118,11 +118,23 @@ makes `xcrun` ignore `SDKROOT`, so a shim earlier on the path is the only contro
 CAUTION: On macOS, run `cargo xtask build` before a plain `cargo build`, `cargo clippy` or
 `cargo test`. Only `cargo xtask` puts the shim on the path. A plain cargo command that must
 compile libghostty-vt-sys again stops with about twenty `undefined symbol` errors, such as
-`_sigaction` and `_waitpid`. Prefix the path to run a plain cargo command yourself:
+`_sigaction` and `_waitpid`.
+
+To run a plain cargo command yourself, run both of these lines first, in this order:
 
 ```
-PATH="$PWD/.toolchain/shim:$PATH" cargo clippy --all-targets -- -D warnings
+eval "$(mise env --shell bash)"
+export PATH="$PWD/.toolchain/shim:$PATH"
 ```
+
+The base PATH puts the Homebrew Zig ahead of the pinned Zig of mise. `mise env` fixes that
+order. Without it, the Homebrew Zig fails the version check of Ghostty before the linker
+runs. Run the `export` line after the `eval` line. `mise env` writes a new PATH, and it
+removes the shim when you export the shim first.
+
+CAUTION: Do not add `.toolchain/shim` to the `[env]` table of `mise.toml`. mise then controls
+the order of its own PATH entries. A shim that lands after the Zig directory of mise gives a
+silent build against the wrong SDK.
 
 This step is for macOS only. Linux needs no shim, and CI runs `cargo clippy` and `cargo test`
 on `ubuntu-24.04`.

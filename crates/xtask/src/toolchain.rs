@@ -99,9 +99,9 @@ fn zig_version() -> Result<String> {
 /// architecture, and prefer the newest one that does.
 #[cfg(target_os = "macos")]
 pub fn find_usable_sdk() -> Result<PathBuf> {
-    // TBD files use Apple's architecture names, not Rust's. Note that
-    // `arm64e-macos` does not satisfy `arm64-macos`: Zig needs an exact match,
-    // and that difference is the whole fault this function works around.
+    // TBD files use Apple's architecture names, not Rust's. `arm64e-macos`
+    // does not satisfy `arm64-macos`: Zig needs an exact match, and that
+    // difference is the whole fault this function works around.
     let wanted = match std::env::consts::ARCH {
         "aarch64" => "arm64-macos",
         "x86_64" => "x86_64-macos",
@@ -118,8 +118,8 @@ pub fn find_usable_sdk() -> Result<PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            // Skip the MacOSX.sdk symlink; it tracks the newest SDK, which is
-            // the one that breaks.
+            // Skip the MacOSX.sdk symlink. It tracks the newest SDK, and that
+            // is the one that breaks.
             if path.file_name().is_some_and(|n| n == "MacOSX.sdk") {
                 continue;
             }

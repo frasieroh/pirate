@@ -436,8 +436,8 @@ impl Inner {
     /// Take the lock and recover from poison.
     ///
     /// Nothing under this lock can panic, so a poisoned lock means that
-    /// another thread died for a different reason. The sessions are still
-    /// correct, and a server that refuses every request after that is worse.
+    /// another thread died for a different reason. The sessions stay
+    /// correct after the recovery.
     fn lock(&self) -> MutexGuard<'_, Guarded> {
         self.guarded
             .lock()
@@ -564,7 +564,7 @@ pub async fn post(State(state): State<Arc<AppState>>, headers: HeaderMap, body: 
 
     let Ok(value) = HeaderValue::from_str(&cookie) else {
         // The cookie holds hexadecimal characters and ASCII punctuation only,
-        // so this arm never runs. A 500 is still better than a panic.
+        // so this arm never runs.
         return answer(StatusCode::INTERNAL_SERVER_ERROR);
     };
     let mut response = answer(StatusCode::NO_CONTENT);

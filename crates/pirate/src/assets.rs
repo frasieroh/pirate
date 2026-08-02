@@ -27,7 +27,6 @@ struct Payload {
 }
 
 pub async fn serve(path: &str, headers: &HeaderMap, assets_dir: Option<&PathBuf>) -> Response {
-    // Strip the leading slash and fall back to index.html for the root.
     let mut rel = path.trim_start_matches('/');
     if rel.is_empty() {
         rel = "index.html";
@@ -106,7 +105,8 @@ fn read(name: &str, assets_dir: Option<&PathBuf>) -> Option<Vec<u8>> {
 
 fn read_from_disk(dir: &Path, name: &str) -> Option<Vec<u8>> {
     let path = dir.join(name);
-    // Make sure the resolved path stays inside the assets directory.
+    // canonicalize follows symlinks. A symlink inside the assets directory can
+    // point outside it, and the `..` check in `serve` does not catch that.
     let root = dir.canonicalize().ok()?;
     let resolved = path.canonicalize().ok()?;
     if !resolved.starts_with(&root) {

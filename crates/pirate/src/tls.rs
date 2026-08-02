@@ -307,7 +307,7 @@ pub fn build(source: &TlsSource, bound: SocketAddr) -> Result<Tls, Box<dyn std::
 ///
 /// This build speaks HTTP/1.1 and nothing else: axum 0.8 does not carry
 /// `http2` in its default set, `Cargo.toml` adds only the `ws` feature, and
-/// `Cargo.lock` holds no `h2` crate. The line still earns its place. A
+/// `Cargo.lock` holds no `h2` crate. This pin still matters. A
 /// WebSocket over HTTP/2 needs the extended CONNECT method of RFC 8441, and
 /// pirate has never proven that path, so this pin is what stops a later
 /// change to the features from handing the socket to an HTTP/2 handler.
@@ -361,7 +361,7 @@ impl NameAwareResolver {
     /// through [`verify_server_name`]. It honors a wildcard name in the
     /// supplied certificate exactly as rustls does, and it never returns an
     /// error: a name it cannot parse, or a certificate it cannot parse,
-    /// simply does not match, and the caller falls back.
+    /// does not match, and the caller falls back.
     fn supplied_covers(&self, sni: &str) -> bool {
         let Ok(name) = ServerName::try_from(sni) else {
             return false;

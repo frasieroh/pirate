@@ -234,8 +234,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if tls.is_none() {
             eprintln!(
                 "pirate: CAUTION: Use --selfsigned or --cert on this bind address. \
-                 Plain HTTP names no server, so pirate answers to every name in the Host header. \
-                 A DNS name that an attacker owns then reaches this port."
+                 pirate answers to every name in the Host header, so a DNS name that an \
+                 attacker owns reaches this port. A certificate makes the browser warn on \
+                 that name."
             );
         }
     }

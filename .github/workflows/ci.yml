@@ -1,30 +1,39 @@
 name: ci
 
-# CI builds all six targets, runs the checks, and runs a Linux binary.
+# CI holds four jobs, one per kind of check. Each job runs on its own, and no
+# job needs another one to finish first:
+#   lint    formatting, clippy, pin verification, and the web typecheck
+#   e2e     the browser suite (stub server) and the end-to-end suite (real binary)
+#   macos   the two Apple targets, plus the unit tests on the host target
+#   linux   the four Linux targets, plus the unit tests on the host target
+#
 # The release workflow owns the release artifacts. No workflow builds the
 # container image. A person builds that image from the Dockerfile.
 #
-# Two build jobs, because the macOS SDK license does not permit redistribution:
+# Two build jobs for the six targets, because the macOS SDK license does not
+# permit redistribution:
 #   macos   aarch64-apple-darwin, x86_64-apple-darwin            plain cargo build
 #   linux   the two gnu.2.28 targets and the two musl targets    cargo zigbuild
 # `cargo xtask build --target T` makes that choice. Do not repeat it here.
 #
 # mise.toml declares every tool version, and jdx/mise-action installs them.
 # That action caches its own installs, so this file caches build output only:
-#   1 ZIG_GLOBAL_CACHE_DIR              key: Ghostty commit, mise.toml, Cargo.lock
-#   2 the Ghostty source checkout       key: Ghostty commit
-#   3 the Cargo registry                key: Cargo.lock
-#   4 the Cargo target directory        key: Cargo.lock and mise.toml
-#   5 web/node_modules                  key: web/bun.lock
-#   6 the Playwright browser            key: web/bun.lock
+#   1 ZIG_GLOBAL_CACHE_DIR              key: OS, mise.toml, Ghostty commit, Cargo.lock
+#   2 the Ghostty source checkout       key: Ghostty commit (one entry for every job)
+#   3 the Cargo registry                key: OS, Cargo.lock
+#   4 the Cargo target directory        key: OS, Cargo.lock, mise.toml
+#   5 web/node_modules                  key: OS, web/bun.lock
+#   6 the Playwright browser            key: OS, web/bun.lock
 #
 # NOTE: A repository gets 10 GB of cache. Cache 1 holds the Zig global cache:
 # the packages that the Ghostty build fetches, and the artifacts that Zig shares
 # between builds. The build script of libghostty-vt-sys passes
 # `--cache-dir <OUT_DIR>/zig-cache`, so the compile output of each target lands
 # under `target/` and belongs to cache 4. Cache 4 is therefore the large one.
-# Each key is stable, and each job writes one entry. Cache 4 saves on `main`
-# only, so a branch that changes Cargo.lock cannot fill the budget with copies.
+# Caches 1, 2, 3, 5, and 6 hold one Linux key each, so the lint, e2e, and linux
+# jobs share one entry per cache and only one of them needs to write it. Cache
+# 4 saves on `main` only, and the macos and linux jobs are its only writers, so
+# a branch that changes Cargo.lock cannot fill the budget with copies.
 #
 # CAUTION: Do not add the `sha256:` input to jdx/mise-action. That checksum
 # holds for one platform, and this workflow runs on ubuntu and on macOS.
@@ -50,31 +59,23 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  # ---------------------------------------------------------------- lint ------
-  # These two checks need no Zig, no Node, and no web assets, so they report a
-  # failure in about one minute. `cargo xtask verify-pins` is also the guard on
-  # mise.lock: Renovate can raise a version in mise.toml, and it cannot write
-  # the checksums that mise.lock holds.
+  # ------------------------------------------------------------------ lint ----
+  # Format, lint, and typecheck. Clippy compiles libghostty-vt-sys, so this job
+  # needs Zig and the Ghostty source, the same as the build jobs.
   lint:
-    name: Format and pins
+    name: Format, lint, and typecheck
     runs-on: ubuntu-24.04
     steps:
       - name: Get the source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # mise.toml declares every tool, and mise.lock holds a SHA-256 for each
-      # download. The action adds `--locked` when it finds that lock file, so
-      # this job installs the bytes that mise.lock names.
       - name: Install the pinned tools
         uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
         with:
           version: 2026.8.0
-          # This job runs cargo only. Zig and bun cost minutes and stay out.
-          # `cargo fetch` and `cargo xtask verify-pins` need no other tool.
-          install_args: rust
 
-      # Cache 3. The key matches the one in the linux job, so both jobs share
-      # one entry.
+      # Cache 3. The key matches the one in the linux job, so the two jobs
+      # share one entry.
       - name: Cache the Cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -97,25 +98,58 @@ jobs:
       - name: Verify the pins
         run: cargo xtask verify-pins
 
-  # ----------------------------------------------------------------- web ------
-  # The browser tests need no Rust and no Zig, so they run beside the builds.
-  # These tests assert on terminal state and never on glyph pixels, because font
-  # rasterization changes with the machine and the GPU.
-  web:
-    name: Web client and browser tests
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Get the source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Read the CAUTION on this step in the linux job.
+      - name: Read the pinned Ghostty commit
+        run: |
+          set -euo pipefail
+          cache="${CARGO_HOME:-$HOME/.cargo}/registry/cache"
+          crate=$(find "$cache" -name 'libghostty-vt-sys-*.crate' | sort | head -1)
+          name=$(basename "$crate" .crate)
+          commit=$(tar -xzOf "$crate" "$name/build.rs" \
+            | sed -n 's/.*GHOSTTY_COMMIT: &str = "\([0-9a-f]\{40\}\)".*/\1/p' | head -1)
+          if [ ${#commit} -ne 40 ]; then
+            echo "FAILURE: no GHOSTTY_COMMIT in $name/build.rs"
+            exit 1
+          fi
+          echo "GHOSTTY_COMMIT=$commit" >> "$GITHUB_ENV"
+          echo "ghostty $commit, from $name"
 
-      - name: Install the pinned tools
-        uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+      # Cache 1. This cache holds the Zig global cache, and not the compile
+      # output of a target. Read the note at the top of this file.
+      - name: Cache the Zig global cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          version: 2026.8.0
-          # This job runs bun only. Rust and Zig cost minutes and stay out.
-          install_args: bun
+          path: .toolchain/zig-cache
+          key: zig-global-Linux-${{ hashFiles('mise.toml') }}-${{ env.GHOSTTY_COMMIT }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: zig-global-Linux-${{ hashFiles('mise.toml') }}-${{ env.GHOSTTY_COMMIT }}-
 
-      # Cache 5. The key matches the one in the build jobs.
+      # Cache 2. The commit is the only input to this checkout, so every job
+      # shares one entry.
+      - name: Cache the Ghostty source
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .toolchain/ghostty-src
+          key: ghostty-src-${{ env.GHOSTTY_COMMIT }}
+
+      - name: Get the Ghostty source
+        run: |
+          set -euo pipefail
+          dir="$GITHUB_WORKSPACE/.toolchain/ghostty-src"
+          if [ ! -f "$dir/build.zig" ]; then
+            rm -rf "$dir"
+            mkdir -p "$(dirname "$dir")"
+            git clone --filter=blob:none --no-checkout \
+              https://github.com/ghostty-org/ghostty.git "$dir"
+            git -C "$dir" checkout "$GHOSTTY_COMMIT"
+          fi
+          test -f "$dir/build.zig"
+          test "$(git -C "$dir" rev-parse HEAD)" = "$GHOSTTY_COMMIT"
+          echo "GHOSTTY_SOURCE_DIR=$dir" >> "$GITHUB_ENV"
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Cache 5. The key matches the one in the e2e and linux jobs.
       - name: Cache node_modules
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -127,8 +161,97 @@ jobs:
         working-directory: web
         run: bun install --frozen-lockfile
 
-      # Cache 6. Key the browser cache on the playwright version. A different
-      # version needs a different browser build.
+      - name: Check the types
+        working-directory: web
+        run: bun run typecheck
+
+  # ------------------------------------------------------------------- e2e ----
+  # The browser suite drives Chromium against a stub server, and the
+  # end-to-end suite drives Chromium against one real pirate process. Both need
+  # Chromium, and the end-to-end suite also needs the compiled binary, so the
+  # two live in one job with Rust, Zig, and Chromium.
+  e2e:
+    name: Browser and end-to-end tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Get the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the pinned tools
+        uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+        with:
+          version: 2026.8.0
+
+      # Cache 3.
+      - name: Cache the Cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-Linux-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-Linux-
+
+      - name: Download the crate sources
+        run: cargo fetch --locked
+
+      # Read the CAUTION on this step in the linux job.
+      - name: Read the pinned Ghostty commit
+        run: |
+          set -euo pipefail
+          cache="${CARGO_HOME:-$HOME/.cargo}/registry/cache"
+          crate=$(find "$cache" -name 'libghostty-vt-sys-*.crate' | sort | head -1)
+          name=$(basename "$crate" .crate)
+          commit=$(tar -xzOf "$crate" "$name/build.rs" \
+            | sed -n 's/.*GHOSTTY_COMMIT: &str = "\([0-9a-f]\{40\}\)".*/\1/p' | head -1)
+          if [ ${#commit} -ne 40 ]; then
+            echo "FAILURE: no GHOSTTY_COMMIT in $name/build.rs"
+            exit 1
+          fi
+          echo "GHOSTTY_COMMIT=$commit" >> "$GITHUB_ENV"
+          echo "ghostty $commit, from $name"
+
+      # Cache 1.
+      - name: Cache the Zig global cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .toolchain/zig-cache
+          key: zig-global-Linux-${{ hashFiles('mise.toml') }}-${{ env.GHOSTTY_COMMIT }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: zig-global-Linux-${{ hashFiles('mise.toml') }}-${{ env.GHOSTTY_COMMIT }}-
+
+      # Cache 2.
+      - name: Cache the Ghostty source
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .toolchain/ghostty-src
+          key: ghostty-src-${{ env.GHOSTTY_COMMIT }}
+
+      - name: Get the Ghostty source
+        run: |
+          set -euo pipefail
+          dir="$GITHUB_WORKSPACE/.toolchain/ghostty-src"
+          if [ ! -f "$dir/build.zig" ]; then
+            rm -rf "$dir"
+            mkdir -p "$(dirname "$dir")"
+            git clone --filter=blob:none --no-checkout \
+              https://github.com/ghostty-org/ghostty.git "$dir"
+            git -C "$dir" checkout "$GHOSTTY_COMMIT"
+          fi
+          test -f "$dir/build.zig"
+          test "$(git -C "$dir" rev-parse HEAD)" = "$GHOSTTY_COMMIT"
+          echo "GHOSTTY_SOURCE_DIR=$dir" >> "$GITHUB_ENV"
+
+      # Cache 5.
+      - name: Cache node_modules
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: web/node_modules
+          key: node-modules-Linux-${{ hashFiles('web/bun.lock') }}
+          restore-keys: node-modules-Linux-
+
+      # Cache 6. This job is the only writer, because it is the only job that
+      # installs a browser.
       - name: Cache the Playwright browser
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -141,15 +264,21 @@ jobs:
         working-directory: web
         run: bunx playwright install --with-deps chromium
 
-      - name: Check the types
-        working-directory: web
-        run: bun run typecheck
+      # `cargo xtask build` builds the web assets, then the host binary. The web
+      # build writes web/dist, which the end-to-end suite serves, and
+      # `web/e2e/server.ts` starts `target/debug/pirate`.
+      - name: Build the web assets and the host binary
+        run: cargo xtask build
 
       - name: Run the browser tests
         working-directory: web
         run: bun run test
 
-  # --------------------------------------------------------------- macos ------
+      - name: Run the end-to-end suite
+        working-directory: web
+        run: bun run test:e2e
+
+  # ----------------------------------------------------------------- macos ----
   macos:
     name: Build the Apple targets
     # CAUTION: Do not use `macos-latest`. Zig 0.15.2 cannot link against the
@@ -296,6 +425,11 @@ jobs:
             fi
           done
 
+      # cargo test builds and runs on the host target only, the same as the
+      # unit tests in the linux job.
+      - name: Run the tests
+        run: cargo test --workspace
+
       - name: Save the target directory
         if: github.event_name == 'push' && steps.target-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -303,7 +437,7 @@ jobs:
           path: target
           key: target-macOS-${{ hashFiles('Cargo.lock', 'mise.toml') }}
 
-  # --------------------------------------------------------------- linux ------
+  # ----------------------------------------------------------------- linux ----
   linux:
     name: Build the Linux targets
     # Pinned, for the same reason as the macOS job: an image bump must be a
@@ -315,15 +449,15 @@ jobs:
 
       # This step installs every tool in mise.toml, which includes cargo-zigbuild
       # for the four Linux targets. It puts each tool on PATH and exports the
-      # `[env]` block of that file. clippy and the tests run without xtask, and
-      # they need both: the build script of libghostty-vt-sys runs `zig` by a
-      # bare PATH lookup, and it writes to ZIG_GLOBAL_CACHE_DIR.
+      # `[env]` block of that file. The tests run without xtask, and they need
+      # both: the build script of libghostty-vt-sys runs `zig` by a bare PATH
+      # lookup, and it writes to ZIG_GLOBAL_CACHE_DIR.
       - name: Install the pinned tools
         uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
         with:
           version: 2026.8.0
 
-      # Cache 3. The key matches the one in the lint job.
+      # Cache 3. The key matches the one in the lint and e2e jobs.
       - name: Cache the Cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -337,7 +471,12 @@ jobs:
       - name: Download the crate sources
         run: cargo fetch --locked
 
-      # Read the CAUTION in the macOS job.
+      # CAUTION: Read this commit from the crate, and never from
+      # toolchain/ghostty.toml. A later step checks out this commit and exports
+      # the checkout as GHOSTTY_SOURCE_DIR. The build script of libghostty-vt-sys
+      # then builds that tree, and it asserts on build.zig alone. It never
+      # compares the tree against its own GHOSTTY_COMMIT constant. A drifted file
+      # therefore makes CI build a parser that the release build never builds.
       - name: Read the pinned Ghostty commit
         run: |
           set -euo pipefail
@@ -499,44 +638,10 @@ jobs:
           fi
           echo "the musl binary served the index page"
 
-      - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
+      # cargo test builds and runs on the host target only, the same as the
+      # unit tests in the macos job.
       - name: Run the tests
         run: cargo test --workspace
-
-      # ---------------------------------------------------------- e2e ------
-      # The end-to-end suite drives one real Chromium against one real pirate
-      # process over TLS. It lives in this job and not in the `web` job,
-      # because it needs the compiled binary, and only this job has Rust and
-      # Zig. It stays out of `bun run test`, because it needs a browser
-      # download and a binary. `bun run test:e2e` is its own command.
-      #
-      # `cargo xtask build` above already ran `bun install --frozen-lockfile`
-      # and `bun run build`, so web/node_modules and web/dist are present.
-
-      # Cache 6. The `web` job writes the same key, so the two jobs share one
-      # entry.
-      - name: Cache the Playwright browser
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-Linux-${{ hashFiles('web/bun.lock') }}
-          restore-keys: playwright-Linux-
-
-      - name: Install Chromium
-        working-directory: web
-        run: bunx playwright install --with-deps chromium
-
-      # The suite starts `target/debug/pirate`. The steps above build the four
-      # cross targets, which land under `target/<triple>/`. `cargo test` above
-      # already compiled every dependency for the host, so this step is short.
-      - name: Build the host binary
-        run: cargo build -p pirate
-
-      - name: Run the end-to-end suite
-        working-directory: web
-        run: bun run test:e2e
 
       - name: Save the target directory
         if: github.event_name == 'push' && steps.target-cache.outputs.cache-hit != 'true'

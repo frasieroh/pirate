@@ -12,9 +12,8 @@
  * client sends no bytes for it. This is the only defense against a
  * double-sent keystroke: the client never adds a second path to `onData`.
  *
- * This module holds no key repeat. The repeat layer goes into the same
- * listener, at the seam that `onKeyDown` marks. A second listener would give
- * a second path for one key press, which is the fault above.
+ * This module holds no key repeat. That layer lives in `installKeyRepeat`,
+ * in `src/input.ts`, on its own listener.
  */
 
 import type { BindingId } from "./prefs";
@@ -235,10 +234,8 @@ function onKeyDown(event: KeyboardEvent): void {
     return;
   }
 
-  /* SEAM(repeat): the key repeat layer goes here, in this same listener.
-     It stops every event that carries `repeat === true`, then a timer
-     dispatches a synthetic keydown on the terminal container. A second
-     listener would give a second path for one key press. Add no listener. */
+  /* SEAM(repeat): the key repeat layer lives in `installKeyRepeat`, in
+     `src/input.ts`, on its own listener. */
 
   const id = bindingFor(chordOfEvent(event));
   if (id === null) {
