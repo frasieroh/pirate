@@ -2,7 +2,7 @@ name: ci
 
 # CI holds four jobs, one per kind of check. Each job runs on its own, and no
 # job needs another one to finish first:
-#   lint    formatting, clippy, pin verification, and the web typecheck
+#   lint    formatting, clippy, pin verification, cargo-deny, and the web typecheck
 #   e2e     the browser suite (stub server) and the end-to-end suite (real binary)
 #   macos   the two Apple targets, plus the unit tests on the host target
 #   linux   the four Linux targets, plus the unit tests on the host target
@@ -97,6 +97,9 @@ jobs:
 
       - name: Verify the pins
         run: cargo xtask verify-pins
+
+      - name: Check the licenses, advisories, bans, and sources
+        run: cargo deny check
 
       # Read the CAUTION on this step in the linux job.
       - name: Read the pinned Ghostty commit

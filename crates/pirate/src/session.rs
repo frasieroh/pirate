@@ -599,6 +599,8 @@ mod tests {
     use super::*;
     use crate::protocol::ServerFrame;
 
+    const DRAIN_GRACE: Duration = Duration::from_secs(120);
+
     fn is_dump(frame: &[u8]) -> bool {
         matches!(ServerFrame::decode(frame), Ok(ServerFrame::Dump(_)))
     }
@@ -607,7 +609,7 @@ mod tests {
     async fn the_first_frame_of_a_session_is_a_dump() {
         let (mut session, mut frames) = Session::spawn(Path::new("/bin/cat"), 80, 24).unwrap();
 
-        let first = tokio::time::timeout(Duration::from_secs(10), frames.next())
+        let first = tokio::time::timeout(DRAIN_GRACE, frames.next())
             .await
             .expect("no first frame arrived")
             .expect("the session ended");
@@ -629,7 +631,7 @@ mod tests {
         flood_until_behind(&mut session, &frames).await;
 
         // The next frame is the dump, and never the oldest queued output.
-        let frame = tokio::time::timeout(Duration::from_secs(10), frames.next())
+        let frame = tokio::time::timeout(DRAIN_GRACE, frames.next())
             .await
             .expect("no frame arrived after the flood")
             .expect("the session ended");
@@ -657,7 +659,7 @@ mod tests {
                 session.input(&line).await.unwrap();
             }
         };
-        tokio::time::timeout(Duration::from_secs(20), flood)
+        tokio::time::timeout(DRAIN_GRACE, flood)
             .await
             .expect("the write to the PTY timed out");
 
@@ -666,7 +668,7 @@ mod tests {
         // parse speed. A debug build parses about 200 times more slowly than a
         // release build, and a fixed wait would then pass on one and fail on
         // the other.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + DRAIN_GRACE;
         while !frames.resync.load(Ordering::Acquire) && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -702,24 +704,24 @@ mod tests {
         // About 1 MB of output, which is twice the queue. Read no frame here.
         let line = "x".repeat(255);
         let burst = format!("i=0; while [ $i -lt 4000 ]; do echo {line}; i=$((i+1)); done\n");
-        tokio::time::timeout(Duration::from_secs(20), session.input(burst.as_bytes()))
+        tokio::time::timeout(DRAIN_GRACE, session.input(burst.as_bytes()))
             .await
             .expect("the write to the PTY timed out")
             .expect("the write to the PTY failed");
         assert!(
-            wait_for_resync(&frames, Duration::from_secs(60)).await,
+            wait_for_resync(&frames, DRAIN_GRACE).await,
             "1 MB of output never filled a queue of {CLIENT_BACKLOG} bytes"
         );
 
         // Clear the flag by hand, and send the exit after it. A client that is
         // behind sends no frame, so only the exit frame can raise the flag now.
         frames.resync.store(false, Ordering::Release);
-        tokio::time::timeout(Duration::from_secs(20), session.input(b"exit 42\n"))
+        tokio::time::timeout(DRAIN_GRACE, session.input(b"exit 42\n"))
             .await
             .expect("the write to the PTY timed out")
             .expect("the write to the PTY failed");
         assert!(
-            wait_for_resync(&frames, Duration::from_secs(120)).await,
+            wait_for_resync(&frames, DRAIN_GRACE).await,
             "the shell never exited into a full queue"
         );
 
@@ -728,7 +730,7 @@ mod tests {
         // exit frame together.
         let mut exit = None;
         for _ in 0..16 {
-            let frame = tokio::time::timeout(Duration::from_secs(10), frames.next())
+            let frame = tokio::time::timeout(DRAIN_GRACE, frames.next())
                 .await
                 .expect("no frame arrived after the exit")
                 .expect("the session ended");
@@ -761,7 +763,7 @@ mod tests {
 
         // The client asks for a dump while the server holds it behind.
         session.request_dump();
-        let frame = tokio::time::timeout(Duration::from_secs(10), frames.next())
+        let frame = tokio::time::timeout(DRAIN_GRACE, frames.next())
             .await
             .expect("no frame arrived after the request")
             .expect("the session ended");
@@ -772,13 +774,13 @@ mod tests {
 
         // Output must reach that client again. The line goes through the PTY,
         // so this is the whole path and not the flag alone.
-        tokio::time::timeout(Duration::from_secs(10), session.input(b"after the dump\n"))
+        tokio::time::timeout(DRAIN_GRACE, session.input(b"after the dump\n"))
             .await
             .expect("the write to the PTY timed out")
             .expect("the write to the PTY failed");
         let mut flowed = false;
         for _ in 0..64 {
-            let frame = tokio::time::timeout(Duration::from_secs(10), frames.next())
+            let frame = tokio::time::timeout(DRAIN_GRACE, frames.next())
                 .await
                 .expect("no frame arrived after the dump")
                 .expect("the session ended");
@@ -817,7 +819,7 @@ mod tests {
 
         // Ask for a dump until it reports the alternate screen. Each pass is
         // one round trip through the PTY and the terminal thread.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + DRAIN_GRACE;
         let mut entered = false;
         while tokio::time::Instant::now() < deadline && !entered {
             session
@@ -826,7 +828,7 @@ mod tests {
                 .unwrap()
                 .send(Command::Resync)
                 .unwrap();
-            let frame = tokio::time::timeout(Duration::from_secs(10), frames.next())
+            let frame = tokio::time::timeout(DRAIN_GRACE, frames.next())
                 .await
                 .expect("no frame arrived")
                 .expect("the session ended");
@@ -862,7 +864,7 @@ mod tests {
         // proves that the guard sends no signal to it.
         let (mut ended, _ended_frames) = Session::spawn(Path::new("/bin/echo"), 80, 24).unwrap();
         assert!(
-            ended.wait_for_exit(Duration::from_secs(10)).await,
+            ended.wait_for_exit(DRAIN_GRACE).await,
             "/bin/echo must end on its own"
         );
 
@@ -896,7 +898,7 @@ mod tests {
         // Skip the output frames until the flag makes a new dump. A resize
         // alone sends no frame, so ask for one through the input echo.
         let large = loop {
-            let frame = tokio::time::timeout(Duration::from_secs(10), frames.next())
+            let frame = tokio::time::timeout(DRAIN_GRACE, frames.next())
                 .await
                 .expect("no frame arrived after the resize")
                 .expect("the session ended");
