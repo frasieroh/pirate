@@ -1,0 +1,530 @@
+name: ci
+
+# CI builds all six targets, runs the checks, and runs a Linux binary.
+# The release workflow owns the release artifacts and the Docker image.
+#
+# Two build jobs, because the macOS SDK license does not permit redistribution:
+#   macos   aarch64-apple-darwin, x86_64-apple-darwin            plain cargo build
+#   linux   the two gnu.2.28 targets and the two musl targets    cargo zigbuild
+# `cargo xtask build --target T` makes that choice. Do not repeat it here.
+#
+# Six caches, as the build speed section of the spec states:
+#   1 the pinned Zig toolchain          key: Zig version
+#   2 ZIG_GLOBAL_CACHE_DIR              key: Ghostty commit and Zig version
+#   3 the Ghostty source checkout       key: Ghostty commit and Zig version
+#   4 the Cargo registry                key: Cargo.lock
+#   5 the Cargo target directory        key: Cargo.lock
+#   6 web/node_modules                  key: web/bun.lock
+#
+# NOTE: A repository gets 10 GB of cache. Cache 2 holds 868 MB for six targets,
+# and cache 5 is the other large one. The estimated total is 4 to 5 GB, because
+# each key is stable and each job writes one entry. Cache 5 saves on `main` only,
+# so a branch that changes Cargo.lock cannot fill the budget with copies.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The Zig compile of libghostty-vt is the slowest step, and Debug is much
+  # faster than ReleaseFast. ReleaseFast belongs to the release workflow only.
+  LIBGHOSTTY_VT_SYS_OPTIMIZE: Debug
+  CARGO_TERM_COLOR: always
+  # CI never reuses incremental data. This keeps the target directory cache small.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # ---------------------------------------------------------------- lint ------
+  # These two checks need no Zig, no Node, and no web assets, so they report a
+  # failure in about one minute.
+  lint:
+    name: Format and pins
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Get the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # Cache 4. The key matches the one in the linux job, so both jobs share
+      # one entry.
+      - name: Cache the Cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-Linux-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-Linux-
+
+      - name: Check the formatting
+        run: cargo fmt --all --check
+
+      - name: Verify the pins
+        run: cargo xtask verify-pins
+
+  # ----------------------------------------------------------------- web ------
+  # The browser tests need no Rust and no Zig, so they run beside the builds.
+  # These tests assert on terminal state and never on glyph pixels, because font
+  # rasterization changes with the machine and the GPU.
+  web:
+    name: Web client and browser tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Get the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      # Cache 6. The key matches the one in the build jobs.
+      - name: Cache node_modules
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: web/node_modules
+          key: node-modules-Linux-${{ hashFiles('web/bun.lock') }}
+          restore-keys: node-modules-Linux-
+
+      - name: Install the dependencies
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      # Key the browser cache on the playwright version. A different version
+      # needs a different browser build.
+      - name: Cache the Playwright browser
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-Linux-${{ hashFiles('web/bun.lock') }}
+          restore-keys: playwright-Linux-
+
+      # Install Chromium only. The tests launch `chromium` and no other browser.
+      - name: Install Chromium
+        working-directory: web
+        run: bunx playwright install --with-deps chromium
+
+      - name: Check the types
+        working-directory: web
+        run: bun run typecheck
+
+      - name: Run the browser tests
+        working-directory: web
+        run: bun run test
+
+  # --------------------------------------------------------------- macos ------
+  macos:
+    name: Build the Apple targets
+    # CAUTION: Do not use `macos-latest`. Zig 0.15.2 cannot link against the
+    # macOS 26 SDK, because its libSystem.B.tbd lists `arm64e-macos` and does not
+    # list `arm64-macos`. A runner image bump to a macOS 26 SDK therefore breaks
+    # the build with no change in this repository. This pin holds the image, and
+    # the Xcode step below holds the SDK inside it.
+    runs-on: macos-15
+    steps:
+      - name: Get the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The image carries Xcode 16.4 (SDK 15.5) and Xcode 26.x (SDK 26.x). Zig
+      # 0.15.2 needs the 15.x SDK. The SDK scan in xtask skips an unusable SDK,
+      # and this step makes the choice explicit and makes a removal loud.
+      - name: Select Xcode 16.4
+        run: |
+          set -euo pipefail
+          sudo xcode-select --switch /Applications/Xcode_16.4.app
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+
+      - name: Install the Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # Cache 4.
+      - name: Cache the Cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-macOS-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-macOS-
+
+      - name: Download the crate sources
+        run: cargo fetch --locked
+
+      # The Ghostty commit is a constant inside the build script of
+      # libghostty-vt-sys. Read it from the downloaded crate. A hardcoded copy
+      # here can drift, and a drift makes CI build the wrong Ghostty.
+      - name: Read the pinned versions
+        run: |
+          set -euo pipefail
+          zig_version=$(tr -d '[:space:]' < .zigversion)
+          case "$(uname -s)-$(uname -m)" in
+            Darwin-arm64)  zig_triple=aarch64-macos ;;
+            Darwin-x86_64) zig_triple=x86_64-macos ;;
+            Linux-x86_64)  zig_triple=x86_64-linux ;;
+            Linux-aarch64) zig_triple=aarch64-linux ;;
+            *) echo "unsupported host $(uname -s)-$(uname -m)"; exit 1 ;;
+          esac
+          crate=$(ls "${CARGO_HOME:-$HOME/.cargo}"/registry/cache/*/libghostty-vt-sys-*.crate | head -1)
+          name=$(basename "$crate" .crate)
+          commit=$(tar -xzOf "$crate" "$name/build.rs" \
+            | sed -n 's/.*GHOSTTY_COMMIT: &str = "\([0-9a-f]\{40\}\)".*/\1/p' | head -1)
+          if [ ${#commit} -ne 40 ]; then
+            echo "FAILURE: no GHOSTTY_COMMIT in $name/build.rs"
+            exit 1
+          fi
+          echo "ZIG_VERSION=$zig_version" >> "$GITHUB_ENV"
+          echo "ZIG_DIR=.toolchain/zig-$zig_triple-$zig_version" >> "$GITHUB_ENV"
+          echo "GHOSTTY_COMMIT=$commit" >> "$GITHUB_ENV"
+          echo "zig $zig_version for $zig_triple, ghostty $commit, from $name"
+
+      # Cache 1. xtask downloads the tarball, checks the SHA-256, and unpacks it
+      # into this directory.
+      - name: Cache the Zig toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.ZIG_DIR }}
+          key: zig-toolchain-macOS-${{ env.ZIG_VERSION }}
+
+      # Cache 2. This is the large one: 868 MB for six targets.
+      - name: Cache the Zig global cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .toolchain/zig-cache
+          key: zig-global-macOS-${{ env.ZIG_VERSION }}-${{ env.GHOSTTY_COMMIT }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: zig-global-macOS-${{ env.ZIG_VERSION }}-${{ env.GHOSTTY_COMMIT }}-
+
+      # Cache 3.
+      - name: Cache the Ghostty source
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .toolchain/ghostty-src
+          key: ghostty-src-${{ env.GHOSTTY_COMMIT }}-${{ env.ZIG_VERSION }}
+
+      # The build script of libghostty-vt-sys clones with `--filter=blob:none
+      # --no-checkout`, then runs `git checkout <commit>`. The result is a work
+      # tree that holds build.zig, and build.zig is the only thing the script
+      # asserts on. These two commands make the same shape.
+      - name: Get the Ghostty source
+        run: |
+          set -euo pipefail
+          dir="$GITHUB_WORKSPACE/.toolchain/ghostty-src"
+          if [ ! -f "$dir/build.zig" ]; then
+            rm -rf "$dir"
+            mkdir -p "$(dirname "$dir")"
+            git clone --filter=blob:none --no-checkout \
+              https://github.com/ghostty-org/ghostty.git "$dir"
+            git -C "$dir" checkout "$GHOSTTY_COMMIT"
+          fi
+          test -f "$dir/build.zig"
+          test "$(git -C "$dir" rev-parse HEAD)" = "$GHOSTTY_COMMIT"
+          echo "GHOSTTY_SOURCE_DIR=$dir" >> "$GITHUB_ENV"
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      # Cache 6.
+      - name: Cache node_modules
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: web/node_modules
+          key: node-modules-macOS-${{ hashFiles('web/bun.lock') }}
+
+      # Cache 5. Restore on every run. Save on `main` only, so that one branch
+      # cannot fill the 10 GB budget with copies of a multi-gigabyte directory.
+      - name: Restore the target directory
+        id: target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: target-macOS-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: target-macOS-
+
+      - name: Acquire Zig and write the SDK shim
+        run: |
+          set -euo pipefail
+          cargo xtask setup
+          echo "$GITHUB_WORKSPACE/$ZIG_DIR" >> "$GITHUB_PATH"
+
+      - name: Build the Apple targets
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo xtask build --target "$target"
+          done
+
+      # The spec asks for this check: the macOS binary links against the system
+      # libraries and nothing else.
+      - name: Check the macOS link
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            binary="target/$target/debug/pirate"
+            file "$binary"
+            report=$(otool -L "$binary")
+            echo "$report"
+            outside=$(printf '%s\n' "$report" | tail -n +2 \
+              | grep -vE '^[[:space:]]+(/usr/lib/|/System/Library/)' || true)
+            if [ -n "$outside" ]; then
+              echo "FAILURE: $target links against a library outside /usr/lib and /System/Library."
+              printf '%s\n' "$outside"
+              exit 1
+            fi
+          done
+
+      - name: Save the target directory
+        if: github.event_name == 'push' && steps.target-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: target-macOS-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+  # --------------------------------------------------------------- linux ------
+  linux:
+    name: Build the Linux targets
+    # Pinned, for the same reason as the macOS job: an image bump must be a
+    # change in this file and not a surprise.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Get the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@1beb33eee6d086258184383af9a538940be190ed # v2.85.6
+        with:
+          tool: cargo-zigbuild@0.23.0
+
+      # Cache 4. The key matches the one in the lint job.
+      - name: Cache the Cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-Linux-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-Linux-
+
+      - name: Download the crate sources
+        run: cargo fetch --locked
+
+      - name: Read the pinned versions
+        run: |
+          set -euo pipefail
+          zig_version=$(tr -d '[:space:]' < .zigversion)
+          case "$(uname -s)-$(uname -m)" in
+            Darwin-arm64)  zig_triple=aarch64-macos ;;
+            Darwin-x86_64) zig_triple=x86_64-macos ;;
+            Linux-x86_64)  zig_triple=x86_64-linux ;;
+            Linux-aarch64) zig_triple=aarch64-linux ;;
+            *) echo "unsupported host $(uname -s)-$(uname -m)"; exit 1 ;;
+          esac
+          crate=$(ls "${CARGO_HOME:-$HOME/.cargo}"/registry/cache/*/libghostty-vt-sys-*.crate | head -1)
+          name=$(basename "$crate" .crate)
+          commit=$(tar -xzOf "$crate" "$name/build.rs" \
+            | sed -n 's/.*GHOSTTY_COMMIT: &str = "\([0-9a-f]\{40\}\)".*/\1/p' | head -1)
+          if [ ${#commit} -ne 40 ]; then
+            echo "FAILURE: no GHOSTTY_COMMIT in $name/build.rs"
+            exit 1
+          fi
+          echo "ZIG_VERSION=$zig_version" >> "$GITHUB_ENV"
+          echo "ZIG_DIR=.toolchain/zig-$zig_triple-$zig_version" >> "$GITHUB_ENV"
+          echo "GHOSTTY_COMMIT=$commit" >> "$GITHUB_ENV"
+          echo "zig $zig_version for $zig_triple, ghostty $commit, from $name"
+
+      # Cache 1.
+      - name: Cache the Zig toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.ZIG_DIR }}
+          key: zig-toolchain-Linux-${{ env.ZIG_VERSION }}
+
+      # Cache 2. This is the large one: 868 MB for six targets.
+      - name: Cache the Zig global cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .toolchain/zig-cache
+          key: zig-global-Linux-${{ env.ZIG_VERSION }}-${{ env.GHOSTTY_COMMIT }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: zig-global-Linux-${{ env.ZIG_VERSION }}-${{ env.GHOSTTY_COMMIT }}-
+
+      # Cache 3.
+      - name: Cache the Ghostty source
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .toolchain/ghostty-src
+          key: ghostty-src-${{ env.GHOSTTY_COMMIT }}-${{ env.ZIG_VERSION }}
+
+      - name: Get the Ghostty source
+        run: |
+          set -euo pipefail
+          dir="$GITHUB_WORKSPACE/.toolchain/ghostty-src"
+          if [ ! -f "$dir/build.zig" ]; then
+            rm -rf "$dir"
+            mkdir -p "$(dirname "$dir")"
+            git clone --filter=blob:none --no-checkout \
+              https://github.com/ghostty-org/ghostty.git "$dir"
+            git -C "$dir" checkout "$GHOSTTY_COMMIT"
+          fi
+          test -f "$dir/build.zig"
+          test "$(git -C "$dir" rev-parse HEAD)" = "$GHOSTTY_COMMIT"
+          echo "GHOSTTY_SOURCE_DIR=$dir" >> "$GITHUB_ENV"
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      # Cache 6.
+      - name: Cache node_modules
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: web/node_modules
+          key: node-modules-Linux-${{ hashFiles('web/bun.lock') }}
+
+      # Cache 5. Read the note in the macOS job.
+      - name: Restore the target directory
+        id: target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: target-Linux-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: target-Linux-
+
+      # xtask sets these two for the cargo child process. clippy and cargo test
+      # run without xtask, so they need the same values in the job environment.
+      # The build script of libghostty-vt-sys runs `zig` by a bare PATH lookup.
+      - name: Acquire Zig
+        run: |
+          set -euo pipefail
+          cargo xtask setup
+          echo "$GITHUB_WORKSPACE/$ZIG_DIR" >> "$GITHUB_PATH"
+          echo "ZIG_GLOBAL_CACHE_DIR=$GITHUB_WORKSPACE/.toolchain/zig-cache" >> "$GITHUB_ENV"
+
+      - name: Build the Linux targets
+        run: |
+          set -euo pipefail
+          for target in \
+            x86_64-unknown-linux-gnu.2.28 \
+            aarch64-unknown-linux-gnu.2.28 \
+            x86_64-unknown-linux-musl \
+            aarch64-unknown-linux-musl
+          do
+            cargo xtask build --target "$target"
+          done
+
+      # The glibc floor comes out of the `zig cc` link step. No manifest declares
+      # it. This check is the only thing that holds it.
+      #
+      # readelf --dyn-syms prints the symbol name and the version on one line, so
+      # the failure message can name the offending symbol. `readelf -V` prints
+      # the versions without the names, and `nm -D` needs a second pass for them.
+      - name: Check the glibc floor
+        run: |
+          set -euo pipefail
+          floor=2.28
+          status=0
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            binary="target/$target/debug/pirate"
+            symbols=$(readelf --wide --dyn-syms "$binary")
+            # Keep `name@GLIBC_x.y` tokens only. The digit class drops
+            # GLIBC_PRIVATE, which carries no version to compare.
+            refs=$(printf '%s\n' "$symbols" \
+              | grep -oE '[^[:space:]]+@@?GLIBC_[0-9]+(\.[0-9]+)+' | sort -u || true)
+            if [ -z "$refs" ]; then
+              echo "$target: no versioned glibc symbol. Nothing to check."
+              continue
+            fi
+            # sort -V orders version numbers. The last line is the highest.
+            highest=$(printf '%s\n' "$refs" | sed 's/.*GLIBC_//' | sort -u -V | tail -1)
+            echo "$target: the highest glibc symbol version is $highest"
+            # The floor holds when the floor sorts last against the highest.
+            if [ "$(printf '%s\n%s\n' "$highest" "$floor" | sort -V | tail -1)" != "$floor" ]; then
+              pattern=$(printf '%s' "$highest" | sed 's/\./\\./g')
+              echo "FAILURE: $target needs glibc $highest. The floor is $floor."
+              printf '%s\n' "$refs" | grep -E "GLIBC_${pattern}\$" \
+                | sed 's/^/  offending symbol: /'
+              status=1
+            fi
+          done
+          exit $status
+
+      # readelf reads the headers of any architecture. `ldd` reads the host
+      # architecture only, and glibc 2.35 changed its word for a static binary
+      # from "statically linked" to "not a dynamic executable".
+      - name: Check the musl link
+        run: |
+          set -euo pipefail
+          status=0
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            binary="target/$target/debug/pirate"
+            file "$binary"
+            # A static binary names no dynamic loader and no shared library.
+            refs=$(readelf --wide --program-headers --dynamic "$binary" \
+              | grep -E 'INTERP|NEEDED' || true)
+            if [ -n "$refs" ]; then
+              echo "FAILURE: $target is not statically linked."
+              printf '%s\n' "$refs" | sed 's/^/  /'
+              status=1
+            fi
+          done
+          exit $status
+
+      # No Linux binary has ever run in this project. Architecture and static
+      # linkage are proven. Run-time behavior is not.
+      - name: Run the musl binary and request the index page
+        run: |
+          set -euo pipefail
+          binary="target/x86_64-unknown-linux-musl/debug/pirate"
+          "$binary" --bind 127.0.0.1 --port 8099 &
+          pid=$!
+          served=0
+          for _ in $(seq 1 50); do
+            if curl -fsS -o /dev/null "http://127.0.0.1:8099/"; then
+              served=1
+              break
+            fi
+            sleep 0.2
+          done
+          if [ "$served" -ne 1 ]; then
+            echo "FAILURE: pirate did not serve the index page within 10 seconds."
+            kill "$pid" || true
+            exit 1
+          fi
+          body=$(curl -fsS "http://127.0.0.1:8099/")
+          kill "$pid"
+          if ! printf '%s' "$body" | grep -q 'id="terminal"'; then
+            echo "FAILURE: the index page has no terminal element."
+            printf '%s\n' "$body" | head -20
+            exit 1
+          fi
+          echo "the musl binary served the index page"
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run the tests
+        run: cargo test --workspace
+
+      - name: Save the target directory
+        if: github.event_name == 'push' && steps.target-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: target-Linux-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}

@@ -1,0 +1,258 @@
+# Release workflow.
+#
+# A git tag of `v<x.y.z>` starts this workflow. The output is one tarball for
+# each of the six targets, one SHA256SUMS file, and a GitHub release.
+#
+# This file is written by hand. It does not use cargo-dist. cargo-dist owns the
+# workflow file that it generates, so hand-written commit SHA pins do not
+# survive the next `dist generate`. cargo-dist also calls `cargo build`, and
+# `build.rs` stops when `web/dist` is absent. `cargo xtask dist` builds the web
+# assets first, so this workflow calls that command.
+#
+# Every `uses:` line carries the full 40-character commit SHA. The tag in the
+# trailing comment is documentation only. To upgrade an action, resolve the new
+# SHA with `gh api repos/<owner>/<repo>/git/refs/tags/<tag>`.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # ReleaseFast is for release builds only. Local work and tests use the
+  # default, because the Zig compile is the slowest step of the build.
+  LIBGHOSTTY_VT_SYS_OPTIMIZE: ReleaseFast
+  # The Zig cache reached 868 MB for six targets during the spike.
+  ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.toolchain/zig-cache
+  BUN_VERSION: "1.3.14"
+  CARGO_ZIGBUILD_VERSION: "0.23.0"
+  CARGO_DENY_VERSION: "0.20.2"
+
+jobs:
+  guard:
+    name: Tag and version agree
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The workspace Cargo.toml holds the only version number. If the tag and
+      # that number differ, stop before any build starts.
+      - name: Compare the tag with the workspace version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')"
+          echo "tag=$tag workspace=$version"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::The tag is $tag and Cargo.toml says $version. Run \`cargo xtask version $tag\`."
+            exit 1
+          fi
+
+      - name: Make sure that every pin is exact
+        run: cargo xtask verify-pins
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/bin/cargo-deny
+          key: guard-${{ env.CARGO_DENY_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: guard-${{ env.CARGO_DENY_VERSION }}-
+
+      - name: Install cargo-deny
+        run: |
+          set -euo pipefail
+          if [ ! -x "$HOME/.cargo/bin/cargo-deny" ]; then
+            cargo install --locked "cargo-deny@${CARGO_DENY_VERSION}"
+          fi
+
+      # The license allowlist and the RustSec advisory database. deny.toml holds
+      # the allowlist and the one exception.
+      - name: Check the licenses and the advisories
+        run: cargo deny check
+
+  macos:
+    name: Build the Apple targets
+    needs: guard
+    # CAUTION: Keep this runner at macos-15. Zig 0.15.2 cannot link against the
+    # macOS 26 SDK, and a newer image can drop the macOS 15 SDK.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup show
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .toolchain
+          key: dist-macos-15-${{ hashFiles('Cargo.lock', '.zigversion', 'toolchain/zig.toml') }}
+          restore-keys: dist-macos-15-
+
+      - name: Build the tarballs
+        run: |
+          cargo xtask dist \
+            --target aarch64-apple-darwin \
+            --target x86_64-apple-darwin
+
+      # macOS cannot produce a fully static binary. Apple needs a dynamic link
+      # to libSystem. "static" here means system libraries and nothing else.
+      - name: Make sure that the binary needs system libraries only
+        run: |
+          set -euo pipefail
+          for triple in aarch64-apple-darwin x86_64-apple-darwin; do
+            bin="target/$triple/release/pirate"
+            otool -L "$bin"
+            otool -L "$bin" | tail -n +2 | awk '{ print $1 }' | while read -r lib; do
+              case "$lib" in
+                /usr/lib/*|/System/Library/*) ;;
+                *) echo "::error::$bin links against $lib"; exit 1 ;;
+              esac
+            done
+          done
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-macos
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  linux:
+    name: Build the Linux targets
+    needs: guard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup show
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-zigbuild
+            .toolchain
+          key: dist-ubuntu-24.04-${{ env.CARGO_ZIGBUILD_VERSION }}-${{ hashFiles('Cargo.lock', '.zigversion', 'toolchain/zig.toml') }}
+          restore-keys: dist-ubuntu-24.04-${{ env.CARGO_ZIGBUILD_VERSION }}-
+
+      # cargo-zigbuild is the linker driver for the four Linux targets. xtask
+      # supplies the pinned Zig on PATH.
+      - name: Install cargo-zigbuild
+        run: |
+          set -euo pipefail
+          if [ ! -x "$HOME/.cargo/bin/cargo-zigbuild" ]; then
+            cargo install --locked "cargo-zigbuild@${CARGO_ZIGBUILD_VERSION}"
+          fi
+          cargo zigbuild --version
+
+      - name: Build the tarballs
+        run: |
+          cargo xtask dist \
+            --target x86_64-unknown-linux-gnu.2.28 \
+            --target aarch64-unknown-linux-gnu.2.28 \
+            --target x86_64-unknown-linux-musl \
+            --target aarch64-unknown-linux-musl
+
+      # The glibc floor comes from the `zig cc` link step, not from the Zig
+      # build of the archive. Two tools produce it, so measure the result.
+      - name: Make sure that the glibc floor is 2.28
+        run: |
+          set -euo pipefail
+          for triple in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            bin="target/$triple/release/pirate"
+            symbols="$(readelf --dyn-syms --wide "$bin" || true)"
+            highest="$(printf '%s\n' "$symbols" \
+              | grep -o 'GLIBC_[0-9][0-9.]*' \
+              | sed 's/^GLIBC_//; s/\.$//' \
+              | sort -V | tail -1 || true)"
+            echo "$triple needs glibc ${highest:-none}"
+            if [ -n "$highest" ] && \
+               [ "$(printf '%s\n2.28\n' "$highest" | sort -V | tail -1)" != "2.28" ]; then
+              echo "::error::$bin needs glibc $highest. The floor is 2.28."
+              exit 1
+            fi
+          done
+
+      # No Linux binary ran during the spike. This step is the smoke test.
+      - name: Run the musl binary
+        run: |
+          set -euo pipefail
+          bin="target/x86_64-unknown-linux-musl/release/pirate"
+          file "$bin"
+          file "$bin" | grep -q static
+          "$bin" --version
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-linux
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish the GitHub release
+    needs: [macos, linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: parts
+          pattern: dist-*
+
+      # Each build job writes its own SHA256SUMS. Join them into one file, then
+      # read every line back against the tarballs.
+      - name: Collect the tarballs and the checksums
+        run: |
+          set -euo pipefail
+          mkdir release
+          cp parts/*/*.tar.gz release/
+          cat parts/*/SHA256SUMS | sort -k2 > release/SHA256SUMS
+          cd release
+          sha256sum -c SHA256SUMS
+          ls -l
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --title "pirate ${GITHUB_REF_NAME#v}" \
+            --verify-tag \
+            --generate-notes \
+            release/*.tar.gz \
+            release/SHA256SUMS

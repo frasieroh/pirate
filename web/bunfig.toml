@@ -1,0 +1,4 @@
+# One browser and one stub server for the whole test run. A hook in a
+# preloaded file runs once, around every test file.
+[test]
+preload = ["./tests/setup.ts"]

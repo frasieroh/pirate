@@ -1,0 +1,80 @@
+# cargo-deny configuration.
+#
+# Two checks matter here. The license check keeps the allowlist below true for
+# every crate in the graph. The advisories check reads the RustSec database.
+#
+# Run all four checks:
+#   cargo deny check
+#
+# pirate is MIT. Ghostty is MIT. libghostty-vt-sys is MIT. ghostty-web is MIT.
+# The binary contains ghostty-web code, so the repository also ships
+# THIRD-PARTY-LICENSES.md. cargo-about writes that file.
+
+[graph]
+# Check every target that the release builds. A dependency can be
+# platform-specific, so one target list hides the licenses of the others.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
+all-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# A yanked crate is a supply-chain signal. Do not ship one.
+yanked = "deny"
+# Add an entry only with the advisory ID and the reason in a comment.
+ignore = []
+
+[licenses]
+# Permissive licenses only. A strong copyleft license in this list would put the
+# whole static binary under that license.
+#
+# Every license here is present in the graph today. cargo-deny warns about an
+# entry that it does not find, so add a license when a dependency needs it.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+# One exception, for one named crate, with the reason.
+#
+# option-ext is MPL-2.0. That license is file-level copyleft: it applies to the
+# files of option-ext and not to the program that links them. pirate does not
+# change those files.
+#
+# option-ext also stays out of the binary. The path is
+# rust-embed-impl -> shellexpand -> dirs -> dirs-sys -> option-ext, and
+# rust-embed-impl is a proc-macro crate that runs at compile time only.
+[[licenses.exceptions]]
+name = "option-ext"
+allow = ["MPL-2.0"]
+
+[licenses.private]
+# The workspace crates carry the license of the repository. Do not read them
+# as third-party code.
+ignore = true
+
+[bans]
+# Two versions of one crate make the binary larger and the audit harder.
+multiple-versions = "warn"
+# A wildcard version defeats the pin discipline. `cargo xtask verify-pins`
+# makes the same check on the manifests of this repository.
+wildcards = "deny"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

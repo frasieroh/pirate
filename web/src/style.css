@@ -1,0 +1,58 @@
+:root {
+  color-scheme: dark;
+  --bg: #16161e;
+  --fg: #a9b1d6;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  /* The canvas can exceed the box by a fraction of a cell. Without this rule
+     the document gets a scrollbar, the scrollbar takes space from the
+     terminal, the fit runs again, and the client sends a second resize frame
+     for one window size. */
+  overflow: hidden;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+#terminal {
+  flex: 1;
+  min-height: 0;
+  padding: 8px;
+  overflow: hidden;
+}
+
+#status {
+  padding: 4px 8px;
+  font-size: 12px;
+  /* A fixed whole-pixel height. An empty status is then as tall as a full
+     one, and the height of the terminal never moves by a fraction of a
+     pixel. Without this rule the first status message changes the row count,
+     and the client sends a second resize frame for one window size. */
+  height: 26px;
+  line-height: 18px;
+  opacity: 0.7;
+  border-top: 1px solid rgba(169, 177, 214, 0.15);
+}
+
+#status[data-state="warn"] {
+  color: #e0af68;
+  opacity: 1;
+}
+
+#status[data-state="error"] {
+  color: #f7768e;
+  opacity: 1;
+}

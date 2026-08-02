@@ -1,0 +1,70 @@
+[package]
+name = "pirate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Terminal emulator proxy: a local PTY, rendered in the browser by libghostty-vt."
+
+[dependencies]
+axum = { version = "=0.8.9", features = ["ws"] }
+tokio = { version = "=1.53.1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+    "sync",
+    "time",
+    "io-util",
+    "process",
+] }
+clap = { version = "=4.6.5", features = ["derive", "env"] }
+rust-embed = { version = "=8.12.0", features = ["interpolate-folder-path"] }
+mime_guess = "=2.0.5"
+# The terminal parser. This is the same Ghostty code that the browser runs, so
+# the server screen and the client screen agree.
+libghostty-vt = "=0.2.1"
+# The PTY. See the module comment in src/session.rs for the reason.
+pty-process = { version = "=0.5.3", features = ["async"] }
+# Process group signals on disconnect. pty-process already links rustix, so
+# this adds no crate to the graph.
+rustix = { version = "=1.1.4", features = ["process"] }
+# axum gives the WebSocket a Stream and a Sink. Splitting it needs these traits.
+futures-util = { version = "=0.3.33", default-features = false }
+# The TLS transport. The `ring` provider replaces the default `aws-lc-rs`,
+# because this repository cross-compiles with zig, and `aws-lc-rs` needs cmake
+# and nasm. `tls12` keeps the older clients, and `logging` keeps rustls quiet
+# behind the `log` facade that nothing here installs.
+tokio-rustls = { version = "=0.26.4", default-features = false, features = [
+    "logging",
+    "tls12",
+    "ring",
+] }
+# The certificate for --selfsigned. `pem` stays off, because the key never
+# leaves memory and pirate therefore needs the DER form only.
+rcgen = { version = "=0.14.8", default-features = false, features = ["ring"] }
+# The certificate fingerprint that --selfsigned prints.
+sha2 = "=0.10.9"
+# The token bytes for src/auth.rs.
+getrandom = "=0.3.4"
+# The constant-time compare of the token in src/auth.rs. A compare that stops
+# at the first wrong byte tells an attacker how much of a guess was correct.
+subtle = "=2.6.1"
+
+[dev-dependencies]
+# A WebSocket client for the integration tests. axum 0.8.9 builds its server
+# side on the same tungstenite version, so the graph holds one copy.
+tokio-tungstenite = "=0.29.0"
+# The TLS client of the integration tests. Same pins as the server side, so the
+# graph holds one copy.
+tokio-rustls = { version = "=0.26.4", default-features = false, features = [
+    "logging",
+    "tls12",
+    "ring",
+] }
+# The test certificate. The tests write it to a file, so this build adds `pem`.
+rcgen = { version = "=0.14.8", default-features = false, features = [
+    "ring",
+    "pem",
+] }

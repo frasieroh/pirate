@@ -1,0 +1,253 @@
+//! Pin discipline.
+//!
+//! Every input is pinned in exactly one place, and every dependency is exact.
+//! Cargo treats a bare `"1.2.3"` as `^1.2.3`, so this module requires the
+//! explicit `=` prefix. npm treats a bare `"1.2.3"` as exact, so this module
+//! rejects any prefix character there.
+
+use crate::{repo_root, toolchain, Result};
+use std::path::{Path, PathBuf};
+
+pub fn verify() -> Result<()> {
+    let mut errors: Vec<String> = Vec::new();
+
+    // toolchain/zig.toml against .zigversion. read_pin compares them.
+    match toolchain::read_pin() {
+        Ok(pin) => eprintln!("xtask: zig pinned at {}", pin.version),
+        Err(e) => errors.push(e.to_string()),
+    }
+
+    // toolchain/ghostty.toml against the crate source, when that source is here.
+    match check_ghostty_pin() {
+        Ok(commit) => eprintln!("xtask: ghostty pinned at {commit}"),
+        Err(e) => errors.push(e.to_string()),
+    }
+
+    let root = repo_root();
+    let mut manifests = vec![root.join("Cargo.toml")];
+    for entry in std::fs::read_dir(root.join("crates"))? {
+        let path = entry?.path().join("Cargo.toml");
+        if path.is_file() {
+            manifests.push(path);
+        }
+    }
+    for manifest in &manifests {
+        check_cargo_manifest(manifest, &mut errors)?;
+    }
+
+    let package_json = root.join("web/package.json");
+    if package_json.is_file() {
+        check_package_json(&package_json, &mut errors)?;
+    }
+
+    if errors.is_empty() {
+        eprintln!("xtask: all pins are exact");
+        return Ok(());
+    }
+    let count = errors.len();
+    for e in errors {
+        eprintln!("  {e}");
+    }
+    Err(format!("{count} pin error(s)").into())
+}
+
+/// The Ghostty commit that libghostty-vt-sys builds.
+///
+/// That crate declares `links = "ghostty-vt"`, but its build script emits
+/// `cargo:include` only. Cargo therefore gives a dependent no way to read the
+/// commit, and the value stays a private constant in that build script. pirate
+/// records it in toolchain/ghostty.toml. When the crate source is in the cargo
+/// registry cache, compare the two values and fail on a difference.
+fn check_ghostty_pin() -> Result<String> {
+    let path = repo_root().join("toolchain/ghostty.toml");
+    let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&path)?)?;
+
+    let commit = doc
+        .get("commit")
+        .and_then(|v| v.as_str())
+        .ok_or("toolchain/ghostty.toml has no `commit`")?;
+    if commit.len() != 40 || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(
+            format!("`{commit}` in toolchain/ghostty.toml is not a full git commit").into(),
+        );
+    }
+    let version = doc
+        .get("libghostty_vt_sys")
+        .and_then(|v| v.as_str())
+        .ok_or("toolchain/ghostty.toml has no `libghostty_vt_sys`")?;
+
+    match crate_commit(version)? {
+        Some(found) if found != commit => Err(format!(
+            "toolchain/ghostty.toml says {commit}, and libghostty-vt-sys {version} \
+             builds {found}. Correct toolchain/ghostty.toml."
+        )
+        .into()),
+        Some(_) => Ok(commit.to_string()),
+        None => {
+            eprintln!(
+                "xtask: note: libghostty-vt-sys {version} is not in the cargo registry \
+                 cache, so the Ghostty commit stays unchecked"
+            );
+            Ok(commit.to_string())
+        }
+    }
+}
+
+/// Read GHOSTTY_COMMIT from the build script of libghostty-vt-sys in the cargo
+/// registry cache. The result is None when that source is absent.
+fn crate_commit(version: &str) -> Result<Option<String>> {
+    let home = match std::env::var("CARGO_HOME") {
+        Ok(h) => PathBuf::from(h),
+        Err(_) => PathBuf::from(std::env::var("HOME")?).join(".cargo"),
+    };
+    let Ok(entries) = std::fs::read_dir(home.join("registry/src")) else {
+        return Ok(None);
+    };
+    for entry in entries.flatten() {
+        let build_rs = entry
+            .path()
+            .join(format!("libghostty-vt-sys-{version}/build.rs"));
+        let Ok(text) = std::fs::read_to_string(&build_rs) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Some((_, rest)) = line.split_once("GHOSTTY_COMMIT") else {
+                continue;
+            };
+            let Some(open) = rest.find('"') else { continue };
+            let rest = &rest[open + 1..];
+            let Some(close) = rest.find('"') else {
+                continue;
+            };
+            return Ok(Some(rest[..close].to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn check_cargo_manifest(path: &Path, errors: &mut Vec<String>) -> Result<()> {
+    let doc: toml::Value = toml::from_str(&std::fs::read_to_string(path)?)?;
+    let name = path.strip_prefix(repo_root()).unwrap_or(path).display();
+
+    for table in [
+        "dependencies",
+        "dev-dependencies",
+        "build-dependencies",
+        "workspace.dependencies",
+    ] {
+        let mut node = &doc;
+        for key in table.split('.') {
+            match node.get(key) {
+                Some(next) => node = next,
+                None => {
+                    node = &toml::Value::Boolean(false);
+                    break;
+                }
+            }
+        }
+        let Some(deps) = node.as_table() else {
+            continue;
+        };
+
+        for (dep, spec) in deps {
+            let version = match spec {
+                toml::Value::String(s) => Some(s.as_str()),
+                toml::Value::Table(t) => {
+                    // Path and workspace dependencies carry no version to pin.
+                    if t.contains_key("path") || t.contains_key("workspace") {
+                        continue;
+                    }
+                    t.get("version").and_then(|v| v.as_str())
+                }
+                _ => None,
+            };
+            let Some(version) = version else {
+                errors.push(format!("{name}: `{dep}` in [{table}] has no version"));
+                continue;
+            };
+            if !version.starts_with('=') {
+                errors.push(format!(
+                    "{name}: `{dep} = \"{version}\"` is a range. Write \"={version}\"."
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_package_json(path: &Path, errors: &mut Vec<String>) -> Result<()> {
+    let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    for table in ["dependencies", "devDependencies"] {
+        let Some(deps) = doc.get(table).and_then(|d| d.as_object()) else {
+            continue;
+        };
+        for (dep, spec) in deps {
+            let Some(version) = spec.as_str() else {
+                continue;
+            };
+            let exact = version.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && !version.contains('*')
+                && !version.contains(" - ")
+                && !version.contains("||");
+            if !exact {
+                errors.push(format!(
+                    "web/package.json: `{dep}`: \"{version}\" is a range. Write the exact version."
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read the one version number of the workspace.
+pub fn read_version() -> Result<String> {
+    let path = repo_root().join("Cargo.toml");
+    let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&path)?)?;
+    let version = doc
+        .get("workspace")
+        .and_then(|w| w.get("package"))
+        .and_then(|p| p.get("version"))
+        .and_then(|v| v.as_str())
+        .ok_or("no `version` under [workspace.package] in Cargo.toml")?;
+    Ok(version.to_string())
+}
+
+/// Write one version number to every manifest that carries one.
+pub fn write_version(version: &str) -> Result<()> {
+    let root = repo_root();
+
+    let cargo_path = root.join("Cargo.toml");
+    let cargo = std::fs::read_to_string(&cargo_path)?;
+    let mut out = String::with_capacity(cargo.len());
+    let mut in_workspace_package = false;
+    let mut replaced = false;
+    for line in cargo.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_workspace_package = trimmed == "[workspace.package]";
+        }
+        if in_workspace_package && trimmed.starts_with("version") && !replaced {
+            out.push_str(&format!("version = \"{version}\"\n"));
+            replaced = true;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !replaced {
+        return Err("no `version` under [workspace.package] in Cargo.toml".into());
+    }
+    std::fs::write(&cargo_path, out)?;
+
+    let pkg_path = root.join("web/package.json");
+    if pkg_path.is_file() {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&pkg_path)?)?;
+        doc["version"] = serde_json::Value::String(version.to_string());
+        std::fs::write(
+            &pkg_path,
+            format!("{}\n", serde_json::to_string_pretty(&doc)?),
+        )?;
+    }
+    Ok(())
+}

@@ -1,0 +1,7 @@
+/target
+/.toolchain
+/web/dist
+/web/build-info.toml
+/web/node_modules
+/dist
+/.claude/worktrees

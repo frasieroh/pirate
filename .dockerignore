@@ -1,0 +1,4 @@
+# The image build needs the tarballs of `cargo xtask dist` and nothing else.
+# Ignore the whole repository, then add dist/ back.
+*
+!dist

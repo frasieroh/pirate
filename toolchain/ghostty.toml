@@ -1,0 +1,16 @@
+# Pinned Ghostty commit.
+#
+# libghostty-vt-sys builds Ghostty from this commit. The crate declares
+# `links = "ghostty-vt"`, but its build script emits `cargo:include` only.
+# Therefore a dependent cannot read the commit from Cargo metadata. The value is
+# a private constant in the build script of that crate, so pirate records it
+# here, beside the Zig pin.
+#
+# CAUTION: Change both values together when you upgrade libghostty-vt-sys. A
+# stale commit here makes `pirate --version --long` report the wrong parser.
+# `cargo xtask verify-pins` compares this commit against the crate source when
+# that source is in the cargo registry cache.
+#
+# This commit declares .minimum_zig_version = "0.15.2". See toolchain/zig.toml.
+libghostty_vt_sys = "0.2.1"
+commit = "a887df42c56f6de86c0fe6da9c4eeca37931e083"

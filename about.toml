@@ -1,0 +1,48 @@
+# cargo-about configuration.
+#
+# cargo-about reads the license of every crate in the graph and writes
+# THIRD-PARTY-LICENSES.md from the template about.hbs.
+#
+# Regenerate the file after any dependency change:
+#   cargo about generate --config about.toml --output-file THIRD-PARTY-LICENSES.md about.hbs
+#
+# NOTE: cargo-about reads Rust crates only. ghostty-web is an npm package, and
+# its code is inside the binary. The last section of about.hbs holds that
+# license text as static text.
+
+# Keep this list equal to the `allow` list in deny.toml.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+# The same six targets that the release builds. A dependency can be
+# platform-specific, so one target hides the licenses of the others.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
+
+# A build dependency and a dev dependency do not put code in the binary.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false
+
+# NOTE: cargo-about asks clearlydefined.io when a local license file is unclear.
+# The `--offline` flag stops that request and reads local files only.
+#
+# Keep every per-crate table at the end of this file. A TOML table takes every
+# key that comes after it.
+
+# The one exception of deny.toml. option-ext is MPL-2.0, which is file-level
+# copyleft. rust-embed-impl is a proc-macro crate, so option-ext runs at compile
+# time and stays out of the binary.
+[option-ext]
+accepted = ["MPL-2.0"]

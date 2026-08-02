@@ -1,0 +1,27 @@
+[package]
+name = "pirate-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Latency measurements for pirate. Nothing here ships in the binary."
+publish = false
+
+[dependencies]
+pirate = { path = "../pirate" }
+# `bench_server` starts a real server on an ephemeral port.
+axum = { version = "=0.8.9", features = ["ws"] }
+tokio = { version = "=1.53.1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "io-util",
+    "process",
+] }
+# A WebSocket client, to measure what a browser would receive.
+tokio-tungstenite = "=0.29.0"
+futures-util = { version = "=0.3.33", default-features = false }
+# `record_fixtures` records the byte streams from a real PTY.
+pty-process = { version = "=0.5.3", features = ["async"] }

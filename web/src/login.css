@@ -1,0 +1,72 @@
+/* A theme can set these five custom properties:
+   --pirate-bg       the page background
+   --pirate-fg       the text
+   --pirate-surface  the background of the input
+   --pirate-border   the border of the input
+   --pirate-error    the error text
+   Each use gives a fallback from the palette of `style.css`. */
+
+body[data-auth="required"] #terminal,
+body[data-auth="required"] #status {
+  display: none;
+}
+
+#login {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin: 0;
+  background: var(--pirate-bg, #16161e);
+  color: var(--pirate-fg, #a9b1d6);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+
+/* The username field stays in the DOM for the password manager. The wrapper
+   takes it out of the layout, and `display: none` on the input itself can
+   stop a manager from reading it. */
+#login .login-user {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+#login-token {
+  width: 18rem;
+  max-width: 80vw;
+  padding: 8px 10px;
+  font: inherit;
+  color: inherit;
+  background: var(--pirate-surface, #1a1b26);
+  border: 1px solid var(--pirate-border, #2f3549);
+  border-radius: 3px;
+}
+
+/* The button leaves the screen, and it stays in the DOM. The form needs a
+   submit control for the password manager, and a form of two fields needs one
+   for implicit submission. The operator submits with the Enter key. These
+   rules keep the button focusable and in the tab order, which `display: none`
+   and the `hidden` attribute do not. */
+#login button {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+#login .login-error {
+  /* The line keeps its height when it holds no text. The input then stays at
+     one position on the screen, and an error moves nothing. */
+  height: 18px;
+  margin: 0;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--pirate-error, #f7768e);
+}
