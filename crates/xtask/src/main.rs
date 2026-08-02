@@ -3,9 +3,11 @@
 //! The build spans three toolchains: Zig builds libghostty-vt, Rust builds the
 //! server, and Vite builds the web client. xtask owns the order and the
 //! environment so that no other command needs to know about them.
+//!
+//! The web build owns its own output. Two Vite plugins compress web/dist and
+//! write web/build-info.toml, so xtask starts that build and then reads the
+//! result.
 
-mod buildinfo;
-mod compress;
 mod dist;
 mod pins;
 mod toolchain;
@@ -19,8 +21,7 @@ const HELP: &str = "\
 cargo xtask <command>
 
 Commands:
-  setup                  Download the pinned Zig and write the macOS SDK shim.
-  web                    Build the web assets into web/dist and compress them.
+  web                    Build the web assets. The web build compresses them.
   build [--release]      Build the web assets, then the binary.
         [--target T]     Cross-compile. Linux targets use cargo-zigbuild.
   dist [--target T]...   Build each target, then write a tarball for each one
@@ -34,8 +35,7 @@ fn main() {
     let cmd = args.first().map(String::as_str).unwrap_or("help");
 
     let result = match cmd {
-        "setup" => cmd_setup(),
-        "web" => cmd_web(),
+        "web" => cmd_web_alone(),
         "build" => cmd_build(&args[1..]),
         "dist" => dist::run(&args[1..]),
         "verify-pins" => pins::verify(),
@@ -65,47 +65,50 @@ pub fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn cmd_setup() -> Result<()> {
+/// The outputs of the web build that the Rust build reads.
+///
+/// The two Vite plugins write them. `cargo build` embeds web/dist, and the
+/// `build.rs` script of pirate reads web/build-info.toml.
+const WEB_OUTPUTS: &[&str] = &["dist/index.html", "build-info.toml"];
+
+/// The `web` command on its own. It builds the same environment that a full
+/// build gives, because `bun` must come from mise here too.
+fn cmd_web_alone() -> Result<()> {
     let env = toolchain::build_env()?;
-    for (k, v) in &env {
-        if k == "PATH" {
-            continue;
-        }
-        eprintln!("xtask: {k}={v}");
-    }
-    eprintln!("xtask: setup complete");
-    Ok(())
+    cmd_web(&env)
 }
 
-/// Stage 1. Vite builds web/dist, then every compressible file gets a gzip and a
-/// brotli copy beside it. The Rust build embeds all three forms.
-pub fn cmd_web() -> Result<()> {
+/// The web build. Vite writes web/dist, compresses every large asset into a gzip
+/// and a brotli copy, and writes web/build-info.toml. The Rust build embeds all
+/// three forms of each asset.
+///
+/// CAUTION: Run `bun` with the build environment of mise. mise pins the bun
+/// version and puts that bun on PATH. A bun from the machine ignores the pin,
+/// and two machines then build different web assets.
+pub fn cmd_web(env: &[(String, String)]) -> Result<()> {
     let web = repo_root().join("web");
     if !web.join("package.json").is_file() {
         return Err(format!("no package.json in {}", web.display()).into());
     }
 
-    run("bun", &["install", "--frozen-lockfile"], &web)
-        .or_else(|_| run("bun", &["install"], &web))?;
-    run("bun", &["run", "build"], &web)?;
+    run_with_env("bun", &["install", "--frozen-lockfile"], &web, env)
+        .or_else(|_| run_with_env("bun", &["install"], &web, env))?;
+    run_with_env("bun", &["run", "build"], &web, env)?;
 
-    let dist = web.join("dist");
-    if !dist.is_dir() {
-        return Err(format!("bun run build did not create {}", dist.display()).into());
+    // A missing output means that a Vite plugin stopped without an error. Fail
+    // here, because the Rust build gives a worse message for the same fault.
+    for output in WEB_OUTPUTS {
+        let path = web.join(output);
+        if !path.is_file() {
+            return Err(format!("`bun run build` wrote no {}", path.display()).into());
+        }
     }
-    let saved = compress::compress_tree(&dist)?;
-    eprintln!("xtask: compressed {saved} files in web/dist");
-
-    // The ghostty-web version and the wasm checksum come from node_modules.
-    // Only stage 1 can read them, because build.rs must not run bun.
-    buildinfo::write(&web)?;
+    eprintln!("xtask: web assets are complete");
     Ok(())
 }
 
-/// Stage 1, then stages 2 and 3.
+/// The web build, then the Rust build.
 fn cmd_build(args: &[String]) -> Result<()> {
-    cmd_web()?;
-
     let mut target: Option<&str> = None;
     let mut release = false;
     let mut i = 0;
@@ -121,11 +124,14 @@ fn cmd_build(args: &[String]) -> Result<()> {
         i += 1;
     }
 
+    // One call for both builds. The web build needs the bun of mise, and
+    // the Rust build needs the Zig and the rustup toolchain of mise.
     let env = toolchain::build_env()?;
+    cmd_web(&env)?;
     build_target(target, release, &env)
 }
 
-/// Stages 2 and 3 for one target. `dist` calls this once for each target, so it
+/// The Rust build for one target. `dist` calls this once for each target, so it
 /// takes the build environment as an argument and does not rebuild the web
 /// assets.
 pub fn build_target(target: Option<&str>, release: bool, env: &[(String, String)]) -> Result<()> {
@@ -133,6 +139,13 @@ pub fn build_target(target: Option<&str>, release: bool, env: &[(String, String)
     // with the system linker and build with plain cargo.
     let linux = target.is_some_and(|t| t.contains("linux"));
     let mut argv: Vec<&str> = vec![if linux { "zigbuild" } else { "build" }];
+
+    // CAUTION: Keep `--locked` on both forms. Cargo.lock is a pin. Without this
+    // flag cargo writes the file again from the manifests, and the release then
+    // holds a dependency set that nobody committed. cargo-zigbuild passes the
+    // flag through to cargo.
+    argv.push("--locked");
+
     if release {
         argv.push("--release");
     }
@@ -154,10 +167,6 @@ fn cmd_version(version: &str) -> Result<()> {
     pins::write_version(version)?;
     eprintln!("xtask: version set to {version}");
     Ok(())
-}
-
-pub fn run(program: &str, args: &[&str], cwd: &Path) -> Result<()> {
-    run_with_env(program, args, cwd, &[])
 }
 
 pub fn run_with_env(

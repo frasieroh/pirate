@@ -1,25 +1,33 @@
 name: ci
 
 # CI builds all six targets, runs the checks, and runs a Linux binary.
-# The release workflow owns the release artifacts and the Docker image.
+# The release workflow owns the release artifacts. No workflow builds the
+# container image. A person builds that image from the Dockerfile.
 #
 # Two build jobs, because the macOS SDK license does not permit redistribution:
 #   macos   aarch64-apple-darwin, x86_64-apple-darwin            plain cargo build
 #   linux   the two gnu.2.28 targets and the two musl targets    cargo zigbuild
 # `cargo xtask build --target T` makes that choice. Do not repeat it here.
 #
-# Six caches, as the build speed section of the spec states:
-#   1 the pinned Zig toolchain          key: Zig version
-#   2 ZIG_GLOBAL_CACHE_DIR              key: Ghostty commit and Zig version
-#   3 the Ghostty source checkout       key: Ghostty commit and Zig version
-#   4 the Cargo registry                key: Cargo.lock
-#   5 the Cargo target directory        key: Cargo.lock
-#   6 web/node_modules                  key: web/bun.lock
+# mise.toml declares every tool version, and jdx/mise-action installs them.
+# That action caches its own installs, so this file caches build output only:
+#   1 ZIG_GLOBAL_CACHE_DIR              key: Ghostty commit, mise.toml, Cargo.lock
+#   2 the Ghostty source checkout       key: Ghostty commit
+#   3 the Cargo registry                key: Cargo.lock
+#   4 the Cargo target directory        key: Cargo.lock and mise.toml
+#   5 web/node_modules                  key: web/bun.lock
+#   6 the Playwright browser            key: web/bun.lock
 #
-# NOTE: A repository gets 10 GB of cache. Cache 2 holds 868 MB for six targets,
-# and cache 5 is the other large one. The estimated total is 4 to 5 GB, because
-# each key is stable and each job writes one entry. Cache 5 saves on `main` only,
-# so a branch that changes Cargo.lock cannot fill the budget with copies.
+# NOTE: A repository gets 10 GB of cache. Cache 1 holds the Zig global cache:
+# the packages that the Ghostty build fetches, and the artifacts that Zig shares
+# between builds. The build script of libghostty-vt-sys passes
+# `--cache-dir <OUT_DIR>/zig-cache`, so the compile output of each target lands
+# under `target/` and belongs to cache 4. Cache 4 is therefore the large one.
+# Each key is stable, and each job writes one entry. Cache 4 saves on `main`
+# only, so a branch that changes Cargo.lock cannot fill the budget with copies.
+#
+# CAUTION: Do not add the `sha256:` input to jdx/mise-action. That checksum
+# holds for one platform, and this workflow runs on ubuntu and on macOS.
 
 on:
   pull_request:
@@ -44,7 +52,9 @@ env:
 jobs:
   # ---------------------------------------------------------------- lint ------
   # These two checks need no Zig, no Node, and no web assets, so they report a
-  # failure in about one minute.
+  # failure in about one minute. `cargo xtask verify-pins` is also the guard on
+  # mise.lock: Renovate can raise a version in mise.toml, and it cannot write
+  # the checksums that mise.lock holds.
   lint:
     name: Format and pins
     runs-on: ubuntu-24.04
@@ -52,10 +62,18 @@ jobs:
       - name: Get the source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install the Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
+      # mise.toml declares every tool, and mise.lock holds a SHA-256 for each
+      # download. The action adds `--locked` when it finds that lock file, so
+      # this job installs the bytes that mise.lock names.
+      - name: Install the pinned tools
+        uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+        with:
+          version: 2026.8.0
+          # This job runs cargo only. Zig and bun cost minutes and stay out.
+          # `cargo fetch` and `cargo xtask verify-pins` need no other tool.
+          install_args: rust
 
-      # Cache 4. The key matches the one in the linux job, so both jobs share
+      # Cache 3. The key matches the one in the linux job, so both jobs share
       # one entry.
       - name: Cache the Cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -69,6 +87,12 @@ jobs:
 
       - name: Check the formatting
         run: cargo fmt --all --check
+
+      # `--locked` fails when Cargo.lock does not answer Cargo.toml. This step
+      # also unpacks libghostty-vt-sys into the registry, and the next step reads
+      # GHOSTTY_COMMIT out of that source. Without this step the next step fails.
+      - name: Download the crate sources
+        run: cargo fetch --locked
 
       - name: Verify the pins
         run: cargo xtask verify-pins
@@ -84,12 +108,14 @@ jobs:
       - name: Get the source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - name: Install the pinned tools
+        uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
         with:
-          bun-version: 1.3.14
+          version: 2026.8.0
+          # This job runs bun only. Rust and Zig cost minutes and stay out.
+          install_args: bun
 
-      # Cache 6. The key matches the one in the build jobs.
+      # Cache 5. The key matches the one in the build jobs.
       - name: Cache node_modules
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -101,8 +127,8 @@ jobs:
         working-directory: web
         run: bun install --frozen-lockfile
 
-      # Key the browser cache on the playwright version. A different version
-      # needs a different browser build.
+      # Cache 6. Key the browser cache on the playwright version. A different
+      # version needs a different browser build.
       - name: Cache the Playwright browser
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -146,10 +172,14 @@ jobs:
           xcodebuild -version
           xcrun --sdk macosx --show-sdk-path
 
-      - name: Install the Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
+      # This step installs every tool in mise.toml. It also exports the `[env]`
+      # block of that file, so ZIG_GLOBAL_CACHE_DIR reaches every later step.
+      - name: Install the pinned tools
+        uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+        with:
+          version: 2026.8.0
 
-      # Cache 4.
+      # Cache 3.
       - name: Cache the Cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -160,24 +190,22 @@ jobs:
           key: cargo-registry-macOS-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-registry-macOS-
 
+      # `--locked` fails when Cargo.lock does not answer Cargo.toml. The step
+      # below reads the Ghostty commit out of the crate that this step downloads.
       - name: Download the crate sources
         run: cargo fetch --locked
 
-      # The Ghostty commit is a constant inside the build script of
-      # libghostty-vt-sys. Read it from the downloaded crate. A hardcoded copy
-      # here can drift, and a drift makes CI build the wrong Ghostty.
-      - name: Read the pinned versions
+      # CAUTION: Read this commit from the crate, and never from
+      # toolchain/ghostty.toml. A later step checks out this commit and exports
+      # the checkout as GHOSTTY_SOURCE_DIR. The build script of libghostty-vt-sys
+      # then builds that tree, and it asserts on build.zig alone. It never
+      # compares the tree against its own GHOSTTY_COMMIT constant. A drifted file
+      # therefore makes CI build a parser that the release build never builds.
+      - name: Read the pinned Ghostty commit
         run: |
           set -euo pipefail
-          zig_version=$(tr -d '[:space:]' < .zigversion)
-          case "$(uname -s)-$(uname -m)" in
-            Darwin-arm64)  zig_triple=aarch64-macos ;;
-            Darwin-x86_64) zig_triple=x86_64-macos ;;
-            Linux-x86_64)  zig_triple=x86_64-linux ;;
-            Linux-aarch64) zig_triple=aarch64-linux ;;
-            *) echo "unsupported host $(uname -s)-$(uname -m)"; exit 1 ;;
-          esac
-          crate=$(ls "${CARGO_HOME:-$HOME/.cargo}"/registry/cache/*/libghostty-vt-sys-*.crate | head -1)
+          cache="${CARGO_HOME:-$HOME/.cargo}/registry/cache"
+          crate=$(find "$cache" -name 'libghostty-vt-sys-*.crate' | sort | head -1)
           name=$(basename "$crate" .crate)
           commit=$(tar -xzOf "$crate" "$name/build.rs" \
             | sed -n 's/.*GHOSTTY_COMMIT: &str = "\([0-9a-f]\{40\}\)".*/\1/p' | head -1)
@@ -185,33 +213,24 @@ jobs:
             echo "FAILURE: no GHOSTTY_COMMIT in $name/build.rs"
             exit 1
           fi
-          echo "ZIG_VERSION=$zig_version" >> "$GITHUB_ENV"
-          echo "ZIG_DIR=.toolchain/zig-$zig_triple-$zig_version" >> "$GITHUB_ENV"
           echo "GHOSTTY_COMMIT=$commit" >> "$GITHUB_ENV"
-          echo "zig $zig_version for $zig_triple, ghostty $commit, from $name"
+          echo "ghostty $commit, from $name"
 
-      # Cache 1. xtask downloads the tarball, checks the SHA-256, and unpacks it
-      # into this directory.
-      - name: Cache the Zig toolchain
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.ZIG_DIR }}
-          key: zig-toolchain-macOS-${{ env.ZIG_VERSION }}
-
-      # Cache 2. This is the large one: 868 MB for six targets.
+      # Cache 1. This cache holds the Zig global cache, and not the compile
+      # output of a target. Read the note at the top of this file.
       - name: Cache the Zig global cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .toolchain/zig-cache
-          key: zig-global-macOS-${{ env.ZIG_VERSION }}-${{ env.GHOSTTY_COMMIT }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: zig-global-macOS-${{ env.ZIG_VERSION }}-${{ env.GHOSTTY_COMMIT }}-
+          key: zig-global-macOS-${{ hashFiles('mise.toml') }}-${{ env.GHOSTTY_COMMIT }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: zig-global-macOS-${{ hashFiles('mise.toml') }}-${{ env.GHOSTTY_COMMIT }}-
 
-      # Cache 3.
+      # Cache 2. The commit is the only input to this checkout.
       - name: Cache the Ghostty source
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .toolchain/ghostty-src
-          key: ghostty-src-${{ env.GHOSTTY_COMMIT }}-${{ env.ZIG_VERSION }}
+          key: ghostty-src-${{ env.GHOSTTY_COMMIT }}
 
       # The build script of libghostty-vt-sys clones with `--filter=blob:none
       # --no-checkout`, then runs `git checkout <commit>`. The result is a work
@@ -232,34 +251,25 @@ jobs:
           test "$(git -C "$dir" rev-parse HEAD)" = "$GHOSTTY_COMMIT"
           echo "GHOSTTY_SOURCE_DIR=$dir" >> "$GITHUB_ENV"
 
-      - name: Install bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: 1.3.14
-
-      # Cache 6.
+      # Cache 5.
       - name: Cache node_modules
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: web/node_modules
           key: node-modules-macOS-${{ hashFiles('web/bun.lock') }}
 
-      # Cache 5. Restore on every run. Save on `main` only, so that one branch
+      # Cache 4. Restore on every run. Save on `main` only, so that one branch
       # cannot fill the 10 GB budget with copies of a multi-gigabyte directory.
       - name: Restore the target directory
         id: target-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: target-macOS-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: target-macOS-${{ hashFiles('Cargo.lock', 'mise.toml') }}
           restore-keys: target-macOS-
 
-      - name: Acquire Zig and write the SDK shim
-        run: |
-          set -euo pipefail
-          cargo xtask setup
-          echo "$GITHUB_WORKSPACE/$ZIG_DIR" >> "$GITHUB_PATH"
-
+      # `cargo xtask build` writes the SDK shim itself, so this job needs no
+      # separate setup step.
       - name: Build the Apple targets
         run: |
           set -euo pipefail
@@ -291,7 +301,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: target-macOS-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: target-macOS-${{ hashFiles('Cargo.lock', 'mise.toml') }}
 
   # --------------------------------------------------------------- linux ------
   linux:
@@ -303,15 +313,17 @@ jobs:
       - name: Get the source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install the Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-
-      - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@1beb33eee6d086258184383af9a538940be190ed # v2.85.6
+      # This step installs every tool in mise.toml, which includes cargo-zigbuild
+      # for the four Linux targets. It puts each tool on PATH and exports the
+      # `[env]` block of that file. clippy and the tests run without xtask, and
+      # they need both: the build script of libghostty-vt-sys runs `zig` by a
+      # bare PATH lookup, and it writes to ZIG_GLOBAL_CACHE_DIR.
+      - name: Install the pinned tools
+        uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
         with:
-          tool: cargo-zigbuild@0.23.0
+          version: 2026.8.0
 
-      # Cache 4. The key matches the one in the lint job.
+      # Cache 3. The key matches the one in the lint job.
       - name: Cache the Cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -325,18 +337,12 @@ jobs:
       - name: Download the crate sources
         run: cargo fetch --locked
 
-      - name: Read the pinned versions
+      # Read the CAUTION in the macOS job.
+      - name: Read the pinned Ghostty commit
         run: |
           set -euo pipefail
-          zig_version=$(tr -d '[:space:]' < .zigversion)
-          case "$(uname -s)-$(uname -m)" in
-            Darwin-arm64)  zig_triple=aarch64-macos ;;
-            Darwin-x86_64) zig_triple=x86_64-macos ;;
-            Linux-x86_64)  zig_triple=x86_64-linux ;;
-            Linux-aarch64) zig_triple=aarch64-linux ;;
-            *) echo "unsupported host $(uname -s)-$(uname -m)"; exit 1 ;;
-          esac
-          crate=$(ls "${CARGO_HOME:-$HOME/.cargo}"/registry/cache/*/libghostty-vt-sys-*.crate | head -1)
+          cache="${CARGO_HOME:-$HOME/.cargo}/registry/cache"
+          crate=$(find "$cache" -name 'libghostty-vt-sys-*.crate' | sort | head -1)
           name=$(basename "$crate" .crate)
           commit=$(tar -xzOf "$crate" "$name/build.rs" \
             | sed -n 's/.*GHOSTTY_COMMIT: &str = "\([0-9a-f]\{40\}\)".*/\1/p' | head -1)
@@ -344,32 +350,24 @@ jobs:
             echo "FAILURE: no GHOSTTY_COMMIT in $name/build.rs"
             exit 1
           fi
-          echo "ZIG_VERSION=$zig_version" >> "$GITHUB_ENV"
-          echo "ZIG_DIR=.toolchain/zig-$zig_triple-$zig_version" >> "$GITHUB_ENV"
           echo "GHOSTTY_COMMIT=$commit" >> "$GITHUB_ENV"
-          echo "zig $zig_version for $zig_triple, ghostty $commit, from $name"
+          echo "ghostty $commit, from $name"
 
-      # Cache 1.
-      - name: Cache the Zig toolchain
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.ZIG_DIR }}
-          key: zig-toolchain-Linux-${{ env.ZIG_VERSION }}
-
-      # Cache 2. This is the large one: 868 MB for six targets.
+      # Cache 1. This cache holds the Zig global cache, and not the compile
+      # output of a target. Read the note at the top of this file.
       - name: Cache the Zig global cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .toolchain/zig-cache
-          key: zig-global-Linux-${{ env.ZIG_VERSION }}-${{ env.GHOSTTY_COMMIT }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: zig-global-Linux-${{ env.ZIG_VERSION }}-${{ env.GHOSTTY_COMMIT }}-
+          key: zig-global-Linux-${{ hashFiles('mise.toml') }}-${{ env.GHOSTTY_COMMIT }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: zig-global-Linux-${{ hashFiles('mise.toml') }}-${{ env.GHOSTTY_COMMIT }}-
 
-      # Cache 3.
+      # Cache 2.
       - name: Cache the Ghostty source
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .toolchain/ghostty-src
-          key: ghostty-src-${{ env.GHOSTTY_COMMIT }}-${{ env.ZIG_VERSION }}
+          key: ghostty-src-${{ env.GHOSTTY_COMMIT }}
 
       - name: Get the Ghostty source
         run: |
@@ -386,36 +384,21 @@ jobs:
           test "$(git -C "$dir" rev-parse HEAD)" = "$GHOSTTY_COMMIT"
           echo "GHOSTTY_SOURCE_DIR=$dir" >> "$GITHUB_ENV"
 
-      - name: Install bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: 1.3.14
-
-      # Cache 6.
+      # Cache 5.
       - name: Cache node_modules
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: web/node_modules
           key: node-modules-Linux-${{ hashFiles('web/bun.lock') }}
 
-      # Cache 5. Read the note in the macOS job.
+      # Cache 4. Read the note in the macOS job.
       - name: Restore the target directory
         id: target-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: target-Linux-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: target-Linux-${{ hashFiles('Cargo.lock', 'mise.toml') }}
           restore-keys: target-Linux-
-
-      # xtask sets these two for the cargo child process. clippy and cargo test
-      # run without xtask, so they need the same values in the job environment.
-      # The build script of libghostty-vt-sys runs `zig` by a bare PATH lookup.
-      - name: Acquire Zig
-        run: |
-          set -euo pipefail
-          cargo xtask setup
-          echo "$GITHUB_WORKSPACE/$ZIG_DIR" >> "$GITHUB_PATH"
-          echo "ZIG_GLOBAL_CACHE_DIR=$GITHUB_WORKSPACE/.toolchain/zig-cache" >> "$GITHUB_ENV"
 
       - name: Build the Linux targets
         run: |
@@ -527,4 +510,4 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: target-Linux-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: target-Linux-${{ hashFiles('Cargo.lock', 'mise.toml') }}

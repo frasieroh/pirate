@@ -72,6 +72,12 @@ multiple-versions = "warn"
 # A wildcard version defeats the pin discipline. `cargo xtask verify-pins`
 # makes the same check on the manifests of this repository.
 wildcards = "deny"
+# A path dependency inside this workspace carries no version, and cargo-deny
+# reads a missing version as the wildcard `*`. crates/pirate-bench depends on
+# crates/pirate by path, so the rule above rejected the whole workspace. This
+# setting exempts a path dependency only. A registry crate with a wildcard
+# version stays an error.
+allow-wildcard-paths = true
 deny = []
 
 [sources]

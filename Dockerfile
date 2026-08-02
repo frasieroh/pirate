@@ -3,6 +3,9 @@
 # The image carries the musl artifact that `cargo xtask dist` writes. The final
 # stage is distroless, so the image holds the binary and nothing else.
 #
+# `cargo xtask dist` needs mise, because mise installs the pinned build tools.
+# That command stops without it. See docs/building.md.
+#
 # Build one image for this host:
 #   cargo xtask dist --target x86_64-unknown-linux-musl
 #   docker build -t pirate:0.1.0 .
@@ -14,7 +17,7 @@
 #
 # The build context needs dist/ only. See .dockerignore.
 #
-# Both base images are pinned by digest, because a tag moves. To upgrade a base
+# This file pins both base images by digest, because a tag moves. To upgrade a base
 # image, read the new digest with `docker buildx imagetools inspect <image>:<tag>`.
 
 # ---------------------------------------------------------------------------
@@ -71,7 +74,7 @@ ENV PIRATE_PORT=8080
 #
 # The loopback default makes `docker run -p 8080:8080` answer nothing, because
 # a published port reaches the container from outside. That result is correct.
-# The operator opts in to a wider bind, one command at a time:
+# The operator selects a wider bind, one command at a time:
 #
 #   docker run --rm -it -p 127.0.0.1:8080:8080 -e PIRATE_BIND=0.0.0.0 pirate:0.1.0
 #

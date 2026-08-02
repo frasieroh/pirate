@@ -7,7 +7,16 @@
   </head>
   <body>
     <div id="terminal"></div>
-    <div id="status" role="status"></div>
+    <!-- The menu is fixed, in the top right corner. It is out of the layout
+         flow, so it never changes the box of the terminal. `src/style.css`
+         holds the reason. -->
+    <div id="menu" data-state="open">
+      <div id="menu-header">
+        <span id="menu-status" role="status" data-state="ok"></span>
+        <button id="menu-toggle" type="button" aria-label="collapse the menu">−</button>
+      </div>
+      <div id="menu-body"></div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

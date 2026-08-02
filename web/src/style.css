@@ -1,5 +1,9 @@
 :root {
   color-scheme: dark;
+  /* SEAM(theme): `src/theme.ts` sets the `--pirate-*` custom properties on the
+     root element, from the colors of the active theme. Each rule below gives a
+     fallback from the dark palette, so the page is legible before the first
+     theme runs. */
   --bg: #16161e;
   --fg: #a9b1d6;
 }
@@ -12,8 +16,8 @@ html,
 body {
   margin: 0;
   height: 100%;
-  background: var(--bg);
-  color: var(--fg);
+  background: var(--pirate-bg, var(--bg));
+  color: var(--pirate-fg, var(--fg));
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
   /* The canvas can exceed the box by a fraction of a cell. Without this rule
      the document gets a scrollbar, the scrollbar takes space from the
@@ -34,25 +38,132 @@ body {
   overflow: hidden;
 }
 
-#status {
-  padding: 4px 8px;
+/* The menu is `position: fixed`, and that is not open for a change. A panel in
+   the flex flow of `body` takes height from the terminal. The height of the
+   panel changes with the length of the status line and with the state of the
+   body, so the terminal refits and the client sends a second resize frame for
+   one window size. A fixed panel changes no box, so the fit never runs for a
+   change of the menu. `tests/menu.spec.ts` measures this. */
+#menu {
+  position: fixed;
+  top: 0;
+  right: 0;
+  z-index: 2;
+  max-width: min(24rem, 100vw);
+  padding: 4px 8px 6px;
   font-size: 12px;
-  /* A fixed whole-pixel height. An empty status is then as tall as a full
-     one, and the height of the terminal never moves by a fraction of a
-     pixel. Without this rule the first status message changes the row count,
-     and the client sends a second resize frame for one window size. */
-  height: 26px;
   line-height: 18px;
-  opacity: 0.7;
-  border-top: 1px solid rgba(169, 177, 214, 0.15);
+  background: var(--pirate-surface, #1a1b26);
+  color: var(--pirate-fg, var(--fg));
+  border-left: 1px solid var(--pirate-border, #2f3549);
+  border-bottom: 1px solid var(--pirate-border, #2f3549);
 }
 
-#status[data-state="warn"] {
-  color: #e0af68;
-  opacity: 1;
+#menu[data-state="hidden"] {
+  display: none;
 }
 
-#status[data-state="error"] {
-  color: #f7768e;
-  opacity: 1;
+#menu[data-state="collapsed"] #menu-body {
+  display: none;
+}
+
+/* The login form owns the screen while the session is absent. `src/login.css`
+   takes the terminal off the screen, and this rule takes the menu off it. */
+body[data-auth="required"] #menu {
+  display: none;
+}
+
+#menu-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+#menu-status {
+  flex: 1;
+  min-width: 0;
+  /* The quiet default: the status line before a warning or an error. This
+     reads the color that `src/theme.ts` mixes for dimmed text, instead of a
+     bare `opacity`, so the dimming stays correct against a light theme too. */
+  color: var(--pirate-muted, #676b83);
+}
+
+#menu-status[data-state="warn"] {
+  color: var(--pirate-warn, #e0af68);
+}
+
+#menu-status[data-state="error"] {
+  color: var(--pirate-error, #f7768e);
+}
+
+#menu-body {
+  margin-top: 6px;
+}
+
+/* Every row sits inside a group now, so `#menu-body` holds groups only. The
+   old `.menu-row + .menu-group` selector matched a row that stood outside a
+   group, and such a row read as a member of the group above it. `MenuRow` of
+   `src/menu.ts` requires the group, so that row cannot exist. */
+.menu-group + .menu-group {
+  margin-top: 6px;
+}
+
+.menu-heading {
+  margin: 0;
+  font-size: 12px;
+  font-weight: normal;
+  opacity: 0.55;
+}
+
+.menu-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 22px;
+}
+
+.menu-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+#menu button {
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--pirate-border, #2f3549);
+  border-radius: 3px;
+  padding: 0 6px;
+  cursor: pointer;
+}
+
+#menu-toggle {
+  width: 22px;
+  padding: 0;
+  text-align: center;
+}
+
+#menu button[data-capture="on"] {
+  color: var(--pirate-warn, #e0af68);
+}
+
+/* The fault line: a refused chord, a fault of the store, a file that does not
+   parse. */
+#menu-note {
+  margin: 6px 0 0;
+  color: var(--pirate-warn, #e0af68);
+}
+
+/* The line for a normal result. The line after a theme change reports a limit
+   of ghostty-web, not a fault, so it reads in the dimmed color. */
+#menu-hint {
+  margin: 6px 0 0;
+  color: var(--pirate-muted, #676b83);
+}
+
+#menu-note:empty,
+#menu-hint:empty {
+  display: none;
 }

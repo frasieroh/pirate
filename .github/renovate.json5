@@ -1,0 +1,334 @@
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+
+  // Renovate exists here for one reason. Every input of this repository is an
+  // exact pin, and an exact pin does not age by itself. This configuration
+  // moves the numbers. It never widens a range.
+  //
+  // CAUTION: Do not add `rangeStrategy: "widen"` to any rule. A range makes two
+  // machines build different artifacts. `cargo xtask verify-pins` fails on a
+  // range, so a widened pin breaks CI.
+
+  extends: [
+    "config:recommended",
+
+    // GitHub Actions are pinned by full commit SHA, with the tag in a trailing
+    // comment. This preset keeps that shape. A tag is mutable, and a commit SHA
+    // is not, so the SHA is the security boundary.
+    "helpers:pinGitHubActionDigests",
+  ],
+
+  timezone: "UTC",
+
+  // One batch each week. Every pin here feeds a reproducible build, so a
+  // reviewer reads each diff. A daily stream of pull requests defeats that.
+  schedule: ["before 6am on monday"],
+
+  labels: ["dependencies"],
+
+  // A publisher can yank a release in the first hours after it appears. Three
+  // days of delay removes most of that risk.
+  minimumReleaseAge: "3 days",
+
+  // CAUTION: automerge stays off for the whole repository. A Zig bump, a Rust
+  // bump or a Ghostty bump can break the build in a way that CI cannot see. CI
+  // builds the same pinned inputs. A human reads every diff.
+  automerge: false,
+
+  // ---------------------------------------------------------------- cargo ---
+  // Every cargo dependency is written `= "x.y.z"`. Cargo reads a bare "1.2.3"
+  // as "^1.2.3", so the `=` prefix is the pin.
+  //
+  // The cargo versioning module of Renovate 42.99.0 defines no
+  // `supportedRangeStrategies`, so no list of strategies makes this choice. The
+  // reason is the default. The default `auto` resolves to `update-lockfile` for
+  // cargo, and that strategy changes Cargo.lock alone. It leaves the number in
+  // Cargo.toml. This repository needs both numbers to move, so `bump` is the
+  // correct choice. `bump` raises the number inside the range and leaves the
+  // range operator alone, so `=0.8.9` becomes `=0.9.0`.
+  cargo: {
+    rangeStrategy: "bump",
+  },
+
+  // --------------------------------------------------------------- docker ---
+  // Both base images in the Dockerfile carry `tag@sha256:...`. Renovate keeps
+  // the tag for a human reader and moves the digest for the build.
+  "dockerfile": {
+    pinDigests: true,
+  },
+
+  // ------------------------------------------------------------- lockfiles ---
+  // Cargo.lock and web/bun.lock pin the transitive graph. A direct dependency
+  // bump does not refresh them, so a separate monthly task does.
+  //
+  // NOTE: mise.lock is not in this list. See the gap note at the end of this
+  // file.
+  lockFileMaintenance: {
+    enabled: true,
+    schedule: ["before 6am on the first day of the month"],
+  },
+
+  packageRules: [
+    // ================================================================ zig ===
+    // The Zig version is not free to change. libghostty-vt-sys 0.2.1 pins
+    // Ghostty commit a887df42. That commit declares
+    // .minimum_zig_version = "0.15.2", and Ghostty's requireZig compares the
+    // major and the minor for equality. Zig 0.16.0 is therefore rejected.
+    // Zig 0.16.0 also changed the std.Io.Dir.readFileAlloc signature.
+    //
+    // A 0.15.2 to 0.16.0 step is a semver minor step. Without the two settings
+    // below, Renovate can put that step in the same pull request as a harmless
+    // 0.15.3 patch. The reviewer then merges a broken toolchain by accident.
+    {
+      description: "Zig: keep patch, minor and major in separate pull requests",
+      matchManagers: ["mise"],
+      matchPackageNames: ["ziglang/zig", "zig"],
+      separateMinorPatch: true,
+      separateMultipleMinor: true,
+      addLabels: ["toolchain", "zig"],
+      prBodyNotes: [
+        "1. Run `mise lock --platform linux-x64,linux-arm64,macos-arm64,macos-x64` and commit `mise.lock`.",
+        "2. Run `cargo xtask verify-pins`. That command fails while `mise.lock` has no entry for the new version.",
+      ],
+    },
+    {
+      // This rule labels the dangerous step. The update is not ignored. An
+      // ignored update hides the decision, and a labelled pull request shows it.
+      description: "Zig: label a major or minor step, because Ghostty rejects it",
+      matchManagers: ["mise"],
+      matchPackageNames: ["ziglang/zig", "zig"],
+      matchUpdateTypes: ["major", "minor"],
+      addLabels: ["breaks-the-build"],
+      commitMessageTopic: "Zig (Ghostty pins the 0.15 series)",
+      // A negative priority puts this pull request after the safe ones.
+      prPriority: -10,
+      prBodyNotes: [
+        "STOP. Ghostty's requireZig compares the major and the minor for equality.",
+        "This step needs a libghostty-vt-sys release that accepts the new Zig series.",
+        "If no such release exists, close this pull request.",
+      ],
+    },
+
+    // ============================================================ ghostty ===
+    // libghostty-vt and libghostty-vt-sys build one Ghostty commit.
+    // toolchain/ghostty.toml records that commit, because the build script of
+    // libghostty-vt-sys keeps it in a private constant. Renovate cannot read
+    // that constant and cannot edit toolchain/ghostty.toml.
+    {
+      description: "Ghostty parser: one pull request for both crates",
+      matchManagers: ["cargo"],
+      matchPackageNames: ["libghostty-vt", "libghostty-vt-sys"],
+      groupName: "ghostty parser",
+      addLabels: ["toolchain", "ghostty"],
+      prBodyNotes: [
+        "toolchain/ghostty.toml is not in this diff. Renovate cannot edit it.",
+        "1. Set `libghostty_vt_sys` in `toolchain/ghostty.toml` to the new version.",
+        "2. Set `commit` in `toolchain/ghostty.toml` to the GHOSTTY_COMMIT of the new crate.",
+        "3. Run `cargo xtask verify-pins`. That command compares both values against the crate source.",
+        "4. Read `.minimum_zig_version` of the new Ghostty commit. If it names a new Zig series, `mise.toml` needs a Zig step first.",
+      ],
+    },
+
+    // =============================================================== rust ===
+    // mise.toml holds the one Rust version. The `rust` entry carries a profile,
+    // components and six targets, and Renovate edits the `version` key alone.
+    {
+      description: "Rust toolchain",
+      matchManagers: ["mise"],
+      matchPackageNames: ["rust-lang/rust", "rust"],
+      groupName: "rust toolchain",
+      addLabels: ["toolchain"],
+      prBodyNotes: [
+        "Run `mise lock --platform linux-x64,linux-arm64,macos-arm64,macos-x64` and commit `mise.lock`.",
+        "`rust-version` in the workspace `Cargo.toml` is the minimum of the crate, not the toolchain. Raise it only on purpose.",
+      ],
+    },
+
+    // ================================================================ bun ===
+    // The bun version is written twice: `bun` in mise.toml and `packageManager`
+    // in web/package.json. Two managers read those two files, and each one
+    // reports a different name. mise reports `oven-sh/bun`, and the bun manager
+    // reports `bun`. Both names are below, so one group keeps the two numbers
+    // equal.
+    {
+      description: "Bun runtime: mise.toml and web/package.json move together",
+      matchPackageNames: ["oven-sh/bun", "bun"],
+      groupName: "bun runtime",
+      addLabels: ["toolchain"],
+      prBodyNotes: [
+        "Run `mise lock --platform linux-x64,linux-arm64,macos-arm64,macos-x64` and commit `mise.lock`.",
+      ],
+    },
+
+    // ================================================= cargo helper tools ===
+    // cargo-zigbuild is the linker driver for the four Linux targets.
+    // cargo-deny reads the license allowlist and the advisory database. Neither
+    // tool is linked into the binary, so a bump is low risk. mise.toml is the
+    // one declaration of both.
+    //
+    // The mise manager reads the `aqua:` backend. It reports the repository
+    // path as the package name, so the two names below are the whole match. It
+    // also strips an optional leading `v` from a tag. The `v0.23.0` tags of
+    // cargo-zigbuild and the `0.20.2` tags of cargo-deny therefore need no
+    // extra setting.
+    {
+      description: "cargo-zigbuild and cargo-deny: one pull request",
+      matchPackageNames: [
+        "rust-cross/cargo-zigbuild",
+        "EmbarkStudios/cargo-deny",
+      ],
+      groupName: "cargo helper tools",
+      addLabels: ["toolchain"],
+      prBodyNotes: [
+        "Run `mise lock --platform linux-x64,linux-arm64,macos-arm64,macos-x64` and commit `mise.lock`.",
+      ],
+    },
+
+    // ==================================================== github actions ====
+    // Each action is a build input, not a runtime dependency. One monthly batch
+    // keeps the noise low. Renovate moves the commit SHA and the trailing
+    // `# vX.Y.Z` comment together, because it reads that comment as the version.
+    //
+    // The depType is `action`, which is the `uses:` reference alone. A version
+    // inside a `with:` block has the depType `uses-with`, and a runner image has
+    // the depType `github-runner`. Those two belong to the rules below.
+    {
+      description: "GitHub Actions: one monthly batch of `uses:` pins",
+      matchManagers: ["github-actions"],
+      matchDepTypes: ["action"],
+      groupName: "github actions",
+      addLabels: ["ci"],
+      schedule: ["before 6am on the first day of the month"],
+    },
+
+    // ==================================================== runner images =====
+    // CAUTION: A runner image bump can break the build with no other change.
+    // Zig 0.15.2 cannot link against the macOS 26 SDK, because the
+    // libSystem.B.tbd of that SDK lists `arm64e-macos` and does not list
+    // `arm64-macos`. The `macos-15` pin holds the image that carries a usable
+    // SDK. A runner bump therefore gets its own pull request and a label.
+    {
+      description: "Runner images: a separate, labelled pull request",
+      matchManagers: ["github-actions"],
+      matchDepTypes: ["github-runner"],
+      groupName: "runner images",
+      addLabels: ["ci", "breaks-the-build"],
+      prPriority: -10,
+      prBodyNotes: [
+        "STOP. Read the macOS note in `.github/workflows/ci.yml` before you merge this pull request.",
+        "A macOS runner that carries the macOS 26 SDK only breaks the Zig link step.",
+      ],
+    },
+
+    // ======================================================= mise binary ====
+    // The workflows install mise with jdx/mise-action, and they pin the mise
+    // binary through the `version:` input of that action. The custom manager at
+    // the end of this file reads that input and names it `jdx/mise`. This pin is
+    // the installer, not a tool version, so mise.lock does not change with it.
+    //
+    // The GitHub Actions rule above never takes this pin, in any order. That
+    // rule matches the `github-actions` manager, and this pin comes from the
+    // `custom.regex` manager. The action SHA and the mise binary therefore keep
+    // their own pull requests.
+    {
+      description: "The mise binary that the workflows install",
+      matchPackageNames: ["jdx/mise"],
+      groupName: "mise binary",
+      addLabels: ["ci"],
+      schedule: ["before 6am on the first day of the month"],
+    },
+
+    // ========================================================== container ===
+    // alpine carries a version tag, so Renovate moves the tag and the digest.
+    // The distroless tag is `nonroot` and carries no version, so Renovate moves
+    // the digest alone. Both results keep the image immutable.
+    {
+      description: "Container base images: one pull request",
+      matchManagers: ["dockerfile"],
+      groupName: "container base images",
+      addLabels: ["docker"],
+      prBodyNotes: [
+        "To read the new digest by hand, run `docker buildx imagetools inspect <image>:<tag>`.",
+      ],
+    },
+
+    // ================================================================ web ===
+    // ghostty-web ships the WebAssembly parser for the browser.
+    // web/build-info.toml records its version and the SHA-256 of that
+    // WebAssembly file. That file is generated, so Renovate cannot edit it.
+    {
+      description: "ghostty-web: web/build-info.toml needs a regeneration",
+      matchPackageNames: ["ghostty-web"],
+      addLabels: ["web"],
+      prBodyNotes: [
+        "Run `cargo xtask web`. That command runs the web build, and the web build rewrites `ghostty_web_version` and `wasm_sha256` in `web/build-info.toml`.",
+        "The Rust `build.rs` script reads those two values, so a stale file makes the server report the wrong parser.",
+      ],
+    },
+    {
+      description: "Web build and test tools: one pull request",
+      matchManagers: ["bun", "npm"],
+      matchPackageNames: ["typescript", "vite", "playwright", "@types/bun"],
+      groupName: "web build tools",
+      addLabels: ["web"],
+    },
+  ],
+
+  // ------------------------------------------------------- custom managers ---
+  // A built-in manager reads every other pin in this repository. One pin has no
+  // built-in manager: the mise binary of the `version:` input of
+  // jdx/mise-action. Renovate 42.99.0 holds no reference to `mise-action`, and
+  // its community-action list does not name that action. Without the manager
+  // below, the seven copies of that number get no pull request.
+  //
+  // CAUTION: mise.toml is the one declaration of every tool version. A workflow
+  // must not write a tool version again. Renovate reads no version from an
+  // `env:` value, and it reads no version from a `with:` value of an action
+  // that it does not know. If a workflow needs such a value, add a manager
+  // below for it.
+  customManagers: [
+    {
+      customType: "regex",
+      description: "The mise binary of the `version:` input of jdx/mise-action",
+      managerFilePatterns: ["/^\\.github/workflows/[^/]+\\.yml$/"],
+      // The workflows write `2026.8.0`, and the git tag of that release is
+      // `v2026.8.0`. The template below drops the leading `v`.
+      matchStrings: [
+        "uses:\\s*jdx/mise-action@[0-9a-f]{40}[^\\n]*\\n\\s*with:[^\\n]*\\n(?:\\s*#[^\\n]*\\n)*\\s*version:\\s*[\"']?(?<currentValue>[^\"'\\s]+)",
+      ],
+      depNameTemplate: "jdx/mise",
+      datasourceTemplate: "github-releases",
+      extractVersionTemplate: "^v(?<version>.+)$",
+    },
+  ],
+
+  // ============================== KNOWN GAPS ===============================
+  //
+  // 1. mise.lock. This file holds a SHA-256 for each tool on each of four
+  //    platforms. Renovate runs `mise lock` for the current platform only, and
+  //    that run needs `mise` in the `allowedUnsafeExecutions` list of a
+  //    self-hosted administrator. A repository configuration cannot grant it.
+  //    Therefore every mise.toml pull request leaves mise.lock behind. Run:
+  //
+  //      mise lock --platform linux-x64,linux-arm64,macos-arm64,macos-x64
+  //
+  //    This gap is loud, not silent. `cargo xtask verify-pins` reads the version
+  //    of each tool in mise.toml and finds the entry for that tool in mise.lock.
+  //    That command fails on three faults: mise.lock has no entry for the tool,
+  //    mise.lock holds a different version, or the entry has no checksum for one
+  //    of the four platforms. The `core:rust` backend is the one exception,
+  //    because rustup verifies the signature of every file that it downloads.
+  //    CI runs this command, so a stale mise.lock cannot merge.
+  //
+  // 2. toolchain/ghostty.toml. The Ghostty commit is a private constant in the
+  //    build script of libghostty-vt-sys. No datasource serves it. The Ghostty
+  //    pull request carries the steps in its body instead.
+  //
+  // 3. web/build-info.toml. The web build generates this file, and it holds the
+  //    SHA-256 of the WebAssembly module. Renovate cannot compute that value.
+  //    `cargo xtask web` runs that build, so either command writes the file.
+  //
+  // 4. `rust-version` in the workspace Cargo.toml. This value is the minimum
+  //    Rust version of the crate, not a pin of a tool. A bump is an editorial
+  //    decision, so no rule touches it.
+}

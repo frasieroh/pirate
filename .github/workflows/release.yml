@@ -5,9 +5,15 @@
 #
 # This file is written by hand. It does not use cargo-dist. cargo-dist owns the
 # workflow file that it generates, so hand-written commit SHA pins do not
-# survive the next `dist generate`. cargo-dist also calls `cargo build`, and
-# `build.rs` stops when `web/dist` is absent. `cargo xtask dist` builds the web
-# assets first, so this workflow calls that command.
+# survive the next `dist generate`. That reason still holds. A second reason
+# does not: `build.rs` no longer stops when `web/dist` is absent. It warns and
+# builds, and the binary reports the error at run time. This workflow calls
+# `cargo xtask dist`, because that command builds the web assets first.
+#
+# mise.toml declares every tool version, and jdx/mise-action installs them.
+#
+# CAUTION: Do not add the `sha256:` input to jdx/mise-action. That checksum
+# holds for one platform, and this workflow runs on ubuntu and on macOS.
 #
 # Every `uses:` line carries the full 40-character commit SHA. The tag in the
 # trailing comment is documentation only. To upgrade an action, resolve the new
@@ -32,11 +38,6 @@ env:
   # ReleaseFast is for release builds only. Local work and tests use the
   # default, because the Zig compile is the slowest step of the build.
   LIBGHOSTTY_VT_SYS_OPTIMIZE: ReleaseFast
-  # The Zig cache reached 868 MB for six targets during the spike.
-  ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.toolchain/zig-cache
-  BUN_VERSION: "1.3.14"
-  CARGO_ZIGBUILD_VERSION: "0.23.0"
-  CARGO_DENY_VERSION: "0.20.2"
 
 jobs:
   guard:
@@ -44,6 +45,27 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # mise.toml declares every tool, and mise.lock holds a SHA-256 for each
+      # download. The action adds `--locked` when it finds that lock file, so
+      # this job installs the bytes that mise.lock names. cargo-deny comes from
+      # the same file.
+      - name: Install the pinned tools
+        uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+        with:
+          version: 2026.8.0
+          # This job is the fastest gate in the pipeline, and it runs cargo and
+          # cargo-deny only. Zig, bun and cargo-zigbuild cost minutes, so they
+          # stay out. Each name below is a key of `[tools]` in mise.toml.
+          install_args: "rust aqua:EmbarkStudios/cargo-deny"
+
+      # The registry cache stands before the two cargo steps below, because both
+      # of them read it.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/registry
+          key: guard-${{ hashFiles('Cargo.lock') }}
+          restore-keys: guard-
 
       # The workspace Cargo.toml holds the only version number. If the tag and
       # that number differ, stop before any build starts.
@@ -58,23 +80,16 @@ jobs:
             exit 1
           fi
 
+      # `--locked` fails when Cargo.lock does not answer Cargo.toml. This step
+      # also unpacks libghostty-vt-sys into the registry, and the step below
+      # reads the Ghostty commit out of that source.
+      - name: Download the crate sources
+        run: cargo fetch --locked
+
+      # This step also guards mise.lock. Renovate can raise a version in
+      # mise.toml, and it cannot write the checksums that mise.lock holds.
       - name: Make sure that every pin is exact
         run: cargo xtask verify-pins
-
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/bin/cargo-deny
-          key: guard-${{ env.CARGO_DENY_VERSION }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: guard-${{ env.CARGO_DENY_VERSION }}-
-
-      - name: Install cargo-deny
-        run: |
-          set -euo pipefail
-          if [ ! -x "$HOME/.cargo/bin/cargo-deny" ]; then
-            cargo install --locked "cargo-deny@${CARGO_DENY_VERSION}"
-          fi
 
       # The license allowlist and the RustSec advisory database. deny.toml holds
       # the allowlist and the one exception.
@@ -90,15 +105,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      # This step installs every tool in mise.toml, and it exports the `[env]`
+      # block of that file. ZIG_GLOBAL_CACHE_DIR comes from that block and points
+      # into .toolchain, which the cache below holds.
+      - name: Install the pinned tools
+        uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
         with:
-          bun-version: ${{ env.BUN_VERSION }}
-
-      - name: Install the pinned Rust toolchain
-        run: |
-          set -euo pipefail
-          rustup toolchain install
-          rustup show
+          version: 2026.8.0
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -106,8 +119,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             .toolchain
-          key: dist-macos-15-${{ hashFiles('Cargo.lock', '.zigversion', 'toolchain/zig.toml') }}
+          key: dist-macos-15-${{ hashFiles('Cargo.lock', 'mise.toml') }}
           restore-keys: dist-macos-15-
+
+      # `--locked` fails when Cargo.lock does not answer Cargo.toml. This gate
+      # stands before the build, and not inside it.
+      - name: Download the crate sources
+        run: cargo fetch --locked
 
       - name: Build the tarballs
         run: |
@@ -131,6 +149,36 @@ jobs:
             done
           done
 
+      # `crates/pirate/build.rs` writes a warning, and no longer stops, when
+      # `web/dist` is absent. A binary with zero embedded assets therefore
+      # compiles and ships. This run is the only proof that the assets are in
+      # the binary. `--version` proves nothing, because it returns before the
+      # asset count.
+      #
+      # This runner is arm64, so the step starts the arm64 binary alone. The
+      # x86_64 binary needs Rosetta, and no other step here depends on it.
+      - name: Make sure that the binary holds the web assets
+        run: |
+          set -euo pipefail
+          bin="target/aarch64-apple-darwin/release/pirate"
+          log="assets.log"
+          "$bin" --bind 127.0.0.1 --port 8099 >/dev/null 2>"$log" &
+          pid=$!
+          found=0
+          for _ in $(seq 1 50); do
+            if grep -q 'serving [0-9][0-9]* embedded assets' "$log"; then
+              found=1
+              break
+            fi
+            sleep 0.2
+          done
+          kill "$pid" 2>/dev/null || true
+          cat "$log"
+          if [ "$found" -ne 1 ]; then
+            echo "::error::$bin embeds no web asset."
+            exit 1
+          fi
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-macos
@@ -145,35 +193,27 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      # cargo-zigbuild is the linker driver for the four Linux targets, and this
+      # step installs it beside zig, bun and rust. The aqua backend takes the
+      # prebuilt binary, so this job compiles no tool.
+      - name: Install the pinned tools
+        uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
         with:
-          bun-version: ${{ env.BUN_VERSION }}
-
-      - name: Install the pinned Rust toolchain
-        run: |
-          set -euo pipefail
-          rustup toolchain install
-          rustup show
+          version: 2026.8.0
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ~/.cargo/bin/cargo-zigbuild
             .toolchain
-          key: dist-ubuntu-24.04-${{ env.CARGO_ZIGBUILD_VERSION }}-${{ hashFiles('Cargo.lock', '.zigversion', 'toolchain/zig.toml') }}
-          restore-keys: dist-ubuntu-24.04-${{ env.CARGO_ZIGBUILD_VERSION }}-
+          key: dist-ubuntu-24.04-${{ hashFiles('Cargo.lock', 'mise.toml') }}
+          restore-keys: dist-ubuntu-24.04-
 
-      # cargo-zigbuild is the linker driver for the four Linux targets. xtask
-      # supplies the pinned Zig on PATH.
-      - name: Install cargo-zigbuild
-        run: |
-          set -euo pipefail
-          if [ ! -x "$HOME/.cargo/bin/cargo-zigbuild" ]; then
-            cargo install --locked "cargo-zigbuild@${CARGO_ZIGBUILD_VERSION}"
-          fi
-          cargo zigbuild --version
+      # `--locked` fails when Cargo.lock does not answer Cargo.toml. This gate
+      # stands before the build, and not inside it.
+      - name: Download the crate sources
+        run: cargo fetch --locked
 
       - name: Build the tarballs
         run: |
@@ -204,13 +244,42 @@ jobs:
           done
 
       # No Linux binary ran during the spike. This step is the smoke test.
-      - name: Run the musl binary
+      #
+      # `crates/pirate/build.rs` writes a warning, and no longer stops, when
+      # `web/dist` is absent. A binary with zero embedded assets therefore
+      # compiles and ships. The index page below is the only proof that the
+      # assets are in this binary. `--version` proves nothing, because it
+      # returns before the server starts.
+      - name: Run the musl binary and request the index page
         run: |
           set -euo pipefail
           bin="target/x86_64-unknown-linux-musl/release/pirate"
           file "$bin"
           file "$bin" | grep -q static
           "$bin" --version
+          "$bin" --bind 127.0.0.1 --port 8099 &
+          pid=$!
+          served=0
+          for _ in $(seq 1 50); do
+            if curl -fsS -o /dev/null "http://127.0.0.1:8099/"; then
+              served=1
+              break
+            fi
+            sleep 0.2
+          done
+          if [ "$served" -ne 1 ]; then
+            echo "::error::pirate did not serve the index page within 10 seconds."
+            kill "$pid" 2>/dev/null || true
+            exit 1
+          fi
+          body=$(curl -fsS "http://127.0.0.1:8099/")
+          kill "$pid" 2>/dev/null || true
+          if ! printf '%s' "$body" | grep -q 'id="terminal"'; then
+            echo "::error::the index page has no terminal element."
+            printf '%s\n' "$body" | head -20
+            exit 1
+          fi
+          echo "the musl binary served the index page"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

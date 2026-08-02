@@ -1,102 +1,94 @@
-//! Toolchain acquisition: a pinned Zig, and the macOS SDK shim it needs.
+//! Toolchain acquisition: the tools of mise.toml, and the macOS SDK shim.
+//!
+//! mise installs every build tool. It compares each download against the
+//! SHA-256 in mise.lock. Some backends add a signature check, and `core:bun`
+//! and the two `aqua:` tools get the checksum only. This module therefore holds
+//! no downloader and no version number. mise does not solve the macOS SDK
+//! fault, so the shim stays here.
 
-use crate::{repo_root, run, Result};
+use crate::{repo_root, run_with_env, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-/// The Zig host triple, in the naming that ziglang.org uses.
-pub fn host_zig_triple() -> Result<&'static str> {
-    Ok(match (std::env::consts::ARCH, std::env::consts::OS) {
-        ("aarch64", "macos") => "aarch64-macos",
-        ("x86_64", "macos") => "x86_64-macos",
-        ("x86_64", "linux") => "x86_64-linux",
-        ("aarch64", "linux") => "aarch64-linux",
-        (a, o) => return Err(format!("unsupported host {a}-{o}").into()),
-    })
+/// mise reads a configuration file only when the file is trusted. This variable
+/// grants that trust for one child process.
+const TRUST_VAR: &str = "MISE_TRUSTED_CONFIG_PATHS";
+
+/// The install command for the host.
+#[cfg(target_os = "macos")]
+const INSTALL_MISE: &str = "brew install mise";
+#[cfg(not(target_os = "macos"))]
+const INSTALL_MISE: &str = "curl https://mise.run | sh";
+
+/// The first `mise` program on PATH that this process can run.
+fn find_mise() -> Result<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("mise");
+        if is_executable(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "`mise` is not on PATH. mise installs every tool of mise.toml. \
+         Install mise with `{INSTALL_MISE}`. Then run this command again."
+    )
+    .into())
 }
 
-pub struct ZigPin {
-    pub version: String,
-    pub sha256: String,
+/// True when the path is a file that holds an executable bit.
+///
+/// `execvp` steps over a PATH entry that it cannot run and reads the next one. A
+/// plain file test stops the whole run on a data file named `mise` that sits
+/// earlier on PATH.
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
-/// Read toolchain/zig.toml and check it against .zigversion.
-pub fn read_pin() -> Result<ZigPin> {
-    let root = repo_root();
-    let manifest = std::fs::read_to_string(root.join("toolchain/zig.toml"))?;
-    let doc: toml::Value = toml::from_str(&manifest)?;
+/// The value of MISE_TRUSTED_CONFIG_PATHS for the child process.
+///
+/// The variable is colon-separated, and a bare assignment drops every path that
+/// the caller already trusts. This function puts the repository first and keeps
+/// the rest. `join_paths` refuses a path that holds a colon, because such a path
+/// cannot survive the list form.
+fn trusted_paths(root: &Path) -> Result<String> {
+    let mut dirs: Vec<PathBuf> = vec![root.to_path_buf()];
+    if let Some(current) = std::env::var_os(TRUST_VAR) {
+        dirs.extend(std::env::split_paths(&current).filter(|dir| dir.as_path() != root));
+    }
+    let joined =
+        std::env::join_paths(&dirs).map_err(|e| format!("cannot build {TRUST_VAR}: {e}"))?;
+    joined
+        .into_string()
+        .map_err(|_| format!("{TRUST_VAR} holds bytes that are not UTF-8").into())
+}
 
+/// The pinned Zig version, from the one file that declares it.
+#[cfg(target_os = "macos")]
+fn zig_version() -> Result<String> {
+    let path = repo_root().join("mise.toml");
+    let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&path)?)?;
     let version = doc
-        .get("version")
+        .get("tools")
+        .and_then(|t| t.get("zig"))
         .and_then(|v| v.as_str())
-        .ok_or("toolchain/zig.toml has no `version`")?
-        .to_string();
-
-    let declared = std::fs::read_to_string(root.join(".zigversion"))?;
-    let declared = declared.trim();
-    if declared != version {
-        return Err(format!(
-            ".zigversion says {declared}, toolchain/zig.toml says {version}. \
-             These must be equal."
-        )
-        .into());
-    }
-
-    let triple = host_zig_triple()?;
-    let sha256 = doc
-        .get("checksums")
-        .and_then(|c| c.get(triple))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("toolchain/zig.toml has no checksum for {triple}"))?
-        .to_string();
-
-    Ok(ZigPin { version, sha256 })
-}
-
-/// Download and unpack the pinned Zig, unless it is already present.
-/// Returns the directory that holds the `zig` program.
-pub fn ensure_zig() -> Result<PathBuf> {
-    let pin = read_pin()?;
-    let triple = host_zig_triple()?;
-    let tc = repo_root().join(".toolchain");
-    let dir = tc.join(format!("zig-{triple}-{}", pin.version));
-
-    if dir.join("zig").is_file() {
-        return Ok(dir);
-    }
-
-    std::fs::create_dir_all(&tc)?;
-    let url = format!(
-        "https://ziglang.org/download/{v}/zig-{triple}-{v}.tar.xz",
-        v = pin.version
-    );
-    let tarball = tc.join("zig-download.tar.xz");
-
-    eprintln!("xtask: downloading zig {} for {triple}", pin.version);
-    run(
-        "curl",
-        &["-fsSL", &url, "-o", &tarball.to_string_lossy()],
-        &tc,
-    )?;
-
-    let got = sha256_file(&tarball)?;
-    if got != pin.sha256 {
-        let _ = std::fs::remove_file(&tarball);
-        return Err(format!(
-            "checksum mismatch for {url}\n  expected {}\n  got      {got}",
-            pin.sha256
-        )
-        .into());
-    }
-    eprintln!("xtask: checksum ok");
-
-    run("tar", &["xJf", &tarball.to_string_lossy()], &tc)?;
-    std::fs::remove_file(&tarball)?;
-
-    if !dir.join("zig").is_file() {
-        return Err(format!("zig not found at {} after unpack", dir.display()).into());
-    }
-    Ok(dir)
+        .ok_or("mise.toml has no `zig` under [tools]")?;
+    Ok(version.to_string())
 }
 
 /// A macOS SDK that Zig 0.15.2 can link against.
@@ -147,12 +139,17 @@ pub fn find_usable_sdk() -> Result<PathBuf> {
     }
 
     usable.sort();
+    // Name the Zig version when mise.toml gives one. An unreadable mise.toml is
+    // a different fault, and a blank version there reads as a broken message.
+    let zig = match zig_version() {
+        Ok(version) => format!("Zig {version}"),
+        Err(_) => "Zig".to_string(),
+    };
     usable.pop().ok_or_else(|| {
         format!(
             "no macOS SDK lists the target `{wanted}` in the first document of \
-             libSystem.B.tbd. Zig {} cannot link without one. Install the macOS 15 \
-             SDK, or build on a host whose SDK lists {wanted}.",
-            read_pin().map(|p| p.version).unwrap_or_default()
+             libSystem.B.tbd. {zig} cannot link without one. Install the macOS 15 \
+             SDK, or build on a host whose SDK lists {wanted}."
         )
         .into()
     })
@@ -191,33 +188,75 @@ pub fn ensure_shim(sdk: &Path) -> Result<PathBuf> {
 
 /// Every environment change that a build of libghostty-vt-sys needs.
 /// Returns pairs to set on the child process.
+///
+/// mise installs the tools first, and every part of the build runs with the
+/// result. A fresh clone therefore runs `cargo xtask dist` with no setup step.
 pub fn build_env() -> Result<Vec<(String, String)>> {
-    let zig_dir = ensure_zig()?;
+    let root = repo_root();
+    let mise = find_mise()?;
+    let mise = mise.to_string_lossy().into_owned();
 
-    // The shim comes before zig on the path, so that its `xcrun` wins. Only
-    // macOS needs it, and a `mut` binding on Linux would be an unused one.
+    // CAUTION: Set MISE_TRUSTED_CONFIG_PATHS on the child process only. A write
+    // to the global trust store of mise changes the machine outside this
+    // repository. `cargo xtask` already runs code from this repository, so trust
+    // in the mise.toml of this repository adds no new trust boundary.
+    let trusted = trusted_paths(&root)?;
+    let trust = vec![(TRUST_VAR.to_string(), trusted.clone())];
+
+    run_with_env(&mise, &["install"], &root, &trust)?;
+
+    let output = Command::new(&mise)
+        .args(["env", "--json"])
+        .current_dir(&root)
+        .env(TRUST_VAR, &trusted)
+        .output()
+        .map_err(|e| format!("failed to start `{mise}`: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`mise env --json` exited with {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let table = doc
+        .as_object()
+        .ok_or("`mise env --json` did not print a JSON object")?;
+    let mut env: Vec<(String, String)> = Vec::with_capacity(table.len());
+    for (key, value) in table {
+        let Some(value) = value.as_str() else {
+            continue;
+        };
+        env.push((key.clone(), value.to_string()));
+    }
+
     #[cfg(target_os = "macos")]
-    let prefix = {
+    {
         let sdk = find_usable_sdk()?;
         eprintln!("xtask: using macOS SDK {}", sdk.display());
-        vec![ensure_shim(&sdk)?, zig_dir]
-    };
-    #[cfg(not(target_os = "macos"))]
-    let prefix = vec![zig_dir];
+        let shim = ensure_shim(&sdk)?;
+        let path = env
+            .iter_mut()
+            .find(|(key, _)| key == "PATH")
+            .ok_or("`mise env --json` gave no PATH")?;
 
-    let existing = std::env::var("PATH").unwrap_or_default();
-    let mut path = std::env::join_paths(prefix)?.to_string_lossy().into_owned();
-    path.push(':');
-    path.push_str(&existing);
+        // CAUTION: Put the shim directory at the front of PATH. The shim must
+        // answer first. Otherwise Zig reads the newest SDK. The link then stops
+        // with about twenty undefined libc symbols.
+        //
+        // mise puts its Zig directory near the front, and /usr/bin holds the
+        // real `xcrun`. `join_paths` refuses a directory that holds a colon,
+        // because such a directory cannot survive a PATH string.
+        let mut dirs: Vec<PathBuf> = vec![shim];
+        dirs.extend(std::env::split_paths(path.1.as_str()));
+        path.1 = std::env::join_paths(&dirs)
+            .map_err(|e| format!("cannot put the shim directory on PATH: {e}"))?
+            .into_string()
+            .map_err(|_| "PATH holds bytes that are not UTF-8")?;
+    }
 
-    let mut env = vec![("PATH".to_string(), path)];
-    env.push((
-        "ZIG_GLOBAL_CACHE_DIR".to_string(),
-        repo_root()
-            .join(".toolchain/zig-cache")
-            .to_string_lossy()
-            .into_owned(),
-    ));
     Ok(env)
 }
 

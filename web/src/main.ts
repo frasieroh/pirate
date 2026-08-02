@@ -1,6 +1,20 @@
 import { FitAddon, init, Terminal } from "ghostty-web";
 import "./style.css";
+import { installFont } from "./font";
+import { installInput } from "./input";
+import { chords, setAction, startKeys } from "./keys";
 import { requireSession, sessionLost } from "./login";
+import {
+  initMenu,
+  menuState,
+  setFitHandler,
+  setMenuStatus,
+  type StatusState,
+  toggleMenu,
+} from "./menu";
+import { prefs, setPrefs } from "./prefs";
+import type { Runtime } from "./runtime";
+import { installTheme } from "./theme";
 import {
   decodeExitStatus,
   encodeInput,
@@ -16,14 +30,18 @@ const RESIZE_DEBOUNCE_MS = 100;
 const RECONNECT_MIN_MS = 250;
 /** The largest reconnect wait. */
 const RECONNECT_MAX_MS = 5000;
+/**
+ * The wait before the first repeat of a held key, in milliseconds.
+ *
+ * The client generates its own key repeat, so this delay is a fixed contract
+ * and not a setting of the operating system. `src/input.ts` reads it from
+ * `state.repeatDelayMs`. The operator cannot change it.
+ */
+const REPEAT_DELAY_MS = 600;
 
-const status = document.getElementById("status")!;
-
-type StatusState = "ok" | "warn" | "error";
-
+/** The session status. It goes to the header of the menu. */
 function report(text: string, state: StatusState = "ok"): void {
-  status.textContent = text;
-  status.dataset.state = state;
+  setMenuStatus(text, state);
 }
 
 /**
@@ -48,6 +66,20 @@ interface ClientState {
   exitStatus: number | null;
   /** The debounce of the resize observer, in milliseconds. */
   resizeDebounceMs: number;
+  /** The font size of the terminal, in pixels. */
+  fontSize: number;
+  /** The key repeat rate, in keys per second. */
+  repeatRate: number;
+  /** The wait before the first repeat, in milliseconds. */
+  repeatDelayMs: number;
+  /** The theme slot that is active. */
+  mode: "dark" | "light";
+  /** The name of the theme of the active slot. */
+  themeName: string;
+  /** The state of the menu. */
+  menu: "open" | "collapsed" | "hidden";
+  /** The chord of each binding. */
+  keys: Record<string, string>;
 }
 
 async function main(): Promise<void> {
@@ -55,14 +87,28 @@ async function main(): Promise<void> {
   // login box.
   await requireSession();
 
+  const stored = prefs();
+
+  // The registry attaches before ghostty-web attaches its own handler, so the
+  // capture listener of the registry runs first. A matched chord then never
+  // reaches the terminal.
+  startKeys(stored.keys, (next) => {
+    setPrefs({ keys: next });
+  });
+  setAction("toggleMenu", toggleMenu);
+  // `installFont` gives `fontIncrease` and `fontDecrease` their action.
+  initMenu();
+
   // init() loads the wasm module. ghostty-web 0.4.0 inlines it as a data URI
   // inside its ESM file, so this needs no separate asset request.
   await init();
 
   const container = document.getElementById("terminal")!;
   const term = new Terminal({
-    fontSize: 14,
-    theme: { background: "#16161e", foreground: "#a9b1d6" },
+    fontSize: stored.fontSize,
+    // The theme of the active slot. `installTheme` sets it again on every
+    // later change, and it also sets the `--pirate-*` custom properties.
+    theme: stored[stored.mode],
   });
   const fit = new FitAddon();
   term.loadAddon(fit);
@@ -73,6 +119,19 @@ async function main(): Promise<void> {
     connected: false,
     exitStatus: null,
     resizeDebounceMs: RESIZE_DEBOUNCE_MS,
+    fontSize: stored.fontSize,
+    repeatRate: stored.repeatRate,
+    repeatDelayMs: REPEAT_DELAY_MS,
+    mode: stored.mode,
+    themeName: stored[stored.mode].name,
+    // The menu and the registry own these two values, so both are getters. A
+    // reader of `state` then gets the value of the moment.
+    get menu() {
+      return menuState();
+    },
+    get keys() {
+      return chords();
+    },
   };
 
   let socket: WebSocket | undefined;
@@ -116,14 +175,29 @@ async function main(): Promise<void> {
 
   // A window drag emits one resize event for each frame of the drag. The
   // debounce holds the socket quiet until the drag stops.
-  const observer = new ResizeObserver(() => {
+  function scheduleFit(): void {
     if (resizeTimer !== undefined) {
       clearTimeout(resizeTimer);
     }
     resizeTimer = window.setTimeout(applyFit, RESIZE_DEBOUNCE_MS);
-  });
+  }
+
+  const observer = new ResizeObserver(scheduleFit);
   observer.observe(container);
   applyFit();
+
+  // A change of the cell size needs a new fit. `setFitHandler` gives the menu
+  // this debounced fit, and `requestFit` of `src/menu.ts` calls it. One change
+  // then gives one resize frame, on the same debounce as a window drag.
+  setFitHandler(scheduleFit);
+
+  // ── the feature modules ─────────────────────────────────────────────────
+  // Each feature owns one module and gets its handles here. `main.ts` stays
+  // wiring, and two features never collide in one file.
+  const runtime: Runtime = { term, container, state, refit: scheduleFit };
+  installTheme(runtime);
+  installFont(runtime);
+  installInput(runtime);
 
   // ── frames ──────────────────────────────────────────────────────────────
   function onFrame(data: unknown): void {
@@ -176,7 +250,7 @@ async function main(): Promise<void> {
         // socket closes. A new socket is therefore a new shell. Clear the
         // screen, so that no text of the dead shell stays on it.
         term.reset();
-        report(`connected to a new shell. Shell ${state.connections - 1} ended.`, "warn");
+        report(`pirate connected to a new shell. Shell ${state.connections - 1} ended.`, "warn");
       } else {
         report("connected");
       }

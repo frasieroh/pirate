@@ -41,12 +41,16 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     std::fs::create_dir_all(&out)?;
 
-    // Stage 1 runs once. Every target embeds the same web assets.
-    cmd_web()?;
-
+    // The environment comes first, because the web build runs `bun` and mise
+    // pins the bun version.
     let mut env = toolchain::build_env()?;
+
+    // The web build runs once. Every target embeds the same web assets.
+    cmd_web(&env)?;
+
     // ReleaseFast is for release builds only. Local work and tests use the
-    // default, because the Zig compile is the slowest step of the build.
+    // default, because the Zig compile is the slowest step of the build. The
+    // web build ran already, so this variable reaches the Zig build only.
     env.push((
         "LIBGHOSTTY_VT_SYS_OPTIMIZE".to_string(),
         "ReleaseFast".to_string(),

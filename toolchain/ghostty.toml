@@ -11,6 +11,6 @@
 # `cargo xtask verify-pins` compares this commit against the crate source when
 # that source is in the cargo registry cache.
 #
-# This commit declares .minimum_zig_version = "0.15.2". See toolchain/zig.toml.
+# This commit declares .minimum_zig_version = "0.15.2". See mise.toml.
 libghostty_vt_sys = "0.2.1"
 commit = "a887df42c56f6de86c0fe6da9c4eeca37931e083"

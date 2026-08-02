@@ -5,8 +5,9 @@
 //! beside it. With `--assets-dir` they come from disk instead, which lets the
 //! Vite dev server supply them without a Rust rebuild.
 //!
-//! Stage 1 writes a `.gz` and a `.br` beside each compressible file. This module
-//! chooses one from the Accept-Encoding header, and falls back to the plain file.
+//! A Vite plugin writes a `.gz` and a `.br` beside each compressible file in
+//! web/dist. This module chooses one from the Accept-Encoding header, and falls
+//! back to the plain file.
 
 use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};

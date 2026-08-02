@@ -45,6 +45,13 @@ interface PirateGlobal {
     connected: boolean;
     exitStatus: number | null;
     resizeDebounceMs: number;
+    fontSize: number;
+    repeatRate: number;
+    repeatDelayMs: number;
+    mode: "dark" | "light";
+    themeName: string;
+    menu: "open" | "collapsed" | "hidden";
+    keys: Record<string, string>;
   };
 }
 
@@ -115,11 +122,20 @@ export async function openClient(options?: {
   });
   await page.goto(`${stub.url}/`);
   if (options?.waitForConnection !== false) {
-    await page.waitForFunction(
-      () => (globalThis as unknown as PirateWindow).__pirate?.state.connected === true,
-    );
+    await waitForConnected(page);
   }
   return page;
+}
+
+/**
+ * Wait until the client reports an open socket.
+ *
+ * A test that reloads the page calls this after the reload.
+ */
+export async function waitForConnected(page: Page): Promise<void> {
+  await page.waitForFunction(
+    () => (globalThis as unknown as PirateWindow).__pirate?.state.connected === true,
+  );
 }
 
 /** Open a client, run the body, then close the browser context. */
@@ -243,9 +259,19 @@ export function clientState(page: Page): Promise<PirateGlobal["state"]> {
   }));
 }
 
-/** The text of the status line. */
+/**
+ * The text of the session status.
+ *
+ * The status sits in the header of the menu. The client has no status bar: a
+ * bar in the layout flow changes the height of the terminal.
+ */
 export async function statusText(page: Page): Promise<string> {
-  return (await page.textContent("#status")) ?? "";
+  return (await page.textContent("#menu-status")) ?? "";
+}
+
+/** The state of the menu panel: `open`, `collapsed`, or `hidden`. */
+export async function menuState(page: Page): Promise<string> {
+  return (await page.getAttribute("#menu", "data-state")) ?? "";
 }
 
 /**
