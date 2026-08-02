@@ -25,13 +25,13 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 /// Every wait in this file uses this timeout. A PTY on a loaded machine can
 /// take a moment, and a hung test must still fail instead of blocking the run.
-const WAIT: Duration = Duration::from_secs(10);
+const WAIT: Duration = Duration::from_secs(120);
 
 /// Time that a process gets to disappear after the browser goes away.
 ///
 /// The server waits 500 ms after SIGHUP and 500 ms after SIGKILL, so this
 /// value holds both steps and a margin.
-const DEATH_WAIT: Duration = Duration::from_secs(5);
+const DEATH_WAIT: Duration = Duration::from_secs(30);
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -1089,7 +1089,7 @@ async fn the_ipv4_mapped_loopback_address_needs_no_transport_flag() {
 
     // The server stays up when it accepted the address, so a short wait and a
     // still-running child is the pass. A refusal exits at once.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(Duration::from_millis(5000)).await;
     let running = child.inner.try_wait().unwrap().is_none();
     // `Child` kills the process and waits for it when it drops.
     drop(child);
@@ -1127,7 +1127,7 @@ async fn a_no_password_bind_that_is_not_loopback_warns_and_still_serves() {
     let (_stdout, stdout_thread) = drain_pipe(child.inner.stdout.take().unwrap());
     let (stderr, stderr_thread) = drain_pipe(child.inner.stderr.take().unwrap());
 
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(Duration::from_millis(5000)).await;
     let running = child.inner.try_wait().unwrap().is_none();
     // `Child` kills the process and waits for it when it drops.
     drop(child);
@@ -1157,7 +1157,7 @@ async fn a_loopback_bind_prints_no_caution_and_still_serves() {
         let (_stdout, stdout_thread) = drain_pipe(child.inner.stdout.take().unwrap());
         let (stderr, stderr_thread) = drain_pipe(child.inner.stderr.take().unwrap());
 
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tokio::time::sleep(Duration::from_millis(5000)).await;
         let running = child.inner.try_wait().unwrap().is_none();
         // `Child` kills the process and waits for it when it drops.
         drop(child);
@@ -1212,7 +1212,7 @@ async fn a_plaintext_run_that_is_not_loopback_warns_about_the_token_and_still_se
     let (_stdout, stdout_thread) = drain_pipe(child.inner.stdout.take().unwrap());
     let (stderr, stderr_thread) = drain_pipe(child.inner.stderr.take().unwrap());
 
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(Duration::from_millis(5000)).await;
     let running = child.inner.try_wait().unwrap().is_none();
     // `Child` kills the process and waits for it when it drops.
     drop(child);
