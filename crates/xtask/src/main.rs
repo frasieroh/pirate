@@ -165,6 +165,15 @@ fn cmd_version(version: &str) -> Result<()> {
         return Err(format!("`{version}` is not x.y.z").into());
     }
     pins::write_version(version)?;
+    // Cargo.lock records the version of each workspace member. CI runs
+    // `cargo fetch --locked`, which fails when the lock file still holds the
+    // old version.
+    run_with_env(
+        "cargo",
+        &["update", "--workspace", "--offline"],
+        &repo_root(),
+        &[],
+    )?;
     eprintln!("xtask: version set to {version}");
     Ok(())
 }

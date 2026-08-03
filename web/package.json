@@ -1,16 +1,4 @@
 {
-  "name": "pirate-web",
-  "private": true,
-  "version": "0.1.0",
-  "type": "module",
-  "packageManager": "bun@1.3.14",
-  "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.tests.json && tsc --noEmit -p tsconfig.e2e.json",
-    "test": "vite build && bun test tests bench --timeout 30000",
-    "test:e2e": "vite build && PIRATE_E2E=1 bun test ./e2e/*.e2e.ts --timeout 120000"
-  },
   "dependencies": {
     "ghostty-web": "0.4.0"
   },
@@ -19,5 +7,17 @@
     "playwright": "1.57.0",
     "typescript": "7.0.2",
     "vite": "8.2.0"
-  }
+  },
+  "name": "pirate-web",
+  "packageManager": "bun@1.3.14",
+  "private": true,
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite",
+    "test": "vite build && bun test tests bench --timeout 30000",
+    "test:e2e": "vite build && PIRATE_E2E=1 bun test ./e2e/*.e2e.ts --timeout 120000",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.tests.json && tsc --noEmit -p tsconfig.e2e.json"
+  },
+  "type": "module",
+  "version": "0.1.4"
 }
