@@ -134,7 +134,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // that address does not exist until the bind above resolves the port.
     let addr = SocketAddr::new(args.bind, port);
     // The error of `bind` names no address, and the port can come from a
-    // default. This message states the address that the bind refused.
+    // default. This message states the address that the bind refused. The test
+    // `the_default_port_is_10433_on_tls_and_8080_on_plaintext` reads this text.
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("the bind to {addr} failed: {e}"))?;
@@ -167,14 +168,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // These are the names of the certificates. The browser matches the name
-    // that the operator typed against this list, and pirate compares no name
-    // itself; the browser alone judges the match.
+    // that the operator typed against this list. pirate compares no name
+    // itself, and the browser alone judges the match.
     //
-    // CAUTION: Every name here comes from `tls::certificate_names`, which
-    // pirate READ BACK from the certificate that it serves. An earlier line
-    // called the generator a second time and printed what the generator was
-    // asked for, so a name that the certificate dropped still reached the
-    // operator.
+    // Every name here comes from `tls::certificate_names`, which reads the
+    // certificate that pirate serves. The test in `tests/tls.rs` named
+    // `the_generated_certificate_covers_the_loopback_names_and_the_system_hostname`
+    // holds that.
     //
     // With `--cert`, pirate can serve two certificates, so this block reports
     // both: the supplied certificate first, and the generated fallback that

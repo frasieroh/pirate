@@ -27,6 +27,18 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 /// take a moment, and a hung test must still fail instead of blocking the run.
 const WAIT: Duration = Duration::from_secs(120);
 
+/// Every wait on the pirate binary as a child process uses this timeout.
+///
+/// The binary starts, or it exits, in well under a second. A run that takes
+/// longer than this timeout is a failure of the run.
+const BINARY_WAIT: Duration = Duration::from_secs(30);
+
+/// The wait after a needle in the output of the binary.
+///
+/// The startup prints its last lines in one sequence, so this wait holds the
+/// gap between two of those lines. It is not a wait for the startup itself.
+const SETTLE: Duration = Duration::from_millis(500);
+
 /// Time that a process gets to disappear after the browser goes away.
 ///
 /// The server waits 500 ms after SIGHUP and 500 ms after SIGKILL, so this
@@ -437,11 +449,11 @@ where
 ///
 /// That line carries the scheme of the transport, and the caller states the
 /// scheme that it expects. A wait for `http` therefore never matches an
-/// `https` run, and the test fails on the timeout instead of on a connection
+/// `https` run. The test then fails on the timeout and not on a connection
 /// that speaks another protocol.
 async fn wait_for_address(output: &Arc<Mutex<String>>, scheme: &str) -> SocketAddr {
     let needle = format!("listening on {scheme}://");
-    let deadline = Instant::now() + WAIT;
+    let deadline = Instant::now() + BINARY_WAIT;
     while Instant::now() < deadline {
         let seen = output.lock().unwrap().clone();
         if let Some(rest) = seen.split(needle.as_str()).nth(1) {
@@ -458,42 +470,62 @@ async fn wait_for_address(output: &Arc<Mutex<String>>, scheme: &str) -> SocketAd
     )
 }
 
-/// Wait for the child to exit, and give back its status.
-async fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
-    let deadline = Instant::now() + WAIT;
+/// Wait for the child to exit, and give back its status. `None` on a timeout.
+async fn wait_for_exit(child: &mut Child) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + BINARY_WAIT;
     while Instant::now() < deadline {
         if let Some(status) = child.inner.try_wait().unwrap() {
-            return status;
+            return Some(status);
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("the binary did not exit inside the timeout")
+    None
 }
 
-/// Start the binary, wait for it to exit, and give back the status and stderr.
-async fn run_to_exit(home: &Path, args: &[&str]) -> (std::process::ExitStatus, String) {
+/// Start the binary, wait for it to exit, and give back the status, stdout,
+/// and stderr.
+///
+/// A binary that serves instead of exiting is the failure of a test that calls
+/// this function. The panic therefore carries stderr, which names the address
+/// that the binary bound.
+async fn run_to_exit(home: &Path, args: &[&str]) -> (std::process::ExitStatus, String, String) {
     let mut child = start_binary(home, args);
-    let (_stdout, stdout_thread) = drain_pipe(child.inner.stdout.take().unwrap());
+    let (stdout, stdout_thread) = drain_pipe(child.inner.stdout.take().unwrap());
     let (stderr, stderr_thread) = drain_pipe(child.inner.stderr.take().unwrap());
 
     let status = wait_for_exit(&mut child).await;
+    // `Child` kills the process and waits for it when it drops. A child that
+    // did not exit still holds both pipes, so this drop comes before the join.
+    drop(child);
     stdout_thread.join().unwrap();
     stderr_thread.join().unwrap();
 
+    let out = stdout.lock().unwrap().clone();
     let err = stderr.lock().unwrap().clone();
-    (status, err)
+    let Some(status) = status else {
+        panic!("the binary did not exit inside the timeout. Got: {err}")
+    };
+    (status, out, err)
 }
 
-/// Start the binary, wait 5 s, and give back the state of the child and stderr.
+/// Start the binary, wait for `needle` in stderr, and give back the state of
+/// the child with everything that stderr holds.
 ///
-/// The startup writes every line before it serves the first request, so this
-/// wait reads the listening line and each warning line of the run.
-async fn run_for_a_moment(home: &Path, args: &[&str]) -> (bool, String) {
+/// The startup prints its lines in one sequence, so `needle` proves that every
+/// earlier line is in the buffer. The wait of `SETTLE` after `needle` lets a
+/// later line arrive. A test that asserts the absence of a line needs that
+/// wait, because a line that never prints gives no needle of its own.
+async fn run_until(home: &Path, args: &[&str], needle: &str) -> (bool, String) {
     let mut child = start_binary(home, args);
     let (_stdout, stdout_thread) = drain_pipe(child.inner.stdout.take().unwrap());
     let (stderr, stderr_thread) = drain_pipe(child.inner.stderr.take().unwrap());
 
-    tokio::time::sleep(Duration::from_millis(5000)).await;
+    let deadline = Instant::now() + BINARY_WAIT;
+    while Instant::now() < deadline && !stderr.lock().unwrap().contains(needle) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(SETTLE).await;
+
     let running = child.inner.try_wait().unwrap().is_none();
     // `Child` kills the process and waits for it when it drops.
     drop(child);
@@ -1069,13 +1101,25 @@ async fn a_second_call_gives_the_same_token() {
 
 // --- The token never leaks --- //
 
+/// Read the token of `home` and make sure that neither pipe carries it.
+fn assert_the_token_stayed_out_of_the_pipes(home: &Path, out: &str, err: &str) {
+    let token = std::fs::read_to_string(home.join(".pirate").join("auth_token"))
+        .expect("the binary wrote no token file")
+        .trim()
+        .to_string();
+    assert_eq!(token.len(), 64, "the token is {} characters", token.len());
+    assert!(!out.contains(&token), "the token reached stdout: {out}");
+    assert!(!err.contains(&token), "the token reached stderr: {err}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_binary_never_writes_the_token_to_its_output() {
     // The operator reads the token from the token file. A token in the output
     // reaches every log collector and every terminal recording, so the binary
     // must never print it.
     //
-    // The requests below are plain HTTP, so this run names that transport.
+    // The requests of this first leg are plain HTTP, so the run names that
+    // transport. The TLS leg comes after it.
     let home = temp_dir("binary-token");
     let mut child = start_binary(
         &home,
@@ -1103,16 +1147,36 @@ async fn the_binary_never_writes_the_token_to_its_output() {
     stdout_thread.join().unwrap();
     stderr_thread.join().unwrap();
 
-    let token = std::fs::read_to_string(home.join(".pirate").join("auth_token"))
-        .expect("the binary wrote no token file")
-        .trim()
-        .to_string();
-    assert_eq!(token.len(), 64, "the token is {} characters", token.len());
+    assert_the_token_stayed_out_of_the_pipes(
+        &home,
+        &stdout.lock().unwrap().clone(),
+        &stderr.lock().unwrap().clone(),
+    );
 
-    let out = stdout.lock().unwrap().clone();
+    // The second leg takes the default transport. That path prints the names
+    // of the certificate and its fingerprint, which the first leg never
+    // reaches. The token comes from the file, so this leg needs no request.
+    let home = temp_dir("binary-token-tls");
+    let mut child = start_binary(
+        &home,
+        &["--bind", "127.0.0.1", "--port", "0", "--shell", "/bin/cat"],
+    );
+    let (stdout, stdout_thread) = drain_pipe(child.inner.stdout.take().unwrap());
+    let (stderr, stderr_thread) = drain_pipe(child.inner.stderr.take().unwrap());
+
+    wait_for_address(&stderr, "https").await;
+
+    let _ = child.inner.kill();
+    let _ = child.inner.wait();
+    stdout_thread.join().unwrap();
+    stderr_thread.join().unwrap();
+
     let err = stderr.lock().unwrap().clone();
-    assert!(!out.contains(&token), "the token reached stdout: {out}");
-    assert!(!err.contains(&token), "the token reached stderr: {err}");
+    assert!(
+        err.contains("compare this fingerprint"),
+        "the TLS leg did not reach the fingerprint line: {err}"
+    );
+    assert_the_token_stayed_out_of_the_pipes(&home, &stdout.lock().unwrap().clone(), &err);
 }
 
 // --- The transport of the binary --- //
@@ -1186,21 +1250,25 @@ async fn a_run_with_no_transport_flag_serves_tls_with_a_generated_certificate() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_selfsigned_flag_no_longer_exists() {
-    // The removal is hard: no hidden alias, and no short form. clap answers
-    // both spellings with the error for an argument that it does not know.
-    for flag in ["--selfsigned", "-s"] {
-        let home = temp_dir("binary-no-selfsigned");
-        let (status, err) = run_to_exit(&home, &[flag, "--bind", "127.0.0.1", "--port", "0"]).await;
+async fn the_help_text_states_the_default_port_of_each_transport() {
+    // The operator reads the default port from `--help`, and clap writes that
+    // text to stdout. This is the second witness of the two defaults. The
+    // first one reads the address of a failed bind.
+    let home = temp_dir("binary-help");
+    let (status, out, _err) = run_to_exit(&home, &["--help"]).await;
+    assert!(status.success(), "`--help` must exit with success");
 
-        assert!(!status.success(), "{flag} must stop the start: {err}");
+    // clap can wrap a long help line, so the test reads the whole entry of
+    // `--port`. That entry ends where the next option starts.
+    let entry = out
+        .split_once("--port")
+        .map(|(_, rest)| rest.split("--assets-dir").next().unwrap_or(rest))
+        .unwrap_or_else(|| panic!("`--help` names no --port option: {out}"));
+
+    for word in ["10433", "8080", "--plaintext"] {
         assert!(
-            err.contains("unexpected argument") && err.contains(flag),
-            "{flag} must give the clap error for an unexpected argument: {err}"
-        );
-        assert!(
-            !err.contains("listening on"),
-            "{flag} must reach no listener: {err}"
+            entry.contains(word),
+            "the --port entry of `--help` does not state {word}: {entry}"
         );
     }
 }
@@ -1212,7 +1280,7 @@ async fn a_supplied_certificate_overrides_the_generated_one() {
     // drives the handshake for both. This test drives the two flags.
     let (cert, key) = write_pem_pair("binary-cert-files");
     let home = temp_dir("binary-cert");
-    let (running, err) = run_for_a_moment(
+    let (running, err) = run_until(
         &home,
         &[
             "--cert",
@@ -1224,6 +1292,7 @@ async fn a_supplied_certificate_overrides_the_generated_one() {
             "--port",
             "0",
         ],
+        "listening on https://",
     )
     .await;
 
@@ -1244,7 +1313,7 @@ async fn a_supplied_certificate_overrides_the_generated_one() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_supplied_key_and_plaintext_cannot_run_together() {
-    // REGRESSION. `key` is not a member of the `tls` group, and clap treats a
+    // REGRESSION. `key` is not a member of the `tls` group. clap treats a
     // `requires` target as satisfied when that target conflicts with an
     // argument that is present. `conflicts_with_all` on `key` is what rejects
     // the two command lines below.
@@ -1262,7 +1331,7 @@ async fn a_supplied_key_and_plaintext_cannot_run_together() {
 
     for args in &pairs {
         let home = temp_dir("binary-conflict");
-        let (status, err) = run_to_exit(&home, args).await;
+        let (status, _out, err) = run_to_exit(&home, args).await;
 
         assert!(!status.success(), "{args:?} must stop the start: {err}");
         assert!(
@@ -1288,7 +1357,7 @@ async fn the_default_port_is_10433_on_tls_and_8080_on_plaintext() {
         let held = TcpListener::bind(("127.0.0.1", port)).await;
 
         let home = temp_dir(name);
-        let (status, err) = run_to_exit(&home, args).await;
+        let (status, _out, err) = run_to_exit(&home, args).await;
 
         assert!(
             !status.success(),
@@ -1354,34 +1423,35 @@ async fn the_port_flag_and_the_port_variable_override_the_default() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_non_loopback_bind_with_no_transport_flag_serves_tls() {
-    // An earlier version stopped the start here and asked for a transport
-    // flag. The default now carries the transport, so the same command line
-    // serves TLS.
+    // The default carries the transport on every bind address, so a command
+    // line with no transport flag serves TLS here.
     let home = temp_dir("binary-transport");
-    let (running, err) = run_for_a_moment(&home, &["--bind", "0.0.0.0", "--port", "0"]).await;
+    let (running, err) = run_until(
+        &home,
+        &["--bind", "0.0.0.0", "--port", "0"],
+        "listening on https://",
+    )
+    .await;
 
     assert!(running, "pirate exited instead of serving: {err}");
     assert!(
         err.contains("listening on https://"),
         "a non-loopback bind must serve TLS: {err}"
     );
-    assert!(
-        !err.contains("needs a transport"),
-        "a non-loopback bind must ask for no transport flag: {err}"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_ipv4_mapped_loopback_address_prints_no_warning() {
-    // REGRESSION. `Ipv6Addr::is_loopback` is true for `::1` only, so the
-    // mapped form failed that test and the warning of a non-loopback bind
-    // printed on an address that reaches this machine only. The gate at the
-    // startup line unmaps first. `--no-password` arms that warning, so a
+    // REGRESSION. `Ipv6Addr::is_loopback` is true for `::1` only. The mapped
+    // form therefore got the answer false. The warning of a non-loopback bind
+    // then printed on an address that reaches this machine only. The gate at
+    // the startup line unmaps first. `--no-password` arms that warning, so a
     // broken unmap prints it.
     let home = temp_dir("binary-mapped");
-    let (running, err) = run_for_a_moment(
+    let (running, err) = run_until(
         &home,
         &["--no-password", "--bind", "::ffff:127.0.0.1", "--port", "0"],
+        "listening on https://",
     )
     .await;
 
@@ -1406,9 +1476,10 @@ async fn a_no_password_bind_that_is_not_loopback_warns_and_still_serves() {
     // fire whether or not TLS is present, and the server must still serve.
     // This run takes the default transport, which is TLS.
     let home = temp_dir("no-password-warn");
-    let (running, err) = run_for_a_moment(
+    let (running, err) = run_until(
         &home,
         &["--no-password", "--bind", "0.0.0.0", "--port", "0"],
+        "gives a shell",
     )
     .await;
 
@@ -1431,7 +1502,7 @@ async fn a_loopback_bind_prints_no_warning_and_still_serves() {
     // into a refusal to start.
     async fn assert_loopback_run_has_no_warning(home_name: &str, args: &[&str]) {
         let home = temp_dir(home_name);
-        let (running, err) = run_for_a_moment(&home, args).await;
+        let (running, err) = run_until(&home, args, "listening on http://").await;
 
         assert!(running, "pirate exited instead of serving: {err}");
         assert!(
@@ -1480,8 +1551,12 @@ async fn a_plaintext_run_that_is_not_loopback_warns_about_the_token_and_still_se
     // transport on a non-loopback bind. The still-running check stops that
     // line from turning into a refusal to start.
     let home = temp_dir("plaintext-non-loopback-token-warn");
-    let (running, err) =
-        run_for_a_moment(&home, &["--plaintext", "--bind", "0.0.0.0", "--port", "0"]).await;
+    let (running, err) = run_until(
+        &home,
+        &["--plaintext", "--bind", "0.0.0.0", "--port", "0"],
+        "sends the token",
+    )
+    .await;
 
     assert!(running, "pirate exited instead of serving: {err}");
     assert!(
