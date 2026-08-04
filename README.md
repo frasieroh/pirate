@@ -6,7 +6,7 @@ pirate is a terminal emulator proxy, like gotty or ttyd. It's based on ghostty-w
 
 - A full xterm256-color terminal
 - Authentication, see `$HOME/.pirate/auth_token`
-- TLS by default, with a self-signed certificate generated at startup
+- TLS by default, with a self-signed certificate that pirate generates at startup
 - iTerm2-compatible theming
 
 ## Quickstart
@@ -19,7 +19,7 @@ mise install
 cargo xtask build
 ```
 
-By default, pirate serves TLS on every bind address, the loopback address included. The default port is 10433. The `--plaintext` flag serves plain HTTP on port 8080 instead.
+By default, pirate serves TLS on every bind address, the loopback address included. The default port is 10433. With the `--plaintext` flag, pirate serves plain HTTP on port 8080 instead.
 
 Run the server:
 
