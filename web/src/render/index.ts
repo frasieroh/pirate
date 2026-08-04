@@ -17,7 +17,7 @@
  *     grid.draw(term);
  *
  * The caller owns the frame loop. `draw` is cheap when nothing changed: it
- * writes no cell and it calls `render` one time.
+ * writes no cell, and it presents no canvas.
  */
 
 import init, {
@@ -112,6 +112,29 @@ export class GridRenderer {
     canvas.id = `pirate-grid-${canvasCount}`;
     container.append(canvas);
 
+    // Take the WebGL2 context before `@beamterm/renderer` takes it, and ask for
+    // `preserveDrawingBuffer`. `getContext` gives back the context that the
+    // canvas already holds, and it ignores the second argument at that point,
+    // so the later call inside the wasm module reuses this context with this
+    // attribute. The wasm module passes only the context name to `getContext`,
+    // so this attribute is not reachable through the API of the package.
+    //
+    // The drawing buffer then holds the paint after the frame composites, and a
+    // reader outside the paint task can measure the canvas.
+    //
+    // Measurement, in Chromium with `--enable-unsafe-swiftshader`. Without this
+    // call, a read in the same task as `render` gives 167,176,216,255 and a read
+    // after two animation frames gives 0,0,0,0. With this call, both reads give
+    // 167,176,216,255.
+    //
+    // The attribute costs nothing that this measurement can see. On an idle 109
+    // by 38 terminal, an animation frame loop that presents the canvas on every
+    // frame ran at 22 frames per second both with the attribute and without it,
+    // and a `setTimeout` of 100 ms fired every 195 ms in both cases. The cost of
+    // a present belongs to the present, not to this attribute. `draw` presents
+    // only for a frame that paints, for the reason that `draw` states.
+    canvas.getContext("webgl2", { preserveDrawingBuffer: true });
+
     // `auto_resize_canvas_css` is false, so this module owns the CSS size of
     // the canvas. With true, `resize` writes the pixel count of the backing
     // store into the CSS size, and the canvas then covers `devicePixelRatio`
@@ -128,14 +151,6 @@ export class GridRenderer {
     grid.resize(first.cols, first.rows);
     return grid;
   }
-
-  /**
-   * The draw call.
-   *
-   * This is an own property of the instance, not a method of the prototype, so
-   * a test can replace it on one instance and count the calls.
-   */
-  render: (...args: unknown[]) => void;
 
   private readonly container: HTMLElement;
   private readonly canvas: HTMLCanvasElement;
@@ -163,12 +178,22 @@ export class GridRenderer {
     this.beam = beam;
     this.fontSize = options.fontSize;
     this.palette = new Palette(options.theme);
-    this.render = (): void => {
-      if (this.disposed) {
-        return;
-      }
-      this.beam.render();
-    };
+  }
+
+  /**
+   * The draw call.
+   *
+   * This is a method of the prototype. A caller that counts the paints assigns
+   * its own function to `render` on one instance, which shadows this method,
+   * and it removes that own property with `delete` to stop counting. A method
+   * of the prototype comes back after that `delete`. An own property of the
+   * instance would not come back, and every later `draw` would then stop.
+   */
+  render(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.beam.render();
   }
 
   get cols(): number {
@@ -206,15 +231,25 @@ export class GridRenderer {
     return { width, height };
   }
 
-  /** The columns and rows that the container holds at the current font size. */
+  /**
+   * The columns and rows that the container holds at the current font size.
+   *
+   * The measurement takes the content box, not the padding box. `clientWidth`
+   * and `clientHeight` count the padding, and `#terminal` of `src/style.css`
+   * carries 8 px of it on every side. A grid built from `clientWidth` is
+   * therefore too wide, and its canvas covers the padding. A change of the
+   * padding alone would also move no column, so the grid would not follow its
+   * container.
+   */
   fit(): FitResult {
     const cell = this.cellSize();
     if (cell.width <= 0 || cell.height <= 0) {
       return { cols: 1, rows: 1 };
     }
+    const box = this.contentBox();
     return {
-      cols: Math.max(1, Math.floor(this.container.clientWidth / cell.width)),
-      rows: Math.max(1, Math.floor(this.container.clientHeight / cell.height)),
+      cols: Math.max(1, Math.floor(box.width / cell.width)),
+      rows: Math.max(1, Math.floor(box.height / cell.height)),
     };
   }
 
@@ -262,8 +297,24 @@ export class GridRenderer {
    * redraw, and after a change of the theme, the font size, the grid size, or
    * the device pixel ratio.
    *
-   * `render` runs on every call, and it runs one time. A caller with an
-   * unconditional animation frame loop therefore needs no branch of its own.
+   * A call that finds no change returns at once. It reads no cell, it builds
+   * no batch, and it calls no `render`. A caller with an unconditional
+   * animation frame loop therefore needs no branch of its own.
+   *
+   * The early return exists for the cost of `render`, not for the cost of the
+   * cells. A `render` marks the WebGL canvas dirty, and the compositor then
+   * presents it. That present costs a frame of the browser even when no cell
+   * changed. Measurement, in Chromium with `--enable-unsafe-swiftshader`, on an
+   * idle 109 by 38 terminal: with a `render` on each frame, an animation frame
+   * loop ran at 22 frames per second and a `setTimeout` of 100 ms fired every
+   * 192 ms. Without it the same loop ran at 121 frames per second and the same
+   * timer fired every 101 ms. The `render` call itself takes 0.004 ms, so the
+   * cost is the present and not the submit. The key repeat of `src/input.ts`
+   * runs on a `setTimeout`, so a present on each idle frame gave the operator
+   * half the configured repeat rate.
+   *
+   * The canvas keeps its last paint while no `render` runs, because the
+   * context holds `preserveDrawingBuffer`.
    */
   draw(term: VtTerminal): void {
     if (this.disposed) {
@@ -275,8 +326,14 @@ export class GridRenderer {
     const cols = Math.min(this.gridCols, term.cols);
     const rows = Math.min(this.gridRows, term.rows);
     const full = this.fullRedraw || term.needsFullRedraw();
-    const viewport = term.getViewport();
     const cursor = term.getCursor();
+
+    if (!full && !term.isDirty() && !this.cursorMoved(cursor, cols, rows)) {
+      this.drawnRows = [];
+      return;
+    }
+
+    const viewport = term.getViewport();
     const drawn: number[] = [];
 
     const batch = this.beam.batch();
@@ -316,6 +373,25 @@ export class GridRenderer {
   // ==========================================================================
   // Private
   // ==========================================================================
+
+  /** The content box of the container, in CSS pixels. */
+  private contentBox(): { width: number; height: number } {
+    const style = getComputedStyle(this.container);
+    const trim = (value: string): number => {
+      const number = parseFloat(value);
+      return Number.isFinite(number) ? number : 0;
+    };
+    return {
+      width: Math.max(
+        0,
+        this.container.clientWidth - trim(style.paddingLeft) - trim(style.paddingRight),
+      ),
+      height: Math.max(
+        0,
+        this.container.clientHeight - trim(style.paddingTop) - trim(style.paddingBottom),
+      ),
+    };
+  }
 
   /**
    * Give the canvas the pixel size of the grid.
@@ -385,6 +461,24 @@ export class GridRenderer {
   }
 
   /**
+   * True when the cursor covers a different cell than at the last `draw`.
+   *
+   * A cursor move does not always make a row dirty. The cell under the cursor
+   * carries the cursor colors, so the renderer must paint the new cell and
+   * restore the old one. This check uses the same bounds as `paintCursor`, so
+   * both agree on the cell that the cursor covers.
+   */
+  private cursorMoved(cursor: VtCursor, cols: number, rows: number): boolean {
+    const last = this.lastCursor;
+    const shown =
+      cursor.visible && cursor.x >= 0 && cursor.y >= 0 && cursor.x < cols && cursor.y < rows;
+    if (!shown) {
+      return last !== null;
+    }
+    return last === null || last.x !== cursor.x || last.y !== cursor.y;
+  }
+
+  /**
    * Paint the cursor cell, and restore the cell that the cursor left.
    *
    * The restore covers one cell only. A cursor that moves inside a row that no
@@ -431,8 +525,7 @@ export class GridRenderer {
     }
     // FAINT has no bit in `CellStyle` of `@beamterm/renderer`, so the color
     // carries it: the foreground moves half the way to the background of the
-    // same cell. BLINK has no bit and no clock in this module, so a blinking
-    // cell paints as a steady cell.
+    // same cell.
     if ((cell.flags & VtCellFlags.FAINT) !== 0) {
       fg = faint(fg, bg);
     }
@@ -478,7 +571,17 @@ function symbolOf(term: VtTerminal, cell: VtCell, x: number, y: number): string 
   return cell.codepoint === 0 ? " " : String.fromCodePoint(cell.codepoint);
 }
 
-/** Build the `CellStyle` of one run. The caller frees it. */
+/**
+ * Build the `CellStyle` of one run. The caller frees it.
+ *
+ * This function is the one place where a cell flag becomes a style bit of
+ * `@beamterm/renderer`. The VT layer also carries `VtCellFlags.BLINK`, and
+ * libghostty sets it correctly. `@beamterm/renderer` has no native blink: its
+ * `FontStyle` holds Normal, Bold, Italic, and BoldItalic, and its
+ * `GlyphEffect` holds None, Underline, and Strikethrough. A shim for blink is
+ * out of scope by a decision of the product manager, so a blinking cell paints
+ * as a steady cell.
+ */
 function buildStyle(run: Paint): CellStyle {
   let built = style().fg(run.fg).bg(run.bg);
   if ((run.bits & VtCellFlags.BOLD) !== 0) {

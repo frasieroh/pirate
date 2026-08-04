@@ -7,9 +7,11 @@
  */
 
 import { beforeEach, expect, test } from "bun:test";
+import type { Page } from "playwright";
 import {
   clientState,
   ESC,
+  framesWithTag,
   idle,
   paintedPixels,
   server,
@@ -113,5 +115,88 @@ test("a 0x02 frame carries a big-endian i32 status", async () => {
       (value) => value === 130,
       "the exit status",
     );
+  });
+});
+
+// ── the focus ─────────────────────────────────────────────────────────────
+//
+// CAUTION: No test below calls `page.focus`. The client must take the focus
+// for itself at load time. A test that focuses the terminal first cannot see
+// the defect that these tests measure, and every other focus test of this
+// suite focuses it first.
+
+/** The active element of the page, and whether it sits inside `#terminal`. */
+function activeElement(page: Page): Promise<{ tag: string; inTerminal: boolean }> {
+  return page.evaluate(() => {
+    const active = document.activeElement;
+    const terminal = document.getElementById("terminal");
+    return {
+      tag: active === null ? "none" : active.tagName,
+      inTerminal: active !== null && terminal !== null && terminal.contains(active),
+    };
+  });
+}
+
+test("the client takes the focus at load, with no click and no explicit focus", async () => {
+  // The operator logs in and types. Nothing else happens in between. Before
+  // the repair the active element was BODY, and every keystroke went nowhere.
+  // `src/input.ts` returns the focus on the first `mousedown`, so one click
+  // hides this defect. This test never clicks.
+  const stub = server();
+
+  await withClient(async (page) => {
+    const active = await activeElement(page);
+    // eslint-disable-next-line no-console
+    console.log(`  active element at load: ${JSON.stringify(active)}`);
+    expect(active.inTerminal).toBe(true);
+
+    // The behavior that the operator sees: a keystroke reaches the shell.
+    const before = framesWithTag(stub.received, 0x00).length;
+    await page.keyboard.type("hello");
+    await waitFor(
+      async () => framesWithTag(stub.received, 0x00).length,
+      (count) => count >= before + 5,
+      "one input frame for each of the five keys",
+    );
+  });
+});
+
+test("the terminal does not take the focus off a menu button", async () => {
+  // Criterion 20, the menu path. The operator moves to a menu control and
+  // leaves it there. No rebuild runs, so no facade is built, and the focus
+  // must stay where the operator put it.
+  await withClient(async (page) => {
+    await page.focus("#font-increase");
+    await idle(500);
+    const held = await activeElement(page);
+    // eslint-disable-next-line no-console
+    console.log(`  active element after 500 ms on a menu button: ${JSON.stringify(held)}`);
+    expect(held.inTerminal).toBe(false);
+    expect(held.tag).toBe("BUTTON");
+  });
+});
+
+test("a reconnect does not move the focus", async () => {
+  // Criterion 20, the reconnect path. `ws.onopen` builds no facade, so a
+  // dropped socket must leave the focus of the operator alone.
+  const stub = server();
+
+  await withClient(async (page) => {
+    await page.focus("#font-increase");
+    const before = await activeElement(page);
+
+    stub.closeSocket();
+    await waitFor(
+      async () => (await clientState(page)).connections,
+      (count) => count >= 2,
+      "the second connection",
+    );
+    await idle(400);
+
+    const after = await activeElement(page);
+    // eslint-disable-next-line no-console
+    console.log(`  focus across a reconnect: ${JSON.stringify(before)} -> ${JSON.stringify(after)}`);
+    expect(after).toEqual(before);
+    expect(after.inTerminal).toBe(false);
   });
 });

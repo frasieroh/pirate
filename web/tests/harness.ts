@@ -74,10 +74,18 @@ export const ESC = "";
  * software WebGL2 from the defaults. This list holds the flag for every
  * platform.
  *
- * CAUTION: Do not add `--use-angle=swiftshader` or `--use-gl=angle`. Each of
- * those flags moves the 2D canvas to SwiftShader as well. The paint of the
- * terminal canvas then arrives after the read. The paint assertions of
- * `web/tests` and `web/bench` then fail. The failure is intermittent.
+ * CAUTION: Do not add `--use-angle=swiftshader` or `--use-gl=angle`. The
+ * measured result of either flag: the paint of the terminal canvas arrives
+ * after the read, and the paint assertions of `web/tests` and `web/bench`
+ * fail. The failure is intermittent.
+ *
+ * The flag above asks for a software WebGL2 context alone. The two flags above
+ * move the whole graphics stack of the browser to software, compositing
+ * included, and that is the difference this list depends on. The exact step
+ * that arrives late is not established. An earlier version of this comment
+ * named a 2D canvas, and the client holds none: `src/render/index.ts` draws
+ * with WebGL2, and `paintedPixels` and `canvasSignature` read that context
+ * with `readPixels`.
  *
  * `web/e2e/browser.ts` holds a copy of this list. That module keeps its own
  * copy of every helper here, for the reason in its header.
@@ -305,6 +313,16 @@ export async function menuState(page: Page): Promise<string> {
  *
  * This is the only pixel-level measurement. It proves that the canvas holds
  * paint. It makes no claim about the shape of any glyph.
+ *
+ * The read goes through `readPixels` of the WebGL2 context. A WebGL2 canvas
+ * gives null for a 2D context. `src/render/index.ts` takes the context with
+ * `preserveDrawingBuffer` set, so the paint of the last frame is still there
+ * when this function runs, in a later task than the paint.
+ *
+ * The origin of `readPixels` is the bottom left corner, and the row index
+ * counts from the top, so a band of `height` pixels starts at
+ * `canvas.height - top - height`. The cell height comes from
+ * `canvas.height / rows`, never from `devicePixelRatio`.
  */
 export function paintedPixels(
   page: Page,
@@ -314,18 +332,22 @@ export function paintedPixels(
   return page.evaluate(
     ({ row: y, background }: { row: number; background: [number, number, number] }) => {
       const canvas = document.querySelector("#terminal canvas") as HTMLCanvasElement | null;
-      const context = canvas?.getContext("2d");
-      if (!canvas || !context) {
+      const gl = canvas?.getContext("webgl2") as WebGL2RenderingContext | null;
+      if (!canvas || !gl) {
         return -1;
       }
       const term = (globalThis as unknown as PirateWindow).__pirate.term;
-      const height = canvas.height / term.rows;
-      const data = context.getImageData(
-        0,
-        Math.floor(y * height),
-        canvas.width,
-        Math.floor(height),
-      ).data;
+      const band = Math.floor(canvas.height / term.rows);
+      if (band <= 0) {
+        return -1;
+      }
+      const top = Math.floor(y * (canvas.height / term.rows));
+      const bottom = canvas.height - top - band;
+      if (bottom < 0 || top < 0) {
+        return -1;
+      }
+      const data = new Uint8Array(canvas.width * band * 4);
+      gl.readPixels(0, bottom, canvas.width, band, gl.RGBA, gl.UNSIGNED_BYTE, data);
       let count = 0;
       for (let i = 0; i < data.length; i += 4) {
         if (
@@ -348,15 +370,20 @@ export function paintedPixels(
  * A test compares two of these to learn whether the canvas changed. It never
  * compares a hash against a stored value, because rasterization differs
  * between machines.
+ *
+ * The read goes through `readPixels`, for the reason in `paintedPixels`. This
+ * function reads the whole canvas, so the origin of `readPixels` does not
+ * change the result.
  */
 export function canvasSignature(page: Page): Promise<number> {
   return page.evaluate(() => {
     const canvas = document.querySelector("#terminal canvas") as HTMLCanvasElement | null;
-    const context = canvas?.getContext("2d");
-    if (!canvas || !context) {
+    const gl = canvas?.getContext("webgl2") as WebGL2RenderingContext | null;
+    if (!canvas || !gl) {
       return -1;
     }
-    const data = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    const data = new Uint8Array(canvas.width * canvas.height * 4);
+    gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, data);
     let hash = 2166136261;
     for (let i = 0; i < data.length; i += 4) {
       hash = Math.imul(hash ^ data[i], 16777619);
@@ -368,7 +395,7 @@ export function canvasSignature(page: Page): Promise<number> {
 }
 
 /**
- * Stop the paint loop of ghostty-web.
+ * Stop the paint loop of the terminal.
  *
  * The loop asks for the next frame from inside its own callback, so one
  * `cancelAnimationFrame` ends it. This is the negative control for risk 5: it
@@ -389,8 +416,12 @@ export function stopRenderLoop(page: Page): Promise<void> {
 /**
  * Count the calls to the renderer over a quiet period.
  *
- * This is the measurement for risk 5. It shows whether ghostty-web paints on
+ * This is the measurement for risk 5. It shows whether the client paints on
  * its own after a burst of writes, or waits for another event.
+ *
+ * The wrapper is an own property of the renderer, and `delete` removes it.
+ * `render` of `GridRenderer` is a method of the prototype, so it comes back
+ * after that `delete`.
  */
 export async function countRenders(page: Page, ms: number): Promise<number> {
   return page.evaluate(async (duration: number) => {

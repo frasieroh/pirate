@@ -343,11 +343,51 @@ test("the light palette meets the contrast floors", async () => {
   });
 });
 
+test("the RIS before the dump keeps the text of a theme change from doubling", async () => {
+  // The VT terminal lives through a theme change, because the client never
+  // frees one: `ghostty_terminal_free` of ghostty-vt.wasm 0.4.0 corrupts the
+  // heap of the module. The surviving terminal keeps every cell that it holds,
+  // and a state dump carries no clear of its own, so a dump that lands on the
+  // live screen writes its text on top of the text that is already there.
+  // `rebuild` of `src/main.ts` therefore writes RIS before it asks for the
+  // dump.
+  //
+  // This test pins that write. Without the RIS, row 0 reads `piratepirate`.
+  //
+  // The assertion below is an equality, not a poll for the wanted value. A
+  // poll would end in a timeout and report the wanted string, and the measured
+  // fault would then never reach the report.
+  const stub = server();
+  stub.setOnDump([{ tag: 0x01, text: "pirate" }]);
+
+  await withClient(async (page) => {
+    stub.send([{ tag: 0x00, text: "pirate" }]);
+    await waitFor(() => viewportLine(page, 0), (line) => line === "pirate", "the written text");
+
+    const before = dumpFrames(stub.received).length;
+    await page.click("#theme-light");
+    await waitFor(
+      async () => dumpFrames(stub.received).length,
+      (count) => count > before,
+      "the dump request of the theme change",
+    );
+    // The dump answer travels back and the parser takes it. This wait covers
+    // that round trip, and it does not read the row.
+    await idle(500);
+
+    const row = await viewportLine(page, 0);
+    // eslint-disable-next-line no-console
+    console.log(`  row 0 after the theme change: "${row}"`);
+    expect(row).toBe("pirate");
+  });
+});
+
 test("a theme change refills the screen from the dump, and sends no resize frame", async () => {
-  // ghostty-web 0.4.0 bakes the cell colors at `open()` time, so the client
-  // builds a new terminal for a theme change. The new terminal starts empty,
-  // and the `0x02` dump request brings the screen back from the server. The
-  // guard that stays from the old behavior: the rebuild sends no resize frame.
+  // A theme change builds a new terminal facade. The VT terminal below it lives
+  // on, so `src/main.ts` clears the screen with RIS before it asks for the
+  // dump, and the `0x02` dump request then brings the screen back from the
+  // server. Without that clear the dump would land on the old text. The guard
+  // that stays from the old behavior: the rebuild sends no resize frame.
   const stub = server();
   stub.setOnDump([{ tag: 0x01, text: "pirate" }]);
 
@@ -623,13 +663,16 @@ test("the new terminal carries the new theme, and its canvas paints the new back
   });
 });
 
-test("a rebuild removes the document mouseup listener that ghostty-web leaks", async () => {
-  // ghostty-web 0.4.0 registers `handleMouseUp` on the document in `open()`.
-  // `dispose` sets `isOpen` to false before it calls `cleanupComponents`, and
-  // `cleanupComponents` removes that listener only while `isOpen` is true, so
-  // the listener stays and holds the dead terminal. `rebuild` of
-  // `src/main.ts` removes it. Without that call the count grows by one for
-  // each theme change.
+test("a rebuild adds no document mouseup listener", async () => {
+  // The old client drove ghostty-web, which registered `handleMouseUp` on the
+  // document in `open()` and never removed it, so each theme change leaked one
+  // listener. `src/main.ts` carried a removal call for it.
+  //
+  // The renderer of `src/render` registers no listener on the document, and
+  // the facade of `src/terminal.ts` registers its one `keydown` listener on
+  // `#terminal` and removes it in `dispose`. The removal call is therefore
+  // gone from `src/main.ts`, and the count below stays at zero because nothing
+  // registers and nothing removes.
   const stub = server();
 
   await withClient(async (page) => {
@@ -650,7 +693,7 @@ test("a rebuild removes the document mouseup listener that ghostty-web leaks", a
       "the dump request of the second rebuild",
     );
 
-    // Two rebuilds: two removals and two registrations.
+    // Two rebuilds. Neither one touches the document.
     const count = await mouseUpListeners(page);
     // eslint-disable-next-line no-console
     console.log(`  document mouseup listeners after two rebuilds: ${count >= 0 ? "+" : ""}${count}`);

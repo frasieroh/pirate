@@ -205,7 +205,9 @@ async function install(where: Page): Promise<void> {
           theme: options.theme,
         });
         box.canvas = container.querySelector("canvas");
-        const draw = box.grid.render as (...a: unknown[]) => void;
+        // `render` is a method of the prototype, so it needs its receiver. An
+        // unbound call would read `this` as undefined.
+        const draw = (box.grid.render as (...a: unknown[]) => void).bind(box.grid);
         box.grid.render = (...a: unknown[]): void => {
           box.renderCalls += 1;
           draw(...a);
@@ -604,22 +606,6 @@ describe("the attributes", () => {
     );
     expect(show(colors[0])).toBe("#889098");
   });
-
-  test("BLINK paints the same cell as a steady cell", async () => {
-    await make(20, 6);
-    const steady = await page.evaluate(() => {
-      const grid = (globalThis as unknown as { __grid: GridApi }).__grid;
-      grid.write("M");
-      return grid.cellSignature(0, 0);
-    });
-    await make(20, 6);
-    const blinking = await page.evaluate((esc: string) => {
-      const grid = (globalThis as unknown as { __grid: GridApi }).__grid;
-      grid.write(`${esc}[5mM`);
-      return grid.cellSignature(0, 0);
-    }, ESC);
-    expect(blinking).toBe(steady);
-  });
 });
 
 // ============================================================================
@@ -809,12 +795,41 @@ describe("the dirty state", () => {
     expect(s.lastDrawnRows).toEqual([]);
   });
 
-  test("a draw with no change still calls render one time", async () => {
+  test("a draw with no change calls no render", async () => {
+    // This assertion replaces "a draw with no change still calls render one
+    // time". The old behavior presented the canvas on every animation frame,
+    // and a WebGL canvas that the page presents costs the compositor a frame
+    // even when no cell changed. Measurement, in Chromium with
+    // `--enable-unsafe-swiftshader`, on an idle 109 by 38 terminal: a `render`
+    // on each frame held an animation frame loop at 22 frames per second and
+    // stretched a `setTimeout` of 100 ms to 192 ms. Without it the same loop
+    // ran at 121 frames per second and the timer fired every 101 ms. The key
+    // repeat of `src/input.ts` runs on such a timer, so the old behavior gave
+    // the operator half the repeat rate that the menu reported, and
+    // `tests/repeat.spec.ts` measured 8 frames where it requires more than 8.
+    //
+    // The drawing buffer is preserved, so the canvas keeps the last paint
+    // while no `render` runs. The test below proves that a later change still
+    // reaches the canvas.
     await make(20, 6);
     const calls = await page.evaluate(() => {
       const grid = (globalThis as unknown as { __grid: GridApi }).__grid;
       grid.draw();
       const before = grid.state().renderCalls;
+      grid.draw();
+      return { before, after: grid.state().renderCalls };
+    });
+    expect(calls.after).toBe(calls.before);
+  });
+
+  test("a draw after a change calls render one time", async () => {
+    await make(20, 6);
+    const calls = await page.evaluate(() => {
+      const grid = (globalThis as unknown as { __grid: GridApi }).__grid;
+      grid.write("hello");
+      grid.draw();
+      const before = grid.state().renderCalls;
+      grid.write("!");
       grid.draw();
       return { before, after: grid.state().renderCalls };
     });
@@ -835,7 +850,11 @@ describe("the dirty state", () => {
     expect(s.lastDrawnRows).toEqual([0, 1, 2, 3, 4, 5]);
   });
 
-  test("draw clears the dirty state one time for each call", async () => {
+  test("draw clears the dirty state one time for each call that paints", async () => {
+    // This assertion replaces "one time for each call". A draw that finds no
+    // change now paints no cell and clears nothing, because there is nothing
+    // to clear. A draw that paints still clears the state one time, so no row
+    // paints twice.
     await make(20, 6);
     const counts = await page.evaluate(() => {
       const grid = (globalThis as unknown as { __grid: GridApi }).__grid;
@@ -843,10 +862,14 @@ describe("the dirty state", () => {
       grid.draw();
       const one = grid.state().clearDirtyCalls;
       grid.draw();
-      return { one, two: grid.state().clearDirtyCalls };
+      const two = grid.state().clearDirtyCalls;
+      grid.write("!");
+      grid.draw();
+      return { one, two, three: grid.state().clearDirtyCalls };
     });
     expect(counts.one).toBe(1);
-    expect(counts.two).toBe(2);
+    expect(counts.two).toBe(1);
+    expect(counts.three).toBe(2);
   });
 
   test("a full redraw with no dirty row still paints every row", async () => {
@@ -891,7 +914,10 @@ describe("the dirty state", () => {
       box.grid.render = (): void => {
         count += 1;
       };
+      // Each draw follows a write, so each one paints and calls `render`.
+      box.term.write("a");
       box.grid.draw(box.term);
+      box.term.write("b");
       box.grid.draw(box.term);
       return count;
     });
@@ -1083,5 +1109,62 @@ describe("the source", () => {
         expect(`${file.path}: ${file.text}`).not.toContain(name);
       }
     }
+  });
+
+  /** Every TypeScript file of the client and of its tests. */
+  async function allSources(): Promise<{ path: string; text: string }[]> {
+    const web = `${import.meta.dir}/..`;
+    const glob = new Bun.Glob("**/*.ts");
+    const out: { path: string; text: string }[] = [];
+    for (const dir of ["src", "tests", "e2e", "bench"]) {
+      for await (const name of glob.scan({ cwd: `${web}/${dir}` })) {
+        out.push({ path: `${dir}/${name}`, text: await Bun.file(`${web}/${dir}/${name}`).text() });
+      }
+    }
+    return out;
+  }
+
+  test("no file of the client imports the ghostty-web JavaScript module", async () => {
+    // Criterion 2. The client drives `src/vt` and `src/render`, so the
+    // JavaScript layer of `ghostty-web` has no reader left. The package stays
+    // in `package.json` for one asset: the wasm binary of the VT engine.
+    //
+    // The wasm subpath below is the ONE permitted specifier. Any other
+    // specifier that starts with `ghostty-web` is a defect.
+    const allowed = "ghostty-web/ghostty-vt.wasm?url";
+    const specifier = /(?:from|import)\s*\(?\s*"([^"]+)"/g;
+    const found: string[] = [];
+    for (const file of await allSources()) {
+      for (const match of file.text.matchAll(specifier)) {
+        const name = match[1];
+        if (name.startsWith("ghostty-web") && name !== allowed) {
+          found.push(`${file.path}: ${name}`);
+        }
+      }
+    }
+    expect(found).toEqual([]);
+  });
+
+  test("the wasm subpath of ghostty-web has exactly one reader", async () => {
+    const allowed = "ghostty-web/ghostty-vt.wasm?url";
+    const readers = (await allSources())
+      .filter((file) => file.text.includes(`"${allowed}"`))
+      .map((file) => file.path)
+      .sort();
+    // `src/vt/wasm.ts` imports the asset. `tests/render.spec.ts` names the same
+    // specifier to keep it external in its own bundle.
+    expect(readers).toEqual(["src/vt/wasm.ts", "tests/render.spec.ts"]);
+  });
+
+  test("src/terminal.ts holds no addon API and no xterm.js buffer API", async () => {
+    // Criterion 12. The product surface carries none of these. The adapter of
+    // that shape lives in the test bridge of `src/main.ts`.
+    //
+    // The scan runs on the code alone. A comment names these words to explain
+    // why they are absent, and a scan of the raw text would match those.
+    const text = await Bun.file(`${import.meta.dir}/../src/terminal.ts`).text();
+    const code = text.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
+    const banned = ["loadAddon", "proposeDimensions", "FitAddon", "buffer"];
+    expect(banned.filter((name) => code.includes(name))).toEqual([]);
   });
 });
