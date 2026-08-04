@@ -42,10 +42,10 @@ tokio-rustls = { version = "=0.26.4", default-features = false, features = [
     "tls12",
     "ring",
 ] }
-# The certificate for --selfsigned. `pem` stays off, because the key never
-# leaves memory and pirate therefore needs the DER form only.
+# The certificate that pirate generates by default. `pem` stays off, because
+# the key never leaves memory and pirate therefore needs the DER form only.
 rcgen = { version = "=0.14.8", default-features = false, features = ["ring"] }
-# The certificate fingerprint that --selfsigned prints.
+# The fingerprint that pirate prints for the certificate it generates.
 sha2 = "=0.10.9"
 # The token bytes for src/auth.rs.
 getrandom = "=0.3.4"
