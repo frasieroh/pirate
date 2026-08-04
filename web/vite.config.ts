@@ -264,6 +264,27 @@ export default defineConfig({
     // One JS file and one CSS file keep the embedded asset set small and make
     // the precompression step predictable.
     rollupOptions: {
+      // `index.html` is the default input. The second input adds the WebGL2
+      // renderer, which no file under `src/` imports today. The build writes
+      // one entry chunk for each input. Therefore `assets/beamterm.js` and the
+      // wasm module are in `web/dist` before the first import.
+      //
+      // The subpath `@beamterm/renderer/web` gives the build for the browser.
+      // That build reads the wasm module with
+      // `new URL("beamterm_renderer_bg.wasm", import.meta.url)`. Vite emits the
+      // module into `dist/assets`, and the client fetches a local file. The
+      // default subpath imports the wasm module as an ESM module, which needs
+      // one more plugin.
+      input: {
+        index: "index.html",
+        beamterm: "@beamterm/renderer/web",
+      },
+      // Without this option the build treeshakes the exports of an entry chunk
+      // that no file imports. The chunk then loses the initialization function
+      // and the reference to the wasm module. `strict` keeps the exports of
+      // each entry. The entry of `index.html` exports nothing, so
+      // `assets/index.js` does not change.
+      preserveEntrySignatures: "strict",
       output: {
         entryFileNames: "assets/[name].js",
         chunkFileNames: "assets/[name].js",
