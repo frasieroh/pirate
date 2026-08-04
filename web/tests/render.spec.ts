@@ -623,6 +623,67 @@ describe("the attributes", () => {
 });
 
 // ============================================================================
+// The wide characters
+// ============================================================================
+
+describe("the wide characters", () => {
+  /**
+   * `batch.text` of `@beamterm/renderer` 1.0.0 walks a run by grapheme
+   * cluster, and it advances by the display width of the cluster. A wide
+   * cluster takes two columns. The second half of a wide character therefore
+   * carries no character of its own in a run.
+   */
+  test("a wide character does not move the rest of its run", async () => {
+    await make(20, 6);
+    // The cells of row 0 are: a wide ideograph, its second half, and two full
+    // blocks. The blocks belong to columns 2 and 3.
+    const colors = await drawAndSample(`${ESC}[38;2;18;52;86m漢██`, [
+      { col: 2, row: 0 },
+      { col: 3, row: 0 },
+    ]);
+    expect(colors.map(show)).toEqual(["#123456", "#123456"]);
+  });
+
+  test("a wide character paints across both of its columns", async () => {
+    await make(20, 6);
+    const colors = await drawAndSample(`${ESC}[38;2;255;255;255m漢`, [
+      { col: 0, row: 0, fx: 0.9 },
+      { col: 1, row: 0, fx: 0.1 },
+    ]);
+    for (const color of colors) {
+      expect(show(color)).not.toBe(THEME.background);
+    }
+  });
+
+  test("a grapheme cluster does not move the rest of its run", async () => {
+    await make(20, 6);
+    // `e` and a combining acute accent make one cluster of one column.
+    const colors = await drawAndSample(`${ESC}[38;2;18;52;86mAé█`, [
+      { col: 2, row: 0 },
+      { col: 3, row: 0 },
+    ]);
+    expect(show(colors[0])).toBe("#123456");
+    expect(show(colors[1])).toBe(THEME.cursor);
+  });
+
+  test("the wide character comes back when the cursor leaves its second half", async () => {
+    await make(20, 6);
+    // The cursor moves onto column 1, the second half of the ideograph.
+    await drawAndSample(`${ESC}[38;2;255;255;255m漢${ESC}[1;2H`, [{ col: 1, row: 0 }]);
+    // The cursor moves to row 1. Row 0 is not dirty, so the restore of the old
+    // cursor cell is the only paint of that row.
+    const colors = await drawAndSample(`${ESC}[2;1H`, [
+      { col: 0, row: 0, fx: 0.9 },
+      { col: 1, row: 0, fx: 0.1 },
+    ]);
+    for (const color of colors) {
+      expect(show(color)).not.toBe(THEME.background);
+      expect(show(color)).not.toBe(THEME.cursor);
+    }
+  });
+});
+
+// ============================================================================
 // The cursor
 // ============================================================================
 
