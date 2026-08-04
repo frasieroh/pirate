@@ -33,14 +33,14 @@ const MODE_FOCUS_EVENTS = 1004;
 const MODE_BRACKETED_PASTE = 2004;
 
 export class VtTerminal {
-  readonly cols: number;
-  readonly rows: number;
-
   private readonly exports: VtWasmExports;
   private readonly handle: number;
+  /** The size of the grid. `resize` changes both values. */
+  private colCount: number;
+  private rowCount: number;
   /** The wasm buffer that the module fills with cell records. */
-  private readonly cellsPtr: number;
-  private readonly cellsBytes: number;
+  private cellsPtr: number;
+  private cellsBytes: number;
   /** The wasm buffer that the module fills with grapheme codepoints. */
   private readonly graphemePtr: number;
   /** The cells of the viewport. This class reuses these objects each frame. */
@@ -50,12 +50,10 @@ export class VtTerminal {
   private disposed = false;
 
   constructor(exports: VtWasmExports, cols: number, rows: number) {
-    if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1) {
-      throw new Error(`a terminal needs a positive cols and rows, got ${cols} by ${rows}`);
-    }
+    assertSize(cols, rows);
     this.exports = exports;
-    this.cols = cols;
-    this.rows = rows;
+    this.colCount = cols;
+    this.rowCount = rows;
 
     this.handle = exports.ghostty_terminal_new(cols, rows);
     if (this.handle === 0) {
@@ -76,6 +74,73 @@ export class VtTerminal {
     for (let i = 0; i < cols * rows; i += 1) {
       this.pool.push(emptyCell());
     }
+  }
+
+  // ==========================================================================
+  // Size
+  // ==========================================================================
+
+  /** The column count of the viewport. */
+  get cols(): number {
+    return this.colCount;
+  }
+
+  /** The row count of the viewport. */
+  get rows(): number {
+    return this.rowCount;
+  }
+
+  /**
+   * Give the grid a new size.
+   *
+   * The terminal keeps its handle, its content, and its scrollback. This
+   * method frees no terminal, so the heap defect of `ghostty_terminal_free`
+   * takes no part here. See the note on `dispose`.
+   *
+   * `cols` and `rows` must be integers of 1 or more, the rule that the
+   * constructor uses. Another value throws, and the terminal keeps its old
+   * size. The check is here, not in the module: a measurement of the raw
+   * exports shows that `ghostty_terminal_resize` with 0 columns stops with
+   * "Out of bounds memory access", and that it ignores a count of -1 and keeps
+   * the old size.
+   *
+   * After a resize to a new size, `needsFullRedraw` is true. The module sets
+   * that state itself. The same measurement marks a terminal clean, resizes
+   * it, then calls `ghostty_render_state_update`: a grow from 8 by 3 to 20 by
+   * 5 gives 2, DIRTY_FULL, a shrink from 20 by 5 to 8 by 3 gives 2, and every
+   * row of the new grid reports dirty. A resize to the size that the terminal
+   * already has gives 0, because no row of that terminal changed.
+   */
+  resize(cols: number, rows: number): void {
+    const handle = this.live;
+    assertSize(cols, rows);
+
+    // The new buffer comes first. With no memory for it, the module keeps the
+    // old grid and this terminal stays usable.
+    //
+    // The buffer only grows. A smaller grid fits in the buffer of a larger
+    // one, and a window that grows back to an earlier size then needs no
+    // second allocation.
+    const bytes = cols * rows * CELL_BYTES;
+    if (bytes > this.cellsBytes) {
+      const ptr = this.exports.ghostty_wasm_alloc_u8_array(bytes);
+      if (ptr === 0) {
+        throw new Error(`the wasm module is out of memory for ${bytes} bytes`);
+      }
+      this.exports.ghostty_wasm_free_u8_array(this.cellsPtr, this.cellsBytes);
+      this.cellsPtr = ptr;
+      this.cellsBytes = bytes;
+    }
+
+    this.exports.ghostty_terminal_resize(handle, cols, rows);
+    this.colCount = cols;
+    this.rowCount = rows;
+
+    const count = cols * rows;
+    while (this.pool.length < count) {
+      this.pool.push(emptyCell());
+    }
+    this.pool.length = count;
   }
 
   // ==========================================================================
@@ -679,6 +744,18 @@ function readCells(
     cell.width = bytes[at + 11];
     cell.hyperlinkId = view.getUint16(at + 12, true);
     cell.graphemeLength = bytes[at + 14];
+  }
+}
+
+/**
+ * Stop when `cols` or `rows` is not an integer of 1 or more.
+ *
+ * The constructor and `resize` use the same rule, so a size that makes a
+ * terminal is also a size that resizes one.
+ */
+function assertSize(cols: number, rows: number): void {
+  if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1) {
+    throw new Error(`a terminal needs a positive cols and rows, got ${cols} by ${rows}`);
   }
 }
 
