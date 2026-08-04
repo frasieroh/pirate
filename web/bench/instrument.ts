@@ -24,7 +24,7 @@ interface Span {
 /** The record that the instrument keeps on the page. */
 interface LatencyRecord {
   writes: Span[];
-  renders: Span[];
+  draws: Span[];
 }
 
 /** The latency budget of one screen event, in milliseconds. */
@@ -36,11 +36,11 @@ export interface Budget {
   /** Time from the end of the parse to the start of the next paint. */
   waitMs: number;
   /** Time inside the paint that follows the parse. */
-  renderMs: number;
+  drawMs: number;
   /** The three above, added: the whole client-side cost of the event. */
   totalMs: number;
   /** Paints that ran between the parse and the paint that this row reports. */
-  rendersBefore: number;
+  drawsBefore: number;
 }
 
 /**
@@ -55,7 +55,18 @@ type LatencyWindow = {
 };
 
 /**
- * Wrap `term.write` and `renderer.render` so that each call records its span.
+ * Wrap `term.write` and `renderer.draw` so that each call records its span.
+ *
+ * The wrapped paint call is `draw`, never `render`. `draw` of
+ * `src/render/index.ts` holds the paint work: it reads the cells of the dirty
+ * rows, it builds the batch, and it presents the canvas. `render` only submits
+ * the frame that `draw` already built, and its cost does not follow the cell
+ * count. Measurement, in Chromium with `--enable-unsafe-swiftshader`: 69 by 25
+ * gave a `draw` median of 0.100 ms and a `render` median of 0.000 ms, 109 by 38
+ * gave 0.100 ms and 0.000 ms, and 176 by 58 gave 0.600 ms and 0.000 ms.
+ *
+ * CAUTION: Do not point this wrapper back at `render`. Every paint span then
+ * reads 0.00 ms, and the scaling test of `latency.spec.ts` fails.
  *
  * Call this once per page, before the first measured event.
  */
@@ -65,12 +76,12 @@ export function instrument(page: Page): Promise<void> {
     if (scope.__pirateLatency !== undefined) {
       return;
     }
-    const record: LatencyRecord = { writes: [], renders: [] };
+    const record: LatencyRecord = { writes: [], draws: [] };
     scope.__pirateLatency = record;
 
     const term = scope.__pirate.term as unknown as {
       write(data: Uint8Array): void;
-      renderer: { render(...args: unknown[]): void };
+      renderer: { draw(...args: unknown[]): void };
     };
     const write = term.write.bind(term);
     term.write = (data: Uint8Array): void => {
@@ -79,12 +90,13 @@ export function instrument(page: Page): Promise<void> {
       record.writes.push({ start, end: performance.now() });
     };
 
+    // `draw` is a method of the prototype, so it needs its receiver.
     const renderer = term.renderer;
-    const render = renderer.render.bind(renderer);
-    renderer.render = (...args: unknown[]): void => {
+    const draw = renderer.draw.bind(renderer);
+    renderer.draw = (...args: unknown[]): void => {
       const start = performance.now();
-      render(...args);
-      record.renders.push({ start, end: performance.now() });
+      draw(...args);
+      record.draws.push({ start, end: performance.now() });
     };
   });
 }
@@ -95,7 +107,7 @@ export function resetTimings(page: Page): Promise<void> {
     const record = (globalThis as unknown as LatencyWindow).__pirateLatency;
     if (record !== undefined) {
       record.writes = [];
-      record.renders = [];
+      record.draws = [];
     }
   });
 }
@@ -103,14 +115,14 @@ export function resetTimings(page: Page): Promise<void> {
 /**
  * The budget of the event that the page just took.
  *
- * The parse is every `write` span, added. The paint is the first `render` span
- * that starts after the last parse ends. A render that was already running when
+ * The parse is every `write` span, added. The paint is the first `draw` span
+ * that starts after the last parse ends. A draw that was already running when
  * the bytes arrived cannot hold them, so it does not count.
  */
 export async function budget(page: Page, bytes: number): Promise<Budget> {
   const record = await page.evaluate(() => {
     const value = (globalThis as unknown as LatencyWindow).__pirateLatency;
-    return value === undefined ? { writes: [], renders: [] } : value;
+    return value === undefined ? { writes: [], draws: [] } : value;
   });
   if (record.writes.length === 0) {
     throw new Error("the instrument recorded no write");
@@ -119,7 +131,7 @@ export async function budget(page: Page, bytes: number): Promise<Budget> {
   const last = record.writes[record.writes.length - 1];
   const parseMs = record.writes.reduce((sum, span) => sum + (span.end - span.start), 0);
 
-  const after = record.renders.filter((span) => span.start >= last.end);
+  const after = record.draws.filter((span) => span.start >= last.end);
   if (after.length === 0) {
     throw new Error("the instrument recorded no paint after the write");
   }
@@ -128,23 +140,29 @@ export async function budget(page: Page, bytes: number): Promise<Budget> {
     bytes,
     parseMs,
     waitMs: paint.start - last.end,
-    renderMs: paint.end - paint.start,
+    drawMs: paint.end - paint.start,
     totalMs: paint.end - first.start,
-    rendersBefore: record.renders.filter(
+    drawsBefore: record.draws.filter(
       (span) => span.start >= first.start && span.start < last.end,
     ).length,
   };
 }
 
-/** The median duration of a paint over a quiet period. This is the floor. */
-export async function idleRenderMs(page: Page, ms: number): Promise<number> {
+/**
+ * The median duration of a paint over a quiet period. This is the floor.
+ *
+ * The frame loop calls `draw` on every animation frame, so a quiet period still
+ * records a span for each frame. A quiet `draw` finds no dirty row, so it reads
+ * no cell and presents no canvas, and this value is the cost of that check.
+ */
+export async function idleDrawMs(page: Page, ms: number): Promise<number> {
   await resetTimings(page);
   await idle(ms);
   const record = await page.evaluate(() => {
     const value = (globalThis as unknown as LatencyWindow).__pirateLatency;
-    return value === undefined ? { writes: [], renders: [] } : value;
+    return value === undefined ? { writes: [], draws: [] } : value;
   });
-  const times = record.renders.map((span) => span.end - span.start).sort((a, b) => a - b);
+  const times = record.draws.map((span) => span.end - span.start).sort((a, b) => a - b);
   if (times.length === 0) {
     throw new Error("the instrument recorded no paint while the stream was quiet");
   }
