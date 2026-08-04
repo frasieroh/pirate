@@ -33,6 +33,7 @@ import {
   staysFalse,
   statusText,
   strictContext,
+  terminalGlReport,
   viewportText,
   waitFor,
   waitForConnected,
@@ -379,7 +380,7 @@ describe("the end of the session", () => {
 // ── 9. the WebGL2 context ─────────────────────────────────────────────────
 describe("WebGL2", () => {
   test("the page gets a working WebGL2 context", async () => {
-    const server = await startPirate();
+    const server = await startPirate({ recorder: true });
     const { page, context } = await newSession(server);
     try {
       const report = await webgl2Report(page);
@@ -398,6 +399,28 @@ describe("WebGL2", () => {
       // The context ran one command and gave the result back. A context that
       // answers every call with a default cannot pass this step.
       expect(report.usable).toBe(true);
+
+      // The steps above use a canvas of the helper. The steps below use the
+      // canvas that the client draws on, which is the stronger claim. The
+      // renderer of `src/render/index.ts` builds that canvas after the login,
+      // so the login comes first.
+      await login(page, server.token);
+      await waitForConnected(page);
+      await waitForLine(page, (lines) => lines[0] === RECORDER_READY, "the recorder marker");
+
+      const terminal = await terminalGlReport(page);
+
+      // A 2D canvas gives null for a WebGL2 context, so `present` proves the
+      // context kind of the real canvas.
+      expect(terminal.present).toBe(true);
+      expect(terminal.version).toContain("WebGL 2.0");
+
+      // `preserveDrawingBuffer` is the attribute that lets a later task read
+      // the paint. Every paint assertion of this suite depends on it.
+      expect(terminal.preserved).toBe(true);
+
+      // The real renderer painted the marker row through that context.
+      expect(await paintedPixels(page, 0)).toBeGreaterThan(0);
     } finally {
       await context.close();
       await server.stop();
