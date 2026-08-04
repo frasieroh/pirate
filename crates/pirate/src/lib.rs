@@ -54,13 +54,24 @@ impl AppState {
     }
 }
 
-/// Build the routes.
+/// Build the routes. Each session gets a login shell.
 ///
 /// `/ws` is the terminal, `/auth` takes the token, and every other path is a
 /// web asset.
 pub fn router(state: Arc<AppState>) -> Router {
+    router_with_login(state, true)
+}
+
+/// Build the routes and choose the form of the session shell.
+///
+/// With `login` true, each session shell reads the login profile. `--no-login`
+/// gives false here. The `arg0` function of `session.rs` holds the mechanism.
+///
+/// The form is an argument of this function and not a field of [`AppState`],
+/// so every caller of the `AppState` constructors keeps its own code.
+pub fn router_with_login(state: Arc<AppState>, login: bool) -> Router {
     Router::new()
-        .route("/ws", get(ws::upgrade))
+        .route("/ws", ws::route(login))
         // The web assets stay public, because they are public JavaScript and a
         // public WebAssembly module. `/ws` is the gate that holds the shell.
         .route(

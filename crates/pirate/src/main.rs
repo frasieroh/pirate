@@ -5,7 +5,7 @@
 
 use clap::Parser;
 use pirate::tls::TlsSource;
-use pirate::{router, AppState};
+use pirate::{router_with_login, AppState};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -92,6 +92,10 @@ struct Args {
     /// gets a shell.
     #[arg(long, short = 'n')]
     no_password: bool,
+
+    /// Start the shell as a normal shell, not as a login shell.
+    #[arg(long)]
+    no_login: bool,
 }
 
 #[tokio::main]
@@ -244,17 +248,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The two branches give `axum::serve` two listener types, and therefore two
     // types of server. A trait object cannot hold them, because the trait has
     // an associated type for the connection.
+    let login = !args.no_login;
     match tls {
         Some(tls) => {
             axum::serve(
                 pirate::tls::TlsListener::new(pirate::NoDelay(listener), tls.config),
-                router(state),
+                router_with_login(state, login),
             )
             .with_graceful_shutdown(shutdown())
             .await?;
         }
         None => {
-            axum::serve(pirate::NoDelay(listener), router(state))
+            axum::serve(pirate::NoDelay(listener), router_with_login(state, login))
                 .with_graceful_shutdown(shutdown())
                 .await?;
         }

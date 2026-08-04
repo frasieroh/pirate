@@ -60,10 +60,18 @@ async fn start(shell: PathBuf) -> SocketAddr {
 ///
 /// The authentication tests choose the `Auth` value, so they call this one.
 async fn start_with(state: Arc<AppState>) -> SocketAddr {
+    serve(router(state)).await
+}
+
+/// Start a router that the caller built on an ephemeral port.
+///
+/// The login shell tests build the router themselves, because the form of the
+/// shell is an argument of `router_with_login` and not a field of `AppState`.
+async fn serve(router: axum::Router) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = axum::serve(pirate::NoDelay(listener), router(state)).await;
+        let _ = axum::serve(pirate::NoDelay(listener), router).await;
     });
     addr
 }
@@ -177,6 +185,30 @@ async fn read_dump(socket: &mut Socket) -> String {
         }
     }
     panic!("no dump arrived")
+}
+
+/// Ask the shell of this session for its own `argv[0]`.
+///
+/// A shebang script cannot report `argv[0]`. The kernel drops the value that
+/// the caller gave and builds a new argument list for the interpreter, so `$0`
+/// in a script is the path of that script. The two tests below therefore start
+/// `/bin/sh` and drive it over the PTY.
+///
+/// The PTY sends the input line back, so the marker text arrives twice if the
+/// input holds it. `printf` joins the marker from two parts here, and the echo
+/// of the input therefore matches neither `ARG0[` nor `]END`.
+async fn read_arg0(socket: &mut Socket) -> String {
+    send(
+        socket,
+        ClientFrame::Input(b"printf 'A%s[%s]E%s\\n' RG0 \"$0\" ND\n"),
+    )
+    .await;
+    let text = read_until(socket, "]END").await;
+    let value = text
+        .split_once("ARG0[")
+        .and_then(|(_, rest)| rest.split_once("]END"))
+        .map(|(value, _)| value.to_string());
+    value.unwrap_or_else(|| panic!("the shell reported no argv[0]: {text:?}"))
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -849,6 +881,36 @@ async fn a_malformed_frame_does_not_end_the_session() {
     send(&mut socket, ClientFrame::Input(b"still here\n")).await;
     let text = read_until(&mut socket, "still here").await;
     assert!(text.contains("still here"), "got {text:?}");
+}
+
+// --- The login shell --- //
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_session_shell_is_a_login_shell_by_default() {
+    // A login shell reads the login profile, so the user gets the environment
+    // that a terminal gives. The shell reads its own `argv[0]` to find out.
+    let addr = start(PathBuf::from("/bin/sh")).await;
+    let mut socket = connect(addr).await;
+
+    assert_eq!(
+        read_arg0(&mut socket).await,
+        "-sh",
+        "the default session shell must start with a dash in argv[0]"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_no_login_form_starts_the_shell_with_a_plain_arg0() {
+    // This is the server that `--no-login` builds.
+    let state = Arc::new(AppState::plain(None, PathBuf::from("/bin/sh")));
+    let addr = serve(pirate::router_with_login(state, false)).await;
+    let mut socket = connect(addr).await;
+
+    assert_eq!(
+        read_arg0(&mut socket).await,
+        "sh",
+        "--no-login must give the file name of the shell with no dash"
+    );
 }
 
 // --- Authentication --- //

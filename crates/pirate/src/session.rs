@@ -123,11 +123,15 @@ pub struct Session {
 impl Session {
     /// Open a PTY, start the shell, and start the server-side terminal.
     ///
+    /// With `login` true, the shell reads the login profile. The `arg0`
+    /// function of this file holds the mechanism.
+    ///
     /// The second value is the frame stream for the one client of this session.
     pub fn spawn(
         shell: &Path,
         cols: u16,
         rows: u16,
+        login: bool,
     ) -> Result<(Self, Frames), Box<dyn std::error::Error + Send + Sync>> {
         // The same ceiling as `resize`. `spawn` is the second path into the
         // PTY and into the server-side terminal, so it takes the same clamp.
@@ -141,6 +145,7 @@ impl Session {
         // TERM tells the shell which sequences it can emit. Without it, most
         // programs fall back to a terminal with no color and no cursor keys.
         let child = pty_process::Command::new(shell)
+            .arg0(arg0(shell, login))
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
             // The last guard against a leaked shell. `shutdown` is the first.
@@ -582,6 +587,25 @@ fn to_io(e: pty_process::Error) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
+/// The `argv[0]` of the shell process.
+///
+/// A shell reads the login profile when `argv[0]` starts with a dash. The
+/// program that runs is the full path in both forms, because `argv[0]` names
+/// no file.
+///
+/// The value is the file name of `shell`, with a dash in front of it when
+/// `login` is true. A path that ends in `..` or in `/` has no file name, so the
+/// whole path is the fallback.
+fn arg0(shell: &Path, login: bool) -> std::ffi::OsString {
+    let name = shell.file_name().unwrap_or(shell.as_os_str());
+    if !login {
+        return name.to_os_string();
+    }
+    let mut arg0 = std::ffi::OsString::from("-");
+    arg0.push(name);
+    arg0
+}
+
 /// The shell to start when the operator names none.
 ///
 /// The value of `SHELL` comes first. `/bin/bash` is the fallback, because a
@@ -607,7 +631,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_first_frame_of_a_session_is_a_dump() {
-        let (mut session, mut frames) = Session::spawn(Path::new("/bin/cat"), 80, 24).unwrap();
+        let (mut session, mut frames) =
+            Session::spawn(Path::new("/bin/cat"), 80, 24, true).unwrap();
 
         let first = tokio::time::timeout(DRAIN_GRACE, frames.next())
             .await
@@ -623,7 +648,8 @@ mod tests {
         // This test drives the channel directly, with no socket between. A
         // socket adds kernel buffers whose size differs by host, and the
         // result would then depend on the host.
-        let (mut session, mut frames) = Session::spawn(Path::new("/bin/cat"), 80, 24).unwrap();
+        let (mut session, mut frames) =
+            Session::spawn(Path::new("/bin/cat"), 80, 24, true).unwrap();
 
         let first = frames.next().await.expect("the session ended");
         assert!(is_dump(&first), "the first frame must be a dump");
@@ -696,7 +722,7 @@ mod tests {
         // A burst fills the queue, and the shell then exits. The exit frame is
         // the last frame of a session, and the pump in `ws.rs` closes the
         // socket on it. A client that fell behind must therefore still get it.
-        let (mut session, mut frames) = Session::spawn(Path::new("/bin/sh"), 80, 24).unwrap();
+        let (mut session, mut frames) = Session::spawn(Path::new("/bin/sh"), 80, 24, true).unwrap();
 
         let first = frames.next().await.expect("the session ended");
         assert!(is_dump(&first), "the first frame must be a dump");
@@ -754,7 +780,8 @@ mod tests {
         // is behind. `request_dump` and the backpressure path both send
         // `Command::Resync`, and that command clears the behind flag. Therefore
         // the request must give a dump and must open the output again.
-        let (mut session, mut frames) = Session::spawn(Path::new("/bin/cat"), 80, 24).unwrap();
+        let (mut session, mut frames) =
+            Session::spawn(Path::new("/bin/cat"), 80, 24, true).unwrap();
 
         let first = frames.next().await.expect("the session ended");
         assert!(is_dump(&first), "the first frame must be a dump");
@@ -799,7 +826,7 @@ mod tests {
         // The whole path, through a real PTY: a program enters the alternate
         // screen, and a later dump puts a client there also. tmux and vim take
         // this path, and the user runs tmux to share a session.
-        let (mut session, mut frames) = Session::spawn(Path::new("/bin/sh"), 80, 24).unwrap();
+        let (mut session, mut frames) = Session::spawn(Path::new("/bin/sh"), 80, 24, true).unwrap();
 
         let first = frames.next().await.expect("the session ended");
         let ServerFrame::Dump(bytes) = ServerFrame::decode(&first).unwrap() else {
@@ -847,7 +874,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_reports_an_exit_status() {
-        let (mut session, _frames) = Session::spawn(Path::new("/bin/cat"), 80, 24).unwrap();
+        let (mut session, _frames) = Session::spawn(Path::new("/bin/cat"), 80, 24, true).unwrap();
         assert_eq!(session.exit_status(), None);
 
         session.shutdown().await;
@@ -862,14 +889,16 @@ mod tests {
         // another process. The race itself is not reachable from a test, so
         // this test points the session at a group that it does not own and
         // proves that the guard sends no signal to it.
-        let (mut ended, _ended_frames) = Session::spawn(Path::new("/bin/echo"), 80, 24).unwrap();
+        let (mut ended, _ended_frames) =
+            Session::spawn(Path::new("/bin/echo"), 80, 24, true).unwrap();
         assert!(
             ended.wait_for_exit(DRAIN_GRACE).await,
             "/bin/echo must end on its own"
         );
 
         // A live process group that this session must not touch.
-        let (mut other, _other_frames) = Session::spawn(Path::new("/bin/cat"), 80, 24).unwrap();
+        let (mut other, _other_frames) =
+            Session::spawn(Path::new("/bin/cat"), 80, 24, true).unwrap();
         ended.pgid = other.pgid;
 
         ended.shutdown().await;
@@ -890,7 +919,7 @@ mod tests {
     async fn resize_reaches_the_server_side_terminal() {
         // The dump carries the screen, so a wider screen gives a longer dump.
         // The size itself is proved through the PTY in the integration tests.
-        let (mut session, mut frames) = Session::spawn(Path::new("/bin/cat"), 20, 5).unwrap();
+        let (mut session, mut frames) = Session::spawn(Path::new("/bin/cat"), 20, 5, true).unwrap();
         let small = frames.next().await.unwrap().len();
 
         session.resize(200, 50).unwrap();
