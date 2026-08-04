@@ -452,14 +452,21 @@ export class GridRenderer {
 /**
  * The character of one cell.
  *
- * A cell of codepoint 0 and a cell that holds the second half of a wide
- * character both give one space. `@beamterm/renderer` advances one column for
- * each character of a run, so the second half must hold a character of its own.
- * The wide glyph then paints in the first cell alone.
+ * A cell of codepoint 0 gives one space. The second half of a wide character
+ * gives an empty string.
+ *
+ * `batch.text` of `@beamterm/renderer` 1.0.0 walks the run by grapheme
+ * cluster, and it advances by the display width of each cluster, not by one
+ * column for each cluster. A wide cluster therefore advances two columns, and
+ * the renderer paints that cluster across both of them. Measurement, in
+ * Chromium with `--enable-unsafe-swiftshader`: the run `U+6F22` painted
+ * columns 0 and 1, and a run of `U+6F22` and two full blocks painted the
+ * blocks in columns 3 and 4. An extra character for the second half of a wide
+ * character therefore moves the rest of the run one column to the right.
  */
 function symbolOf(term: VtTerminal, cell: VtCell, x: number, y: number): string {
   if (cell.width === 0) {
-    return " ";
+    return "";
   }
   if (cell.graphemeLength > 0) {
     return term.getGraphemeString(x, y);
