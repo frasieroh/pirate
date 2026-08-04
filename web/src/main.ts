@@ -300,6 +300,27 @@ async function main(): Promise<void> {
     // same size and sends no resize frame. The call stays, because a theme
     // change and a container resize can land in the same frame.
     applyFit();
+    // RIS, `ESC c`. The clear must come before the dump request, and these
+    // three facts give the reason:
+    //
+    // 1. The client never frees a `VtTerminal`, so the terminal that held the
+    //    old screen is the terminal that takes the dump.
+    // 2. It never frees one because `ghostty_terminal_free` of
+    //    ghostty-vt.wasm 0.4.0 corrupts the heap of the module. The comment at
+    //    the top of this section holds the measurement.
+    // 3. A state dump carries no clear of its own. It therefore writes its
+    //    text on top of the text that the screen already holds, and one row of
+    //    "pirate" then reads "piratepirate".
+    //
+    // The reset costs the scrollback. This is a known and accepted cost, not
+    // an oversight: the old client built a new terminal for a theme change and
+    // lost the scrollback the same way, so this restores that behavior and
+    // invents none.
+    //
+    // The order is safe against a race. `term.reset` writes into the local
+    // parser at once, and the dump bytes can arrive only in a later task,
+    // because they need a round trip to the server. `tests/theme.spec.ts`
+    // pins the result.
     term.reset();
     send(encodeDumpRequest());
   }
