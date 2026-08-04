@@ -24,13 +24,26 @@ use crate::protocol::{server_tag, ClientFrame};
 use crate::session::{Frames, Session, DEFAULT_COLS, DEFAULT_ROWS, OUTPUT_BATCH};
 use crate::AppState;
 
+/// The `/ws` route, with the shell form of this server.
+///
+/// The form lives in this closure and not in [`AppState`], so the callers of
+/// the `AppState` constructors need no edit.
+pub(crate) fn route(login: bool) -> axum::routing::MethodRouter<Arc<AppState>> {
+    axum::routing::get(
+        move |state: State<Arc<AppState>>, headers: axum::http::HeaderMap, ws: WebSocketUpgrade| {
+            upgrade(state, headers, ws, login)
+        },
+    )
+}
+
 /// Upgrade the request, then start one session for it.
 ///
-/// `WebSocketUpgrade` is the last argument, because it consumes the request.
-pub async fn upgrade(
+/// `WebSocketUpgrade` is the last extractor, because it consumes the request.
+async fn upgrade(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
+    login: bool,
 ) -> Response {
     // Both tests answer before `on_upgrade`. That order is what stops an
     // unauthenticated request from starting a PTY and a shell.
@@ -42,18 +55,18 @@ pub async fn upgrade(
     }
 
     let shell = state.shell.clone();
-    ws.on_upgrade(move |socket| handle(socket, shell))
+    ws.on_upgrade(move |socket| handle(socket, shell, login))
 }
 
 /// Serve one terminal.
-async fn handle(socket: WebSocket, shell: PathBuf) {
+async fn handle(socket: WebSocket, shell: PathBuf, login: bool) {
     // The browser sends its true size as a resize frame right after it
     // connects. These two values hold until then.
-    let (mut session, frames) = match Session::spawn(&shell, DEFAULT_COLS, DEFAULT_ROWS) {
+    let (mut session, frames) = match Session::spawn(&shell, DEFAULT_COLS, DEFAULT_ROWS, login) {
         Ok(started) => started,
         Err(e) => {
             // The client drives this path: it opens a socket, the spawn
-            // fails, and it opens another. See the CAUTION on `OnceFlag`.
+            // fails, and it opens another. See the note on `OnceFlag`.
             if SPAWN_REPORTED.first_time() {
                 eprintln!(
                     "pirate: cannot start `{}`: {e}. \
@@ -213,9 +226,9 @@ async fn apply(session: &mut Session, bytes: &[u8]) -> bool {
 
 /// A flag that lets one message through for the life of the process.
 ///
-/// CAUTION: Keep every log line of this module behind one of these. The client
-/// is untrusted and it holds the socket open, so a line for each fault is a way
-/// to flood stderr. 20000 one-byte frames wrote 20000 lines and 1.6 MB of log.
+/// Every log line of this module stays behind one of these flags. The client is
+/// untrusted and it holds the socket open, so a line for each fault is a way to
+/// flood stderr. 20000 one-byte frames wrote 20000 lines and 1.6 MB of log.
 /// `eprintln!` also takes the lock of stderr and writes at once, inside an
 /// async task, so a slow reader of that log stops a worker thread of tokio.
 ///
