@@ -423,6 +423,38 @@ export function webgl2Report(page: Page): Promise<Webgl2Report> {
   });
 }
 
+/** Where the keyboard focus is. */
+export interface FocusReport {
+  /** The tag name of `document.activeElement`, or "none". */
+  tag: string;
+  /** The id of `document.activeElement`, or an empty string. */
+  id: string;
+  /** True when `document.activeElement` is inside `#terminal`. */
+  inTerminal: boolean;
+}
+
+/**
+ * Report the element that holds the keyboard focus.
+ *
+ * A test of the focus must never call `page.focus` first. That call sets the
+ * state that the test measures, and the test then passes against a client
+ * that gives the focus to nothing.
+ *
+ * `#terminal` holds a hidden text field, and `src/terminal.ts` gives the
+ * focus to that field. `inTerminal` therefore reads the subtree and not the
+ * id of one element.
+ */
+export function focusReport(page: Page): Promise<FocusReport> {
+  return page.evaluate(() => {
+    const element = document.activeElement;
+    return {
+      tag: element?.tagName ?? "none",
+      id: element?.id ?? "",
+      inTerminal: element?.closest("#terminal") != null,
+    };
+  });
+}
+
 /** What the canvas of the terminal reports about its own context. */
 export interface TerminalGlReport {
   /** True when the canvas of the terminal gave a WebGL2 context. */
