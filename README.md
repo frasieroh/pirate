@@ -19,7 +19,7 @@ mise install
 cargo xtask build
 ```
 
-By default, pirate serves TLS on port 10433, on every bind address including the loopback address. The `--plaintext` flag serves plain HTTP on port 8080 instead.
+By default, pirate serves TLS on every bind address, the loopback address included. The default port is 10433. The `--plaintext` flag serves plain HTTP on port 8080 instead.
 
 Run the server:
 
