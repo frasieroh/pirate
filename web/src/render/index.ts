@@ -137,14 +137,6 @@ export class GridRenderer {
    */
   render: (...args: unknown[]) => void;
 
-  /**
-   * The rows that the last `draw` painted, in ascending order.
-   *
-   * This is the measurement of the dirty-row path. An empty array means that
-   * the last `draw` wrote no cell.
-   */
-  lastDrawnRows: readonly number[] = [];
-
   private readonly container: HTMLElement;
   private readonly canvas: HTMLCanvasElement;
   private readonly beam: BeamtermRenderer;
@@ -158,6 +150,7 @@ export class GridRenderer {
   /** The cell that the cursor covered at the last `draw`, or null. */
   private lastCursor: { x: number; y: number } | null = null;
   private disposed = false;
+  private drawnRows: readonly number[] = [];
 
   private constructor(
     container: HTMLElement,
@@ -184,6 +177,17 @@ export class GridRenderer {
 
   get rows(): number {
     return this.gridRows;
+  }
+
+  /**
+   * The rows that the last `draw` painted, in ascending order.
+   *
+   * This is the measurement of the dirty-row path. An empty array means that
+   * the last `draw` wrote no cell. `draw` builds this array for the cursor
+   * restore, so the report adds no allocation.
+   */
+  get lastDrawnRows(): readonly number[] {
+    return this.drawnRows;
   }
 
   /**
@@ -263,7 +267,7 @@ export class GridRenderer {
    */
   draw(term: VtTerminal): void {
     if (this.disposed) {
-      this.lastDrawnRows = [];
+      this.drawnRows = [];
       return;
     }
     this.syncRatio();
@@ -294,7 +298,7 @@ export class GridRenderer {
 
     term.clearDirty();
     this.fullRedraw = false;
-    this.lastDrawnRows = drawn;
+    this.drawnRows = drawn;
     this.render();
   }
 
@@ -306,7 +310,7 @@ export class GridRenderer {
     this.disposed = true;
     this.beam.free();
     this.canvas.remove();
-    this.lastDrawnRows = [];
+    this.drawnRows = [];
   }
 
   // ==========================================================================
