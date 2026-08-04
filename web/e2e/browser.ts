@@ -70,12 +70,33 @@ const VIEWPORT = { width: 1000, height: 600 };
 /** The poll interval of `waitFor`, in milliseconds. */
 const POLL_MS = 25;
 
+/**
+ * The Chromium flag that gives a software WebGL2 context.
+ *
+ * Headless Chromium has no GPU. Chromium then refuses a WebGL context, and
+ * `getContext("webgl2")` gives null. This flag permits the SwiftShader
+ * backend of ANGLE, which draws on the CPU.
+ *
+ * Playwright adds this flag on macOS only. Linux CI therefore gets no
+ * software WebGL2 from the defaults, and this list holds it for every
+ * platform.
+ *
+ * CAUTION: Do not add `--use-angle=swiftshader` or `--use-gl=angle`. Each of
+ * those flags moves the 2D canvas to SwiftShader as well. The paint of the
+ * terminal canvas then arrives after the read, and the pixel counts of this
+ * suite and of `web/bench/latency.spec.ts` give 0.
+ *
+ * `web/tests/harness.ts` holds a copy of this list, for the reason in the
+ * header of this file.
+ */
+const WEBGL_ARGS = ["--enable-unsafe-swiftshader"];
+
 let browser: Browser | undefined;
 
 /** The one browser of this file. It launches on the first call. */
 async function getBrowser(): Promise<Browser> {
   if (browser === undefined) {
-    browser = await chromium.launch();
+    browser = await chromium.launch({ args: WEBGL_ARGS });
   }
   return browser;
 }
@@ -320,6 +341,53 @@ export function canvasSignature(page: Page): Promise<number> {
       hash = Math.imul(hash ^ data[i + 2], 16777619);
     }
     return hash >>> 0;
+  });
+}
+
+/** What a WebGL2 context of the page reports. */
+export interface Webgl2Report {
+  /** True when the canvas gave a WebGL2 context. */
+  present: boolean;
+  /** The `VERSION` parameter of the context, or an empty string. */
+  version: string;
+  /** The `RENDERER` parameter of the context, or an empty string. */
+  renderer: string;
+  /** True when the context reports a clear color that it kept. */
+  usable: boolean;
+}
+
+/**
+ * Ask the page for a WebGL2 context and report what it gives.
+ *
+ * The function adds its own canvas. A canvas holds one context kind for its
+ * whole life, and the terminal canvas already holds a 2D context.
+ *
+ * `usable` runs one command and reads one value back. A stub that answers
+ * every call with null cannot pass that step.
+ */
+export function webgl2Report(page: Page): Promise<Webgl2Report> {
+  return page.evaluate(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 32;
+    canvas.height = 32;
+    document.body.appendChild(canvas);
+    const gl = canvas.getContext("webgl2");
+    if (gl === null) {
+      return { present: false, version: "", renderer: "", usable: false };
+    }
+    gl.clearColor(0.25, 0.5, 0.75, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    const pixel = new Uint8Array(4);
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+    return {
+      present: true,
+      version: String(gl.getParameter(gl.VERSION) ?? ""),
+      renderer: String(gl.getParameter(gl.RENDERER) ?? ""),
+      usable:
+        Math.abs(pixel[0] - 64) <= 2 &&
+        Math.abs(pixel[1] - 128) <= 2 &&
+        Math.abs(pixel[2] - 191) <= 2,
+    };
   });
 }
 

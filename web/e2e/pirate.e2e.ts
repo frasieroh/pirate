@@ -37,6 +37,7 @@ import {
   waitFor,
   waitForConnected,
   waitForLine,
+  webgl2Report,
 } from "./browser";
 import { RECORDER_READY, startPirate } from "./server";
 
@@ -368,6 +369,35 @@ describe("the end of the session", () => {
 
       await server.stop();
       expect(server.exited).toBe(true);
+    } finally {
+      await context.close();
+      await server.stop();
+    }
+  });
+});
+
+// ── 9. the WebGL2 context ─────────────────────────────────────────────────
+describe("WebGL2", () => {
+  test("the page gets a working WebGL2 context", async () => {
+    const server = await startPirate();
+    const { page, context } = await newSession(server);
+    try {
+      const report = await webgl2Report(page);
+
+      // A null context gives `present: false` and two empty strings. The
+      // renderer of the client cannot start against a null context.
+      expect(report.present).toBe(true);
+
+      // Only a real context gives a version string, and it names WebGL 2.0.
+      expect(report.version).toContain("WebGL 2.0");
+
+      // SwiftShader is the CPU backend of ANGLE. The name of the renderer is
+      // masked by default, so this assertion reads the generic name only.
+      expect(report.renderer.length).toBeGreaterThan(0);
+
+      // The context ran one command and gave the result back. A context that
+      // answers every call with a default cannot pass this step.
+      expect(report.usable).toBe(true);
     } finally {
       await context.close();
       await server.stop();
