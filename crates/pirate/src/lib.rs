@@ -68,7 +68,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// gives false here. The `arg0` function of `session.rs` holds the mechanism.
 ///
 /// The form is an argument of this function and not a field of [`AppState`],
-/// so every caller of the `AppState` constructors keeps its own code.
+/// so the callers of the `AppState` constructors need no edit.
 pub fn router_with_login(state: Arc<AppState>, login: bool) -> Router {
     Router::new()
         .route("/ws", ws::route(login))

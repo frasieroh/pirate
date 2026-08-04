@@ -594,7 +594,7 @@ fn to_io(e: pty_process::Error) -> std::io::Error {
 /// no file.
 ///
 /// The value is the file name of `shell`, with a dash in front of it when
-/// `login` is true. A path that ends in `..` or in `/` has no file name, so the
+/// `login` is true. A path such as `/` or `/bin/..` has no file name, so the
 /// whole path is the fallback.
 fn arg0(shell: &Path, login: bool) -> std::ffi::OsString {
     let name = shell.file_name().unwrap_or(shell.as_os_str());
