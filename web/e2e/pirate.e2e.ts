@@ -31,6 +31,7 @@ import {
   login,
   newSession,
   paintedPixels,
+  size,
   staysFalse,
   statusText,
   strictContext,
@@ -431,50 +432,58 @@ describe("WebGL2", () => {
 
 // ── 10. the keyboard focus ────────────────────────────────────────────────
 //
-// CAUTION: No test below calls `page.focus`. That call gives the focus to the
-// terminal, which is the state that these tests measure. A test that calls it
-// first passes against a client that gives the focus to nothing.
+// CAUTION: The test below never calls `page.focus`. That call gives the focus
+// to the terminal, which is the state that the test measures. A test that
+// calls it first passes against a client that gives the focus to nothing.
 //
-// The unit suite cannot hold these tests. Every test of `web/tests` calls
+// The unit suite cannot hold this test. Every test of `web/tests` calls
 // `page.focus("#terminal")` before it types, and the stub of `web/tests` has
 // no login form. The login path is reachable from this file alone.
+//
+// The test measures the focus in both directions, because one direction alone
+// is blind to half of the fault:
+//
+// 1. Before the login, the terminal must NOT hold the focus. This half fails
+//    against a terminal that grabs the focus too early.
+// 2. After the login, the terminal MUST hold the focus. This half fails
+//    against a terminal that never takes it.
+//
+// A theme change also moves the focus to the terminal. That hand-off follows
+// an action of the operator, `src/theme.ts` makes it on purpose, and it is
+// correct. No assertion here treats it as a fault.
 describe("the keyboard focus", () => {
-  test("the login form keeps the keyboard until the operator logs in", async () => {
+  test("the login form keeps the keyboard, then the terminal takes it", async () => {
     const server = await startPirate({ recorder: true });
     const { page, context } = await newSession(server);
     try {
+      // ── before the login ──
       await page.waitForSelector("#login");
 
-      // `src/login.ts` gives the focus to the token field. The terminal does
-      // not exist at this point, so it takes the focus from nothing.
-      const report = await focusReport(page);
-      expect(report.id).toBe("login-token");
-      expect(report.inTerminal).toBe(false);
+      // `src/login.ts` gives the focus to the token field. A terminal that
+      // took the focus at this moment fails these three assertions.
+      const atLogin = await focusReport(page);
+      expect(`the focus is on ${atLogin.id}, inside #terminal: ${atLogin.inTerminal}`).toBe(
+        "the focus is on login-token, inside #terminal: false",
+      );
 
-      // The proof that the keyboard reaches the form: the characters land in
-      // the field. A terminal that took the focus would swallow them.
+      // The keyboard reaches the form: the characters land in the field. A
+      // terminal that held the focus would swallow them.
       await page.keyboard.type("abc");
       expect(await page.inputValue("#login-token")).toBe("abc");
 
-      // The terminal never started, so no client state exists to steal focus.
+      // No terminal exists yet, so none can hold the keyboard.
       expect(await clientReady(page)).toBe(false);
-    } finally {
-      await context.close();
-      await server.stop();
-    }
-  });
 
-  test("the terminal takes the keyboard when the client opens, with no click", async () => {
-    const server = await startPirate({ recorder: true });
-    const { page, context } = await newSession(server);
-    try {
+      // ── the login, on this same page ──
+      // `login` fills the field, which replaces the three characters above.
       await login(page, server.token);
       await waitForConnected(page);
       await waitForLine(page, (lines) => lines[0] === RECORDER_READY, "the recorder marker");
 
+      // ── after the login ──
       // No click and no `page.focus` ran between the login and this read.
-      const report = await focusReport(page);
-      expect(`the focus is in #terminal: ${report.inTerminal}, on ${report.tag}`).toBe(
+      const atTerminal = await focusReport(page);
+      expect(`the focus is in #terminal: ${atTerminal.inTerminal}, on ${atTerminal.tag}`).toBe(
         "the focus is in #terminal: true, on TEXTAREA",
       );
 
@@ -484,6 +493,57 @@ describe("the keyboard focus", () => {
       await page.keyboard.type("typed");
       const lines = await waitForLine(page, (l) => l[1] === "typed", "the typed word");
       expect(lines[1]).toBe("typed");
+    } finally {
+      await context.close();
+      await server.stop();
+    }
+  });
+
+  test("the menu keeps the keyboard while the client redraws", async () => {
+    const server = await startPirate({ recorder: true });
+    const { page, context } = await newSession(server);
+    try {
+      await login(page, server.token);
+      await waitForConnected(page);
+      await waitForLine(page, (lines) => lines[0] === RECORDER_READY, "the recorder marker");
+      const before = await size(page);
+
+      // The operator moves the keyboard to the menu. `page.focus` sets the
+      // precondition of this test. It never sets the state that the test
+      // measures, which is the focus AFTER the redraw below.
+      //
+      // `#menu-toggle` takes the focus and runs nothing. A click on it would
+      // collapse the menu, so this call gives it the focus and never clicks.
+      await page.focus("#menu-toggle");
+
+      // The precondition, asserted and not assumed.
+      const atRest = await focusReport(page);
+      expect(`the focus is on ${atRest.id}, inside #terminal: ${atRest.inTerminal}`).toBe(
+        "the focus is on menu-toggle, inside #terminal: false",
+      );
+
+      // Make the client redraw with the menu at rest. A quiet terminal draws
+      // nothing: `draw` returns early when no row is dirty. A resize marks
+      // every row dirty, so this step forces the redraw path to run. No click
+      // and no keystroke reaches the page while it runs.
+      await page.setViewportSize({ width: 800, height: 500 });
+      const after = await waitFor(
+        () => size(page),
+        (value) => value.cols !== before.cols || value.rows !== before.rows,
+        "the new terminal size",
+      );
+      expect(`${after.cols}x${after.rows}`).not.toBe(`${before.cols}x${before.rows}`);
+
+      // The terminal redrew and took the keyboard from nobody.
+      const stillAtRest = await focusReport(page);
+      expect(`the focus is on ${stillAtRest.id}, inside #terminal: ${stillAtRest.inTerminal}`).toBe(
+        "the focus is on menu-toggle, inside #terminal: false",
+      );
+
+      // The client stayed alive through the step above. Without this, a dead
+      // client would pass the assertion by drawing nothing at all.
+      expect((await clientState(page)).connected).toBe(true);
+      expect(await paintedPixels(page, 0)).toBeGreaterThan(0);
     } finally {
       await context.close();
       await server.stop();

@@ -423,6 +423,14 @@ export function webgl2Report(page: Page): Promise<Webgl2Report> {
   });
 }
 
+/** The size of the terminal, in cells. */
+export function size(page: Page): Promise<{ cols: number; rows: number }> {
+  return page.evaluate(() => {
+    const term = (globalThis as unknown as PirateWindow).__pirate!.term;
+    return { cols: term.cols, rows: term.rows };
+  });
+}
+
 /** Where the keyboard focus is. */
 export interface FocusReport {
   /** The tag name of `document.activeElement`, or "none". */
