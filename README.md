@@ -6,7 +6,7 @@ pirate is a terminal emulator proxy, like gotty or ttyd. It's based on ghostty-w
 
 - A full xterm256-color terminal
 - Authentication, see `$HOME/.pirate/auth_token`
-- HTTPS/TLS support
+- TLS by default, with a self-signed certificate generated at startup
 - iTerm2-compatible theming
 
 ## Quickstart
@@ -18,6 +18,8 @@ mise trust
 mise install
 cargo xtask build
 ```
+
+By default, pirate serves TLS on port 10433, on every bind address including the loopback address. The `--plaintext` flag serves plain HTTP on port 8080 instead.
 
 Run the server:
 
@@ -31,10 +33,14 @@ This yields:
 pirate: serving <N> embedded assets
 pirate: token file <PATH>
 pirate: shell <SHELL>
-pirate: listening on http://127.0.0.1:8080
+pirate: this certificate covers <NAMES>
+pirate: nothing signed this certificate, so the browser will show a warning.
+pirate: compare this fingerprint with the one in that warning:
+pirate: <FINGERPRINT>
+pirate: listening on https://127.0.0.1:10433
 ```
 
-Open that URL in a browser. Enter the token from the file as the password.
+Open that URL in a browser. Enter the token from the file as the password. On the first visit, the browser shows a certificate warning. Compare the fingerprint in the terminal output with the one in the warning.
 
 ## License
 
