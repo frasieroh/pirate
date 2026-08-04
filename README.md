@@ -1,6 +1,6 @@
 # pirate
 
-pirate is a terminal emulator proxy, like gotty or ttyd. It's based on ghostty-web. The terminal emulator and web server are wrapped in one (optionally static) binary.
+pirate is a terminal emulator proxy, like gotty or ttyd. The wasm VT engine comes from ghostty-web. The terminal emulator and web server are wrapped in one (optionally static) binary.
 
 ## Features
 
