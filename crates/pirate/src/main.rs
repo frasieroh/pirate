@@ -22,15 +22,21 @@ const BUILD_INFO: [(&str, &str); 5] = [
     ("wasm sha256", env!("PIRATE_WASM_SHA256")),
 ];
 
+/// The port of a run with no `--port` and no `PIRATE_PORT`, on TLS.
+const TLS_PORT: u16 = 10433;
+
+/// The port of a run with no `--port` and no `PIRATE_PORT`, on `--plaintext`.
+const PLAINTEXT_PORT: u16 = 8080;
+
 #[derive(Parser, Debug)]
 // clap cannot express `--version --long` with its own version flag, because
 // that flag stops the parse. Therefore pirate declares both flags itself.
 #[command(name = "pirate", version, about, long_about = None, disable_version_flag = true)]
-// One transport per run. The group makes clap reject two of these three flags
-// together, so main.rs reads them in a fixed order and never has to rank them.
+// One transport per run. The group makes clap reject these two flags together,
+// so main.rs reads them in a fixed order and never has to rank them.
 #[command(group = clap::ArgGroup::new("tls")
     .multiple(false)
-    .args(["cert", "selfsigned", "plaintext"]))]
+    .args(["cert", "plaintext"]))]
 struct Args {
     /// Show the version and exit. Add --long for every pinned input.
     #[arg(long, short = 'V')]
@@ -44,9 +50,9 @@ struct Args {
     #[arg(long, env = "PIRATE_BIND", default_value = "127.0.0.1")]
     bind: IpAddr,
 
-    /// Port to listen on.
-    #[arg(long, env = "PIRATE_PORT", default_value_t = 8080)]
-    port: u16,
+    /// Port to listen on. The default is 10433 on TLS, and 8080 on --plaintext.
+    #[arg(long, env = "PIRATE_PORT")]
+    port: Option<u16>,
 
     /// Serve the web assets from this directory instead of from the binary.
     /// Point it at the Vite output to get hot reload with no Rust rebuild.
@@ -58,37 +64,32 @@ struct Args {
     #[arg(long)]
     shell: Option<PathBuf>,
 
-    /// Serve TLS with this certificate chain, in PEM. Give --key with it.
+    /// Serve TLS with this certificate chain, in PEM. Give --key with it. With
+    /// no --cert, pirate serves a self-signed certificate that it generates at
+    /// startup.
     #[arg(long, short = 'c', requires = "key")]
     cert: Option<PathBuf>,
 
     /// The private key for --cert, in PEM. Give --cert with it.
     ///
-    // CAUTION: Keep `conflicts_with_all` on this argument. `key` is not a
-    // member of the `tls` group, and clap treats a `requires` target as
-    // satisfied when that target conflicts with an argument that is present.
-    // Without this list, `--key FILE --plaintext` started the server on plain
-    // HTTP and dropped the key of the operator without a word.
+    // `key` is not a member of the `tls` group, so `conflicts_with_all` is what
+    // rejects `--key FILE --plaintext`. The test
+    // `a_supplied_key_and_plaintext_cannot_run_together` holds that behavior.
     #[arg(
         long,
         short = 'k',
         requires = "cert",
-        conflicts_with_all = ["selfsigned", "plaintext"]
+        conflicts_with_all = ["plaintext"]
     )]
     key: Option<PathBuf>,
 
-    /// Generate a self-signed certificate at startup. The browser then shows a
-    /// warning, and pirate prints the fingerprint to compare.
-    #[arg(long, short = 's')]
-    selfsigned: bool,
-
-    /// Serve plain HTTP. CAUTION: every keystroke crosses the network in the
-    /// clear.
+    /// Serve plain HTTP instead of TLS. Every keystroke then crosses the
+    /// network in the clear.
     #[arg(long)]
     plaintext: bool,
 
-    /// Serve with no authentication. CAUTION: every host that can reach the
-    /// port then gets a shell.
+    /// Serve with no authentication. Every host that can reach the port then
+    /// gets a shell.
     #[arg(long, short = 'n')]
     no_password: bool,
 }
@@ -118,13 +119,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("pirate: serving {count} embedded assets");
     }
 
-    let source = transport(&args)?;
+    let source = transport(&args);
+
+    // The default port follows the transport, so it resolves after it. `--port`
+    // and `PIRATE_PORT` both fill `args.port`, and clap ranks those two.
+    let port = args.port.unwrap_or(if source.is_some() {
+        TLS_PORT
+    } else {
+        PLAINTEXT_PORT
+    });
 
     // Bind BEFORE the build of the TLS configuration. `tls::build` puts the
     // real bound address into the generated certificate, and with `--port 0`
     // that address does not exist until the bind above resolves the port.
-    let addr = SocketAddr::new(args.bind, args.port);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let addr = SocketAddr::new(args.bind, port);
+    // The error of `bind` names no address, and the port can come from a
+    // default. This message states the address that the bind refused.
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| format!("the bind to {addr} failed: {e}"))?;
     let addr = listener.local_addr()?;
 
     let tls = match &source {
@@ -208,35 +221,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scheme = if tls.is_some() { "https" } else { "http" };
     eprintln!("pirate: listening on {scheme}://{addr}");
 
+    // These two lines report a choice that other hosts can reach. One line
+    // reports the transport, and one line reports the authentication. A
+    // loopback bind reaches no other host, so the gate keeps both lines off it.
     if !loopback(args.bind) {
-        if args.plaintext {
+        if tls.is_none() {
             eprintln!(
-                "pirate: CAUTION: Use --selfsigned or --cert to encrypt the transport. \
-                 --plaintext sends every keystroke and every byte of the screen in the clear."
+                "pirate: --plaintext on {} sends the token, every keystroke, and every byte \
+                 of the screen in the clear.",
+                args.bind
             );
         }
         if args.no_password {
             eprintln!(
-                "pirate: CAUTION: Drop --no-password, or bind to loopback. The bind address {} \
-                 gives a shell to every host that can reach this port.",
+                "pirate: --no-password on {} gives a shell to every host that can reach \
+                 this port.",
                 args.bind
-            );
-        }
-        if tls.is_none() {
-            eprintln!(
-                "pirate: CAUTION: Use --selfsigned or --cert on this bind address. \
-                 Plain HTTP puts the token on the network in the clear."
-            );
-        }
-        // A second risk of the same transport, and it is not the token. The
-        // certificate is what states the names that the server answers to, so a
-        // server without one answers to every name.
-        if tls.is_none() {
-            eprintln!(
-                "pirate: CAUTION: Use --selfsigned or --cert on this bind address. \
-                 pirate answers to every name in the Host header, so a DNS name that an \
-                 attacker owns reaches this port. A certificate makes the browser warn on \
-                 that name."
             );
         }
     }
@@ -264,34 +264,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Pick the transport. `None` is plain HTTP.
 ///
-/// clap already rejects two of the three flags together, so the order of the
-/// tests here changes no result.
-fn transport(args: &Args) -> Result<Option<TlsSource>, Box<dyn std::error::Error>> {
+/// clap already rejects the two flags together, so the order of the tests here
+/// changes no result.
+fn transport(args: &Args) -> Option<TlsSource> {
     if let (Some(cert), Some(key)) = (&args.cert, &args.key) {
-        return Ok(Some(TlsSource::Files {
+        return Some(TlsSource::Files {
             cert: cert.clone(),
             key: key.clone(),
-        }));
-    }
-    if args.selfsigned {
-        return Ok(Some(TlsSource::SelfSigned));
+        });
     }
     if args.plaintext {
-        return Ok(None);
+        return None;
     }
-    // A browser treats `http://localhost` as a trustworthy origin, and the
-    // bytes reach no network card. Loopback therefore needs no certificate and
-    // no flag. Every other address crosses a network, so the operator must name
-    // the transport and cannot get plain HTTP by accident.
-    if loopback(args.bind) {
-        return Ok(None);
-    }
-    Err(format!(
-        "the bind address {} is not loopback, so pirate needs a transport. \
-         Use --cert with --key, or --selfsigned, or --plaintext.",
-        args.bind
-    )
-    .into())
+    // TLS is the default on every bind address, loopback included. The
+    // generated certificate needs no file and no flag, so a run with no flag
+    // never puts a keystroke on the network in the clear.
+    Some(TlsSource::SelfSigned)
 }
 
 /// True when `address` reaches this machine only.
