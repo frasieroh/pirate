@@ -26,6 +26,7 @@ export interface VtWasmExports {
   // Terminal lifetime and input.
   ghostty_terminal_new(cols: number, rows: number): number;
   ghostty_terminal_free(handle: number): void;
+  ghostty_terminal_resize(handle: number, cols: number, rows: number): void;
   ghostty_terminal_write(handle: number, ptr: number, len: number): void;
 
   // The render state. It holds the snapshot that a renderer reads.

@@ -2,9 +2,14 @@
  * Resize frames: tag `0x01` from the client.
  *
  * The payload is a `u16` cols and a `u16` rows, both big-endian.
+ *
+ * The block `VtTerminal.resize` at the end of this file is a unit test of the
+ * VT layer. It opens no browser and it sends no frame. It reads the wasm
+ * binary out of `node_modules`, as `web/tests/vt.spec.ts` does.
  */
 
-import { beforeEach, expect, test } from "bun:test";
+import { beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { loadVt, type Vt, type VtTerminal } from "../src/vt";
 import { clientState, hex, idle, server, size, waitFor, withClient } from "./harness";
 
 beforeEach(() => {
@@ -98,5 +103,392 @@ test("a burst of size changes gives one resize frame", async () => {
     // eslint-disable-next-line no-console
     console.log(`  debounce ${debounce} ms: 10 size changes gave ${after - before} resize frame(s)`);
     expect(after - before).toBe(1);
+  });
+});
+
+// ============================================================================
+// VtTerminal.resize
+// ============================================================================
+
+/**
+ * `VtTerminal.resize` on the wasm engine. No browser takes part.
+ *
+ * One module serves most of the block. ghostty-vt.wasm 0.4.0 corrupts its
+ * heap when it frees a grid that held a grapheme cluster, and the next grid of
+ * the same column count then traps. The grapheme test therefore takes its own
+ * module. See the note on `VtTerminal.dispose`.
+ */
+describe("VtTerminal.resize", () => {
+  let vt: Vt;
+  let wasmBytes: ArrayBuffer;
+
+  beforeAll(async () => {
+    const path = `${import.meta.dir}/../node_modules/ghostty-web/ghostty-vt.wasm`;
+    wasmBytes = await Bun.file(path).arrayBuffer();
+    vt = await loadVt(wasmBytes);
+  });
+
+  /** Make a terminal, run the body, then free the wasm memory. */
+  function withTerminal(
+    cols: number,
+    rows: number,
+    body: (term: VtTerminal) => void,
+    module: Vt = vt,
+  ): void {
+    const term = module.createTerminal(cols, rows);
+    try {
+      body(term);
+    } finally {
+      term.dispose();
+    }
+  }
+
+  /** The text of one viewport row, without the trailing empty cells. */
+  function rowText(term: VtTerminal, row: number): string {
+    const line = term.getLine(row);
+    if (line === null) {
+      return "";
+    }
+    return line
+      .map((cell) => (cell.codepoint === 0 ? " " : String.fromCodePoint(cell.codepoint)))
+      .join("")
+      .trimEnd();
+  }
+
+  /**
+   * Read every row of the viewport, and stop when one row is missing.
+   *
+   * The row after the last one must give null. A wrong row count in the layer
+   * therefore fails here.
+   */
+  function everyRow(term: VtTerminal): string[] {
+    const rows: string[] = [];
+    for (let r = 0; r < term.rows; r += 1) {
+      const line = term.getLine(r);
+      expect(line).not.toBeNull();
+      expect(line).toHaveLength(term.cols);
+      rows.push(rowText(term, r));
+    }
+    expect(term.getLine(term.rows)).toBeNull();
+    return rows;
+  }
+
+  test("a grow reports the new size, and the viewport holds cols by rows cells", () => {
+    withTerminal(8, 3, (term) => {
+      term.write("pirate");
+
+      term.resize(20, 5);
+
+      expect(term.cols).toBe(20);
+      expect(term.rows).toBe(5);
+      expect(term.getViewport()).toHaveLength(100);
+      expect(everyRow(term)[0]).toBe("pirate");
+    });
+  });
+
+  test("a shrink reports the new size, and the viewport holds cols by rows cells", () => {
+    withTerminal(40, 10, (term) => {
+      term.write("pirate");
+
+      term.resize(12, 4);
+
+      expect(term.cols).toBe(12);
+      expect(term.rows).toBe(4);
+      expect(term.getViewport()).toHaveLength(48);
+      expect(everyRow(term)[0]).toBe("pirate");
+    });
+  });
+
+  test("a grow after a shrink gives a full viewport again", () => {
+    // The cell buffer only grows. This test drives the path where the buffer
+    // is larger than the grid, then larger again.
+    withTerminal(30, 8, (term) => {
+      term.resize(5, 2);
+      expect(term.getViewport()).toHaveLength(10);
+
+      term.resize(30, 8);
+      expect(term.getViewport()).toHaveLength(240);
+
+      term.resize(60, 12);
+      expect(term.getViewport()).toHaveLength(720);
+      expect(everyRow(term)).toHaveLength(12);
+    });
+  });
+
+  test("a write after a resize lands in the new grid", async () => {
+    withTerminal(8, 3, (term) => {
+      term.write("pirate");
+
+      term.resize(20, 5);
+      term.write("\r\nsecond line");
+
+      expect(rowText(term, 0)).toBe("pirate");
+      // The text is 11 characters. It fits on the new grid and not on the old
+      // one, so a stale column count would wrap it.
+      expect(rowText(term, 1)).toBe("second line");
+    });
+  });
+
+  test("a resize keeps a grapheme cluster, and a write after it does not trap", async () => {
+    // This terminal holds a cluster when `dispose` frees it. It therefore
+    // takes its own module.
+    const fresh = await loadVt(wasmBytes);
+    withTerminal(
+      8,
+      3,
+      (term) => {
+        // `e` and U+0301, the combining acute accent. The module joins them
+        // into one cluster in cell 0. The escape keeps the two codepoints
+        // apart from the precomposed U+00E9.
+        const acute = `e${String.fromCodePoint(0x301)}`;
+        term.write(`${acute}x`);
+        expect(term.getGraphemeString(0, 0)).toBe(acute);
+
+        term.resize(20, 5);
+
+        expect(term.cols).toBe(20);
+        expect(term.getViewport()).toHaveLength(100);
+        expect(term.getGraphemeString(0, 0)).toBe(acute);
+        expect(term.getGraphemeString(1, 0)).toBe("x");
+
+        term.write(" more");
+        // `rowText` reads the base codepoint of each cell, so the cluster
+        // shows there as `e` alone. `getGraphemeString` holds the accent.
+        expect(rowText(term, 0)).toBe("ex more");
+        expect(term.getGraphemeString(0, 0)).toBe(acute);
+      },
+      fresh,
+    );
+  });
+
+  test("a resize to a new size reports a full redraw", () => {
+    withTerminal(8, 3, (term) => {
+      term.write("pirate");
+      term.clearDirty();
+      expect(term.isDirty()).toBe(false);
+
+      term.resize(20, 5);
+
+      // eslint-disable-next-line no-console
+      console.log(`  8x3 -> 20x5: needsFullRedraw ${term.needsFullRedraw()}`);
+      expect(term.needsFullRedraw()).toBe(true);
+      expect(term.isRowDirty(4)).toBe(true);
+
+      term.clearDirty();
+      term.resize(8, 3);
+
+      // eslint-disable-next-line no-console
+      console.log(`  20x5 -> 8x3: needsFullRedraw ${term.needsFullRedraw()}`);
+      expect(term.needsFullRedraw()).toBe(true);
+    });
+  });
+
+  test("a resize to the size that the terminal has reports no redraw", () => {
+    // The module sets the dirty state, and no row changed here. The JSDoc of
+    // `resize` states this case.
+    withTerminal(8, 3, (term) => {
+      term.write("pirate");
+      term.clearDirty();
+
+      term.resize(8, 3);
+
+      expect(term.needsFullRedraw()).toBe(false);
+      expect(term.isDirty()).toBe(false);
+      expect(term.cols).toBe(8);
+      expect(term.rows).toBe(3);
+    });
+  });
+
+  test("a bad size throws, and the terminal keeps its old size", () => {
+    withTerminal(8, 3, (term) => {
+      term.write("pirate");
+
+      for (const [cols, rows] of [
+        [0, 5],
+        [5, 0],
+        [-1, 5],
+        [5, -1],
+        [1.5, 5],
+        [5, Number.NaN],
+      ] as [number, number][]) {
+        expect(() => term.resize(cols, rows)).toThrow(
+          /a terminal needs a positive cols and rows/,
+        );
+      }
+
+      // The module never saw a bad size, so the grid is unchanged and usable.
+      expect(term.cols).toBe(8);
+      expect(term.rows).toBe(3);
+      expect(term.getViewport()).toHaveLength(24);
+      expect(rowText(term, 0)).toBe("pirate");
+    });
+  });
+
+  test("cols and rows take no assignment from outside", () => {
+    withTerminal(8, 3, (term) => {
+      const outside = term as unknown as { cols: number; rows: number };
+
+      expect(() => {
+        outside.cols = 40;
+      }).toThrow(TypeError);
+      expect(term.cols).toBe(8);
+    });
+  });
+
+  test("a resize keeps the handle, so the content survives the new size", async () => {
+    // A resize that freed the terminal and made a new one would lose these
+    // five lines. `resize` calls no `ghostty_terminal_free`.
+    //
+    // The module reflows the lines across the boundary of the viewport. Five
+    // lines on a grid of 3 rows leave 2 lines in the scrollback. A grow to 5
+    // rows pulls both lines back into the viewport and leaves the scrollback
+    // empty. A shrink to 2 rows pushes 3 lines out again.
+    //
+    // This test takes its own module. ghostty-vt.wasm 0.4.0 fills the columns
+    // after the text of a row that a grow pulls back out of the scrollback
+    // with the bytes that the allocator left there. On a heap that already
+    // freed a terminal, row 0 of this test then reads `oneate`, where `ate`
+    // is the tail of a `pirate` that an earlier test wrote. A measurement of
+    // the raw exports gives the same result with no code of this layer, so
+    // the defect is in the module. A fresh module has a zeroed heap.
+    const fresh = await loadVt(wasmBytes);
+    withTerminal(8, 3, (term) => {
+      term.write("one\r\ntwo\r\nthree\r\nfour\r\nfive");
+      expect(term.getScrollbackLength()).toBe(2);
+      expect(everyRow(term)).toEqual(["three", "four", "five"]);
+
+      term.resize(20, 5);
+
+      expect(term.getScrollbackLength()).toBe(0);
+      expect(everyRow(term)).toEqual(["one", "two", "three", "four", "five"]);
+
+      term.resize(20, 2);
+
+      expect(term.getScrollbackLength()).toBe(3);
+      expect(everyRow(term)).toEqual(["four", "five"]);
+      expect(term.getScrollbackLine(0)?.length).toBe(20);
+    }, fresh);
+  });
+
+  test("a size that the wasm i32 cannot carry throws before the module sees it", () => {
+    // JavaScript converts an argument to an i32 at the wasm boundary, with a
+    // wrap. A measurement of the raw exports gives the result of each wrap.
+    // 2 to the power 31 becomes -2147483648. The module then stops with "Out
+    // of bounds memory access". 2 to the power 32 becomes 0, and the module
+    // stops the same way. 100000 by 100000 does not return at all.
+    //
+    // A trap is not a rejection. The layer frees the cell buffer of the old
+    // grid before it calls the module. A trap therefore also leaves the
+    // terminal unusable, and every later `getViewport` stops the same way.
+    withTerminal(8, 3, (term) => {
+      term.write("pirate");
+
+      for (const [cols, rows] of [
+        [2 ** 31, 1],
+        [1, 2 ** 31],
+        [2 ** 32, 1],
+        [100000, 100000],
+        [65535, 65535],
+        [65536, 1],
+      ] as [number, number][]) {
+        expect(() => term.resize(cols, rows)).toThrow(/is too large/);
+      }
+
+      // The module never saw any of these sizes, so the terminal still reads.
+      expect(term.cols).toBe(8);
+      expect(term.rows).toBe(3);
+      expect(term.getViewport()).toHaveLength(24);
+      expect(rowText(term, 0)).toBe("pirate");
+    });
+  });
+
+  test("Infinity is not a size", () => {
+    withTerminal(8, 3, (term) => {
+      for (const [cols, rows] of [
+        [Number.POSITIVE_INFINITY, 5],
+        [5, Number.POSITIVE_INFINITY],
+        [Number.NEGATIVE_INFINITY, 5],
+      ] as [number, number][]) {
+        expect(() => term.resize(cols, rows)).toThrow(
+          /a terminal needs a positive cols and rows/,
+        );
+      }
+      expect(term.cols).toBe(8);
+    });
+  });
+
+  test("the largest size that the rule allows reaches the module", () => {
+    // `CELLS_MAX` is 2 to the power 24. This grid is that count exactly, so
+    // the rule and the module agree at the limit.
+    withTerminal(8, 3, (term) => {
+      term.resize(16384, 1024);
+
+      expect(term.cols).toBe(16384);
+      expect(term.rows).toBe(1024);
+      expect(term.getLine(1023)).not.toBeNull();
+      expect(term.getLine(1024)).toBeNull();
+    });
+  });
+
+  test("every row is dirty after a resize, and none is after a resize to the same size", () => {
+    withTerminal(8, 3, (term) => {
+      term.write("pirate");
+      term.clearDirty();
+
+      term.resize(20, 5);
+
+      // `needsFullRedraw` and `isRowDirty` must agree. A renderer that trusts
+      // one and not the other would leave a stale row on the screen.
+      expect(term.needsFullRedraw()).toBe(true);
+      for (let row = 0; row < term.rows; row += 1) {
+        expect(term.isRowDirty(row)).toBe(true);
+      }
+
+      term.clearDirty();
+      term.resize(20, 5);
+
+      expect(term.needsFullRedraw()).toBe(false);
+      for (let row = 0; row < term.rows; row += 1) {
+        expect(term.isRowDirty(row)).toBe(false);
+      }
+    });
+  });
+
+  test("400 resizes in a loop keep the content and the buffer", async () => {
+    // The path of a font-size control. This terminal takes its own module,
+    // because the shared module already freed a terminal. See the note on the
+    // scrollback test.
+    const fresh = await loadVt(wasmBytes);
+    withTerminal(
+      80,
+      24,
+      (term) => {
+        for (let i = 0; i < 200; i += 1) {
+          term.resize(60, 18);
+          term.resize(100, 30);
+        }
+        term.write("pirate");
+
+        expect(term.cols).toBe(100);
+        expect(term.rows).toBe(30);
+        expect(term.getViewport()).toHaveLength(3000);
+        expect(rowText(term, 0)).toBe("pirate");
+
+        // No cell outside row 0 holds anything. A stale byte of the wasm heap
+        // shows up here as a codepoint that no write put there.
+        const written = term
+          .getViewport()
+          .filter((cell) => cell.codepoint !== 0);
+        expect(written).toHaveLength(6);
+      },
+      fresh,
+    );
+  });
+
+  test("a resize of a disposed terminal throws", () => {
+    const term = vt.createTerminal(8, 3);
+    term.dispose();
+
+    expect(() => term.resize(20, 5)).toThrow(/disposed/);
   });
 });
