@@ -10,9 +10,10 @@
  * path uses, so this file gives the bytes to `loadVt` itself. `loadVt` reads
  * the bundled asset only when it gets no argument.
  *
- * Every terminal here has 10 columns or more. ghostty-vt.wasm 0.4.0 corrupts
- * its heap when it frees a narrower grid, and one module serves the whole
- * file. See the note on `VtTerminal.dispose`.
+ * One module serves the whole file. ghostty-vt.wasm 0.4.0 corrupts its heap
+ * when it frees a grid that held a grapheme cluster, and the next grid of the
+ * same column count then traps. A test that writes a cluster therefore takes
+ * its own module. See the note on `VtTerminal.dispose`.
  */
 
 import { beforeAll, describe, expect, test } from "bun:test";
@@ -246,6 +247,24 @@ test("dirty tracking marks the written row and clears on demand", () => {
   });
 });
 
+test("a row outside the viewport is never dirty", () => {
+  withTerminal(20, 4, (term) => {
+    // The whole screen is dirty here, so a row that exists answers true. A
+    // row that does not exist must still answer false.
+    term.write("first");
+    expect(term.isRowDirty(0)).toBe(true);
+
+    expect(term.isRowDirty(4)).toBe(false);
+    expect(term.isRowDirty(99)).toBe(false);
+    expect(term.isRowDirty(-1)).toBe(false);
+    // The wasm function takes an `i32`. Without a check in the layer, the
+    // conversion turns NaN into 0 and truncates 0.5, so both of these read
+    // the answer of row 0.
+    expect(term.isRowDirty(Number.NaN)).toBe(false);
+    expect(term.isRowDirty(0.5)).toBe(false);
+  });
+});
+
 test("a screen switch asks for a full redraw", () => {
   withTerminal(20, 4, (term) => {
     term.write("normal");
@@ -275,6 +294,25 @@ describe("cells and lines", () => {
       expect(viewport[0].codepoint).toBe(cp("A"));
       expect(viewport[10].codepoint).toBe(cp("B"));
       expect(viewport[29].codepoint).toBe(cp("C"));
+    });
+  });
+
+  test("a wide character takes two cells, and the second one is a spacer", () => {
+    withTerminal(20, 2, (term) => {
+      // U+6F22 is a CJK ideograph. A terminal gives it two columns.
+      term.write("漢A");
+
+      const line = term.getLine(0);
+      expect(line?.[0].codepoint).toBe(0x6f22);
+      expect(line?.[0].width).toBe(2);
+      // The spacer holds no codepoint and no width. A renderer that draws it
+      // would draw over the right half of the wide character.
+      expect(line?.[1].codepoint).toBe(0);
+      expect(line?.[1].width).toBe(0);
+      // The next character starts after the spacer.
+      expect(line?.[2].codepoint).toBe(cp("A"));
+      expect(line?.[2].width).toBe(1);
+      expect(term.getCursor().x).toBe(3);
     });
   });
 
@@ -356,9 +394,22 @@ describe("modes", () => {
       expect(term.hasFocusEvents()).toBe(false);
       expect(term.hasMouseTracking()).toBe(false);
 
-      term.write(`${ESC}[?2004h${ESC}[?1004h${ESC}[?1000h`);
+      // Each mode goes on alone. Three modes set together cannot tell one
+      // reader from another: a `hasBracketedPaste` that reads mode 1004
+      // answers true for all three.
+      term.write(`${ESC}[?2004h`);
       expect(term.hasBracketedPaste()).toBe(true);
+      expect(term.hasFocusEvents()).toBe(false);
+      expect(term.hasMouseTracking()).toBe(false);
+
+      term.write(`${ESC}[?2004l${ESC}[?1004h`);
+      expect(term.hasBracketedPaste()).toBe(false);
       expect(term.hasFocusEvents()).toBe(true);
+      expect(term.hasMouseTracking()).toBe(false);
+
+      term.write(`${ESC}[?1004l${ESC}[?1000h`);
+      expect(term.hasBracketedPaste()).toBe(false);
+      expect(term.hasFocusEvents()).toBe(false);
       expect(term.hasMouseTracking()).toBe(true);
 
       term.write(`${ESC}[?2004l${ESC}[?1004l${ESC}[?1000l`);
@@ -574,6 +625,44 @@ describe("lifetime", () => {
     term.dispose();
     // A second call frees nothing again. A double free corrupts the wasm heap.
     expect(() => term.dispose()).not.toThrow();
+  });
+
+  test("a read after dispose throws, and does not reach the module", () => {
+    const term = vt.createTerminal(10, 2);
+    term.write("A");
+    term.dispose();
+
+    // The handle is back with the module, and the module reused that memory.
+    // `ghostty_render_state_update` on a freed handle does not return: it
+    // runs forever. Without the check in the layer, each of these calls
+    // freezes the thread, and this test never ends.
+    expect(() => term.getViewport()).toThrow();
+    expect(() => term.getLine(0)).toThrow();
+    expect(() => term.getCursor()).toThrow();
+    expect(() => term.getColors()).toThrow();
+    expect(() => term.isRowDirty(0)).toThrow();
+    expect(() => term.isDirty()).toThrow();
+    expect(() => term.needsFullRedraw()).toThrow();
+    expect(() => term.clearDirty()).toThrow();
+    expect(() => term.getGrapheme(0, 0)).toThrow();
+    expect(() => term.getGraphemeString(0, 0)).toThrow();
+    expect(() => term.getScrollbackLine(0)).toThrow();
+    expect(() => term.getHyperlinkUri(0, 0)).toThrow();
+    expect(() => term.getScrollbackHyperlinkUri(0, 0)).toThrow();
+
+    // These reach the module without the render state. They give a wrong
+    // answer instead of a hang, so the check must cover them too.
+    expect(() => term.write("B")).toThrow();
+    expect(() => term.getScrollbackLength()).toThrow();
+    expect(() => term.isAlternateScreen()).toThrow();
+    expect(() => term.hasBracketedPaste()).toThrow();
+    expect(() => term.hasMouseTracking()).toThrow();
+    expect(() => term.getMode(25)).toThrow();
+    expect(() => term.hasResponse()).toThrow();
+    expect(() => term.readResponse()).toThrow();
+    expect(() =>
+      term.encodeKey({ action: VtKeyAction.PRESS, key: VtKey.A, mods: 0, utf8: "a" }),
+    ).toThrow();
   });
 
   test("one module serves many terminals", () => {

@@ -89,6 +89,7 @@ export class VtTerminal {
    * at the end of a write and continues it on the next write.
    */
   write(data: Uint8Array | string): void {
+    const handle = this.live;
     const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
     if (bytes.length === 0) {
       return;
@@ -100,7 +101,7 @@ export class VtTerminal {
     }
     try {
       new Uint8Array(this.exports.memory.buffer).set(bytes, ptr);
-      this.exports.ghostty_terminal_write(this.handle, ptr, bytes.length);
+      this.exports.ghostty_terminal_write(handle, ptr, bytes.length);
     } finally {
       this.exports.ghostty_wasm_free_u8_array(ptr, bytes.length);
     }
@@ -120,7 +121,7 @@ export class VtTerminal {
     this.update();
     const count = this.cols * this.rows;
     const got = this.exports.ghostty_render_state_get_viewport(
-      this.handle,
+      this.live,
       this.cellsPtr,
       count,
     );
@@ -155,7 +156,7 @@ export class VtTerminal {
 
   /** The count of lines in the scrollback. The viewport is not counted. */
   getScrollbackLength(): number {
-    return this.exports.ghostty_terminal_get_scrollback_length(this.handle);
+    return this.exports.ghostty_terminal_get_scrollback_length(this.live);
   }
 
   /**
@@ -171,7 +172,7 @@ export class VtTerminal {
     }
     this.update();
     const got = this.exports.ghostty_terminal_get_scrollback_line(
-      this.handle,
+      this.live,
       offset,
       this.cellsPtr,
       this.cols,
@@ -194,17 +195,17 @@ export class VtTerminal {
   getCursor(): VtCursor {
     this.update();
     return {
-      x: this.exports.ghostty_render_state_get_cursor_x(this.handle),
-      y: this.exports.ghostty_render_state_get_cursor_y(this.handle),
-      visible: this.exports.ghostty_render_state_get_cursor_visible(this.handle) !== 0,
+      x: this.exports.ghostty_render_state_get_cursor_x(this.live),
+      y: this.exports.ghostty_render_state_get_cursor_y(this.live),
+      visible: this.exports.ghostty_render_state_get_cursor_visible(this.live) !== 0,
     };
   }
 
   /** The default foreground and background of the screen, as 8-bit RGB. */
   getColors(): VtColors {
     this.update();
-    const fg = this.exports.ghostty_render_state_get_fg_color(this.handle);
-    const bg = this.exports.ghostty_render_state_get_bg_color(this.handle);
+    const fg = this.exports.ghostty_render_state_get_fg_color(this.live);
+    const bg = this.exports.ghostty_render_state_get_bg_color(this.live);
     return {
       foreground: { r: (fg >> 16) & 0xff, g: (fg >> 8) & 0xff, b: fg & 0xff },
       background: { r: (bg >> 16) & 0xff, g: (bg >> 8) & 0xff, b: bg & 0xff },
@@ -215,10 +216,22 @@ export class VtTerminal {
   // Dirty state
   // ==========================================================================
 
-  /** True when the given row changed after the last `clearDirty`. */
+  /**
+   * True when the given row changed after the last `clearDirty`.
+   *
+   * A row outside the viewport gives false.
+   *
+   * The bound check is here, not in the module. The wasm function takes an
+   * `i32`, and the conversion truncates a fraction and turns NaN into 0. It
+   * therefore answers for row 0 when the argument is NaN, and for row 1 when
+   * the argument is 1.5.
+   */
   isRowDirty(row: number): boolean {
+    if (!inRange(row, this.rows)) {
+      return false;
+    }
     this.update();
-    return this.exports.ghostty_render_state_is_row_dirty(this.handle, row) !== 0;
+    return this.exports.ghostty_render_state_is_row_dirty(this.live, row) !== 0;
   }
 
   /** True when any row changed after the last `clearDirty`. */
@@ -246,7 +259,7 @@ export class VtTerminal {
    */
   clearDirty(): void {
     this.update();
-    this.exports.ghostty_render_state_mark_clean(this.handle);
+    this.exports.ghostty_render_state_mark_clean(this.live);
   }
 
   // ==========================================================================
@@ -254,7 +267,7 @@ export class VtTerminal {
   // ==========================================================================
 
   isAlternateScreen(): boolean {
-    return this.exports.ghostty_terminal_is_alternate_screen(this.handle) !== 0;
+    return this.exports.ghostty_terminal_is_alternate_screen(this.live) !== 0;
   }
 
   hasBracketedPaste(): boolean {
@@ -266,7 +279,7 @@ export class VtTerminal {
   }
 
   hasMouseTracking(): boolean {
-    return this.exports.ghostty_terminal_has_mouse_tracking(this.handle) !== 0;
+    return this.exports.ghostty_terminal_has_mouse_tracking(this.live) !== 0;
   }
 
   /**
@@ -276,7 +289,7 @@ export class VtTerminal {
    * is true for an ANSI mode.
    */
   getMode(mode: number, ansi = false): boolean {
-    return this.exports.ghostty_terminal_get_mode(this.handle, mode, ansi ? 1 : 0) !== 0;
+    return this.exports.ghostty_terminal_get_mode(this.live, mode, ansi ? 1 : 0) !== 0;
   }
 
   // ==========================================================================
@@ -308,7 +321,7 @@ export class VtTerminal {
     // The wasm function takes the row before the column. See the note on the
     // declaration of `ghostty_render_state_get_grapheme`.
     const got = this.exports.ghostty_render_state_get_grapheme(
-      this.handle,
+      this.live,
       y,
       x,
       this.graphemePtr,
@@ -388,7 +401,7 @@ export class VtTerminal {
    * A sequence such as DSR, `ESC [ 6 n`, makes the terminal produce one.
    */
   hasResponse(): boolean {
-    return this.exports.ghostty_terminal_has_response(this.handle) !== 0;
+    return this.exports.ghostty_terminal_has_response(this.live) !== 0;
   }
 
   /**
@@ -405,7 +418,7 @@ export class VtTerminal {
     }
     try {
       const got = this.exports.ghostty_terminal_read_response(
-        this.handle,
+        this.live,
         ptr,
         RESPONSE_MAX,
       );
@@ -435,11 +448,11 @@ export class VtTerminal {
    * key gives `ESC [ A` where the program expects `ESC O A`.
    */
   encodeKey(event: VtKeyEvent): Uint8Array {
+    // The mode read comes first. It goes through the disposed check, so a
+    // call after `dispose` makes no encoder that no one frees.
+    const application = this.getMode(MODE_CURSOR_KEYS) ? 1 : 0;
     const encoder = this.keyEncoder();
-    this.setEncoderOption(
-      OPT_CURSOR_KEY_APPLICATION,
-      this.getMode(MODE_CURSOR_KEYS) ? 1 : 0,
-    );
+    this.setEncoderOption(OPT_CURSOR_KEY_APPLICATION, application);
 
     const eventPtr = this.newKeyEvent();
     const outPtr = this.exports.ghostty_wasm_alloc_u8_array(KEY_ENCODE_MAX);
@@ -484,23 +497,23 @@ export class VtTerminal {
   /**
    * Free the wasm memory of this terminal.
    *
-   * A second call does nothing. Every other method gives wrong results after
-   * this call, because the handle is gone.
+   * A second call does nothing. Every other method throws after this call.
    *
    * CAUTION: ghostty-vt.wasm 0.4.0 corrupts its own heap in
-   * `ghostty_terminal_free` in two measured cases. A later terminal of the
-   * same module then reads wrong cells, or stops with "Out of bounds memory
-   * access". Both measurements use the raw wasm exports, with no code of this
-   * layer:
+   * `ghostty_terminal_free` when the terminal held a grapheme cluster. The
+   * next terminal of the same column count then stops with "Out of bounds
+   * memory access". The row count takes no part.
    *
-   *   - A grid of 9 columns or fewer, with no write at all. A grid of 10
-   *     columns or more stays clean.
-   *   - A grid of 10 columns that held a grapheme cluster. A grid of 80
-   *     columns by 24 rows stays clean.
+   * The measurement uses the raw wasm exports, with no code of this layer. It
+   * writes `e` and U+0301 to a grid, frees the grid, then makes a second grid
+   * and writes to it. Every column count from 2 to 90 traps at the one point
+   * where the second grid is as wide as the first: a freed grid of 20 columns
+   * traps a second grid of 20 columns, and a freed grid of 80 columns traps a
+   * second grid of 80 columns. A grid of a different width stays clean.
    *
-   * The defect is in the wasm module, so this layer cannot correct it. Give
-   * the terminal the full width of a screen, or load one module for each
-   * terminal that must go away.
+   * The defect is in the wasm module, so this layer cannot correct it. A
+   * resize that frees one terminal and makes the next one of the same width
+   * therefore needs one module for each terminal.
    */
   dispose(): void {
     if (this.disposed) {
@@ -521,6 +534,23 @@ export class VtTerminal {
   // ==========================================================================
 
   /**
+   * The handle of the terminal, for a terminal that is not disposed.
+   *
+   * Every call into the module goes through this getter. `dispose` gives the
+   * handle back to the module, and a later call with that handle reaches
+   * memory that the module reused. A measurement of the raw exports shows
+   * that `ghostty_render_state_update` on a freed handle does not return: it
+   * runs forever and freezes the thread that called it. A renderer that
+   * paints one more frame after a resize would therefore freeze the tab.
+   */
+  private get live(): number {
+    if (this.disposed) {
+      throw new Error("the terminal is disposed, so it holds no state to read");
+    }
+    return this.handle;
+  }
+
+  /**
    * Bring the render state up to the terminal state.
    *
    * Every read of a cell, a cursor, a color, a grapheme, or a scrollback line
@@ -528,7 +558,7 @@ export class VtTerminal {
    * idempotent, and the dirty state holds until `clearDirty`.
    */
   private update(): number {
-    return this.exports.ghostty_render_state_update(this.handle);
+    return this.exports.ghostty_render_state_update(this.live);
   }
 
   /** Make the key encoder on the first call, then reuse it. */
