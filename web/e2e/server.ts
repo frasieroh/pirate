@@ -220,7 +220,6 @@ export async function startPirate(options: PirateOptions = {}): Promise<Pirate> 
   const proc = Bun.spawn(
     [
       BINARY,
-      "--selfsigned",
       "--bind",
       "127.0.0.1",
       "--port",
