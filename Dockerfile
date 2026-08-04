@@ -65,22 +65,20 @@ FROM gcr.io/distroless/static-debian12:nonroot@sha256:f5b485ea962d9bd1186b2f6b3a
 COPY --from=unpack /out/pirate /usr/local/bin/pirate
 
 # EXPOSE is documentation. It publishes nothing.
-EXPOSE 8080
-ENV PIRATE_PORT=8080
+EXPOSE 10433
 
-# CAUTION: Do not set PIRATE_BIND in this file. pirate has no authentication,
-# and its default bind address is 127.0.0.1. A bind to 0.0.0.0 gives a shell to
-# every host that can reach the port.
+# This file does not set PIRATE_BIND. The default bind address of pirate is
+# 127.0.0.1.
 #
-# The loopback default makes `docker run -p 8080:8080` answer nothing, because
-# a published port reaches the container from outside. That result is correct.
-# The operator selects a wider bind, one command at a time:
+# A container that binds the loopback address answers nothing on a published
+# port. That result is correct. The operator selects a wider bind, one
+# command at a time:
 #
-#   docker run --rm -it -p 127.0.0.1:8080:8080 -e PIRATE_BIND=0.0.0.0 pirate:0.1.0
+#   docker run --rm -it -p 127.0.0.1:10433:10433 -e PIRATE_BIND=0.0.0.0 pirate:0.1.0
 #
 # This command keeps the container port on the loopback address of the host.
-# Before you publish the port on a network address, put an authenticating
-# reverse proxy in front of the container.
+# pirate serves TLS on 10433 by default, so the browser URL is
+# https://127.0.0.1:10433.
 
 USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/pirate"]
