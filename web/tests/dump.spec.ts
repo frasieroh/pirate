@@ -1,9 +1,9 @@
 /**
  * Dump frames: tag `0x01`, and the stale screen of risk 5.
  *
- * A dump is one large write, and the stream goes quiet after it. Painting in
- * ghostty-web runs on `requestAnimationFrame` and is independent of parsing,
- * so this shape is the one that can leave a stale screen on the canvas.
+ * A dump is one large write, and the stream goes quiet after it. The facade of
+ * `src/terminal.ts` paints from an animation frame loop, independent of the
+ * parse, so this shape is the one that can leave a stale screen on the canvas.
  *
  * The server sends a dump when a socket opens, and again after it drops the
  * backlog of a slow client. Both cases have the same shape.
@@ -131,8 +131,8 @@ test("control: with the paint loop stopped, the same dump leaves a stale screen"
 });
 
 test("the renderer keeps running while the stream is quiet", async () => {
-  // The mechanism behind the result above. ghostty-web 0.4.0 runs an
-  // unconditional requestAnimationFrame loop, so a quiet stream still gets
+  // The mechanism behind the result above. `src/terminal.ts` runs one
+  // unconditional `requestAnimationFrame` loop, so a quiet stream still gets
   // frames and a dump cannot wait for another event.
   const stub = server();
   stub.setOnOpen([{ tag: 0x01, text: screenText(5, "dump") }]);

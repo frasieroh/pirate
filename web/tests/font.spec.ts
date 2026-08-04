@@ -74,7 +74,17 @@ test("one font size change gives exactly one resize frame, with the new size", a
   });
 });
 
-test("a larger font gives fewer columns, and a smaller font gives more columns", async () => {
+test("a larger font gives a smaller grid, and a smaller font gives a larger grid", async () => {
+  // The atlas of `@beamterm/renderer` rasterizes at whole device pixels, so a
+  // cell size is a whole number and one step of the font size does not always
+  // change both of its sides. Measurement at a device pixel ratio of 1, in the
+  // container of this test: font 13 gives a cell of 8 by 13, font 14 gives 9 by
+  // 15, and font 15 gives 9 by 16. The column count therefore holds from 14 to
+  // 15 while the row count falls.
+  //
+  // This test measures the cell count of the grid, which is the size of the
+  // screen. It also holds each side to its direction, so a font increase can
+  // never widen the grid.
   await withClient(async (page) => {
     const debounce = (await clientState(page)).resizeDebounceMs;
     const original = await size(page);
@@ -87,7 +97,9 @@ test("a larger font gives fewer columns, and a smaller font gives more columns",
     );
     await idle(debounce + 400);
     const larger = await size(page);
-    expect(larger.cols).toBeLessThan(original.cols);
+    expect(larger.cols * larger.rows).toBeLessThan(original.cols * original.rows);
+    expect(larger.cols).toBeLessThanOrEqual(original.cols);
+    expect(larger.rows).toBeLessThanOrEqual(original.rows);
 
     // Two decreases: one back to the original size, one below it.
     await page.click("#font-decrease");
@@ -99,7 +111,9 @@ test("a larger font gives fewer columns, and a smaller font gives more columns",
     );
     await idle(debounce + 400);
     const smaller = await size(page);
-    expect(smaller.cols).toBeGreaterThan(original.cols);
+    expect(smaller.cols * smaller.rows).toBeGreaterThan(original.cols * original.rows);
+    expect(smaller.cols).toBeGreaterThanOrEqual(original.cols);
+    expect(smaller.rows).toBeGreaterThanOrEqual(original.rows);
   });
 });
 

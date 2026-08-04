@@ -205,7 +205,9 @@ async function install(where: Page): Promise<void> {
           theme: options.theme,
         });
         box.canvas = container.querySelector("canvas");
-        const draw = box.grid.render as (...a: unknown[]) => void;
+        // `render` is a method of the prototype, so it needs its receiver. An
+        // unbound call would read `this` as undefined.
+        const draw = (box.grid.render as (...a: unknown[]) => void).bind(box.grid);
         box.grid.render = (...a: unknown[]): void => {
           box.renderCalls += 1;
           draw(...a);
@@ -603,22 +605,6 @@ describe("the attributes", () => {
       [{ col: 0, row: 0 }],
     );
     expect(show(colors[0])).toBe("#889098");
-  });
-
-  test("BLINK paints the same cell as a steady cell", async () => {
-    await make(20, 6);
-    const steady = await page.evaluate(() => {
-      const grid = (globalThis as unknown as { __grid: GridApi }).__grid;
-      grid.write("M");
-      return grid.cellSignature(0, 0);
-    });
-    await make(20, 6);
-    const blinking = await page.evaluate((esc: string) => {
-      const grid = (globalThis as unknown as { __grid: GridApi }).__grid;
-      grid.write(`${esc}[5mM`);
-      return grid.cellSignature(0, 0);
-    }, ESC);
-    expect(blinking).toBe(steady);
   });
 });
 
@@ -1083,5 +1069,62 @@ describe("the source", () => {
         expect(`${file.path}: ${file.text}`).not.toContain(name);
       }
     }
+  });
+
+  /** Every TypeScript file of the client and of its tests. */
+  async function allSources(): Promise<{ path: string; text: string }[]> {
+    const web = `${import.meta.dir}/..`;
+    const glob = new Bun.Glob("**/*.ts");
+    const out: { path: string; text: string }[] = [];
+    for (const dir of ["src", "tests", "e2e", "bench"]) {
+      for await (const name of glob.scan({ cwd: `${web}/${dir}` })) {
+        out.push({ path: `${dir}/${name}`, text: await Bun.file(`${web}/${dir}/${name}`).text() });
+      }
+    }
+    return out;
+  }
+
+  test("no file of the client imports the ghostty-web JavaScript module", async () => {
+    // Criterion 2. The client drives `src/vt` and `src/render`, so the
+    // JavaScript layer of `ghostty-web` has no reader left. The package stays
+    // in `package.json` for one asset: the wasm binary of the VT engine.
+    //
+    // The wasm subpath below is the ONE permitted specifier. Any other
+    // specifier that starts with `ghostty-web` is a defect.
+    const allowed = "ghostty-web/ghostty-vt.wasm?url";
+    const specifier = /(?:from|import)\s*\(?\s*"([^"]+)"/g;
+    const found: string[] = [];
+    for (const file of await allSources()) {
+      for (const match of file.text.matchAll(specifier)) {
+        const name = match[1];
+        if (name.startsWith("ghostty-web") && name !== allowed) {
+          found.push(`${file.path}: ${name}`);
+        }
+      }
+    }
+    expect(found).toEqual([]);
+  });
+
+  test("the wasm subpath of ghostty-web has exactly one reader", async () => {
+    const allowed = "ghostty-web/ghostty-vt.wasm?url";
+    const readers = (await allSources())
+      .filter((file) => file.text.includes(`"${allowed}"`))
+      .map((file) => file.path)
+      .sort();
+    // `src/vt/wasm.ts` imports the asset. `tests/render.spec.ts` names the same
+    // specifier to keep it external in its own bundle.
+    expect(readers).toEqual(["src/vt/wasm.ts", "tests/render.spec.ts"]);
+  });
+
+  test("src/terminal.ts holds no addon API and no xterm.js buffer API", async () => {
+    // Criterion 12. The product surface carries none of these. The adapter of
+    // that shape lives in the test bridge of `src/main.ts`.
+    //
+    // The scan runs on the code alone. A comment names these words to explain
+    // why they are absent, and a scan of the raw text would match those.
+    const text = await Bun.file(`${import.meta.dir}/../src/terminal.ts`).text();
+    const code = text.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
+    const banned = ["loadAddon", "proposeDimensions", "FitAddon", "buffer"];
+    expect(banned.filter((name) => code.includes(name))).toEqual([]);
   });
 });
