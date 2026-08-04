@@ -1,4 +1,3 @@
-import { FitAddon, init, Terminal } from "ghostty-web";
 import "./style.css";
 import { installFont } from "./font";
 import { attachKeyCorrection, installInput } from "./input";
@@ -14,8 +13,11 @@ import {
   toggleMenu,
 } from "./menu";
 import { prefs, setPrefs, type ThemeRecord } from "./prefs";
+import { GridRenderer } from "./render";
 import type { Runtime } from "./runtime";
+import { PirateTerminal } from "./terminal";
 import { installTheme } from "./theme";
+import { loadVt, type VtCell, type VtTerminal } from "./vt";
 import {
   decodeExitStatus,
   encodeDumpRequest,
@@ -100,7 +102,7 @@ async function main(): Promise<void> {
 
   const stored = prefs();
 
-  // The registry attaches before ghostty-web attaches its own handler, so the
+  // The registry attaches before the terminal attaches its own handler, so the
   // capture listener of the registry runs first. A matched chord then never
   // reaches the terminal.
   startKeys(stored.keys, (next) => {
@@ -109,10 +111,6 @@ async function main(): Promise<void> {
   setAction("toggleMenu", toggleMenu);
   // `installFont` gives `fontIncrease` and `fontDecrease` their action.
   initMenu();
-
-  // init() loads the wasm module. ghostty-web 0.4.0 inlines it as a data URI
-  // inside its ESM file, so this needs no separate asset request.
-  await init();
 
   const container = document.getElementById("terminal")!;
 
@@ -151,37 +149,66 @@ async function main(): Promise<void> {
   }
 
   // ── the terminal ────────────────────────────────────────────────────────
-  // A theme change builds the terminal again, so these two names hold the
-  // terminal of the moment. Every reader goes through them and captures
-  // neither object.
-  let term!: Terminal;
-  let fit!: FitAddon;
+  //
+  // Three objects hold the terminal. Two of them live for the whole page, and
+  // one of them is rebuilt on every theme change.
+  //
+  // `vtTerm` is the VT100 state machine. The client creates ONE of these and
+  // never frees it. `ghostty_terminal_free` of ghostty-vt.wasm 0.4.0 corrupts
+  // the heap of the module: a freed grid that held a grapheme cluster traps the
+  // next grid of the same width, and after any free a later `resize` that grows
+  // a row out of the scrollback reads stale bytes. Measurement: an 80 by 24
+  // terminal driven through 400 resizes after a free gave 720 garbage cells,
+  // and the same path with no free stayed clean over 402 resizes.
+  //
+  // `grid` is the WebGL2 renderer. It takes a theme at any time through
+  // `setTheme`, so a theme change needs no new renderer and no new canvas.
+  //
+  // `term` is the facade of `src/terminal.ts`. A theme change builds a NEW
+  // facade around the SAME `vtTerm` and the SAME `grid`. The identity of the
+  // facade is what `tests/theme.spec.ts` measures, and the session survives
+  // because the state machine below it never moves.
+  const vt = await loadVt();
+  const grid = await GridRenderer.create(container, {
+    fontSize: stored.fontSize,
+    theme: stored[stored.mode],
+  });
+  const firstFit = grid.fit();
+  const vtTerm: VtTerminal = vt.createTerminal(firstFit.cols, firstFit.rows);
 
-  // ghostty-web attaches its own InputHandler to the container and encodes
-  // each key with the KeyEncoder of libghostty. onData gives the encoded
-  // bytes, so pirate needs no key table of its own. The same event carries
-  // the answer to a device status report, which the PTY also expects.
+  // `term` holds the facade of the moment. Every reader goes through this name
+  // and captures no object.
+  let term!: PirateTerminal;
+  /** The test adapter of the facade of the moment. `buildBridge` builds it. */
+  let bridge: ReturnType<typeof buildBridge>;
+
+  // The facade encodes each key with the key encoder of libghostty and gives
+  // the bytes as text. The same path carries the answer to a device status
+  // report, which the PTY also expects.
   const encoder = new TextEncoder();
 
   /**
-   * Build the terminal with `theme` and open it on the container.
+   * Build the facade with `theme`, and put the theme on the renderer.
    *
-   * ghostty-web 0.4.0 bakes the cell colors into the wasm terminal at `open()`
-   * time, so the theme of the constructor is the theme of the screen. This
-   * function is therefore the one place that colors the terminal, at the first
-   * load and at every later theme change.
+   * The old facade stops first. It cancels its animation frame loop, removes
+   * its key listener, and removes its text field. It frees no VT terminal and
+   * no renderer.
    */
   function buildTerminal(theme: ThemeRecord): void {
-    term = new Terminal({ fontSize: state.fontSize, theme });
-    // The addon holds one terminal, and `term.dispose` disposes it, so each
-    // terminal gets its own fit addon.
-    fit = new FitAddon();
-    term.loadAddon(fit);
-    term.open(container);
+    term?.dispose();
+    grid.setTheme(theme);
+    term = new PirateTerminal({
+      container,
+      vt: vtTerm,
+      renderer: grid,
+      fontSize: state.fontSize,
+      theme,
+    });
     term.onData((data: string) => {
       send(encodeInput(encoder.encode(data)));
     });
-    // A new terminal carries no custom key handler, so the seven corrected
+    bridge = buildBridge(term);
+    // A new facade carries no custom key handler, so the seven corrected
     // chords of `src/input.ts` need this call again.
     attachKeyCorrection(runtime);
   }
@@ -207,10 +234,7 @@ async function main(): Promise<void> {
   let sentRows = 0;
 
   function applyFit(): void {
-    const dims = fit.proposeDimensions();
-    if (dims === undefined) {
-      return;
-    }
+    const dims = grid.fit();
     if (dims.cols !== term.cols || dims.rows !== term.rows) {
       term.resize(dims.cols, dims.rows);
     }
@@ -241,58 +265,63 @@ async function main(): Promise<void> {
   let pendingTheme: ThemeRecord | undefined;
 
   /**
-   * Build the terminal again, with `theme`, and refill it from the server.
+   * Build the facade again, with `theme`, and refill the screen from the
+   * server.
    *
    * A theme change takes this path. The socket stays open and the shell keeps
    * running, so the operator loses no session. The screen comes back from the
    * server: the client `0x02` frame asks for a full-state dump, and the server
    * answers with the `0x01` frame that it also sends at open time.
    *
-   * The dump is the only source for the screen of the new terminal, so this
-   * function needs an open socket. With a closed socket it disposes nothing.
-   * The caller knows nothing about the socket, and it needs to know nothing:
-   * the theme waits here and `ws.onopen` applies it.
+   * The VT terminal lives through this call, so the screen would keep every
+   * cell that it already holds. The dump is a full-state dump and it carries
+   * no clear of its own, so the client clears the screen before it asks for
+   * one. Without that clear the dump lands on the old text, and one row of
+   * "pirate" reads "piratepirate".
    *
-   * The scrollback of the old terminal goes with the old terminal. The dump
-   * carries the screen alone, so a theme change costs the scrollback.
+   * The reset costs the scrollback, which is the cost that the old client paid
+   * as well. With a closed socket no reset runs and the theme waits here, so
+   * the screen of a dead shell stays on the terminal. `ws.onopen` applies the
+   * theme that waits.
    */
   function rebuild(theme: ThemeRecord): void {
     if (socket === undefined || socket.readyState !== WebSocket.OPEN) {
-      // `send` drops a frame on a closed socket, in silence. A rebuild here
-      // would dispose the terminal, get no dump, and leave a blank screen with
-      // no way back. The worst case is a shell that exited: `onclose` never
-      // reconnects after a server `0x02` frame, so that blank screen would take
-      // the last output of that shell away for good. Keep the terminal.
+      // `send` drops a frame on a closed socket, in silence. A reset here would
+      // clear the screen and no dump would come back to refill it. The worst
+      // case is a shell that exited: `onclose` never reconnects after a server
+      // `0x02` frame, so that blank screen would take the last output of that
+      // shell away for good. Keep the screen and park the theme.
       pendingTheme = theme;
       setMenuNote(PENDING_THEME_LINE, "muted");
       return;
     }
-    term.dispose();
-    // `dispose` calls `cleanupComponents`, which removes the canvas and the
-    // hidden textarea from the container: a read of
-    // `node_modules/ghostty-web/dist/ghostty-web.js` confirms both removals.
-    // The same read shows one fault of ghostty-web 0.4.0: `open()` registers
-    // `handleMouseUp` on the document, `dispose` sets `isOpen` to false BEFORE
-    // it calls `cleanupComponents`, and `cleanupComponents` removes that
-    // listener only while `isOpen` is true. The listener therefore stays, and
-    // it holds the dead terminal, its canvas, its renderer, and its wasm
-    // handle for the life of the page. One theme change adds one. The call
-    // below removes it. The guard keeps a later ghostty-web usable, one that
-    // cleans the listener up itself or that renames the property.
-    const mouseUp = (term as unknown as { handleMouseUp?: EventListener }).handleMouseUp;
-    if (typeof mouseUp === "function") {
-      document.removeEventListener("mouseup", mouseUp);
-    }
-    // The loop below is the guard for a canvas that a failed `open` left
-    // behind. A second canvas in `#terminal` would paint over the new one.
-    for (const canvas of Array.from(container.querySelectorAll("canvas"))) {
-      canvas.remove();
-    }
     buildTerminal(theme);
-    // A new terminal starts at the default size. `applyFit` gives it the size
-    // of the container, and it sends a resize frame only when that size
-    // differs from the last size that the client sent.
+    // The grid keeps its size through the rebuild, so `applyFit` finds the
+    // same size and sends no resize frame. The call stays, because a theme
+    // change and a container resize can land in the same frame.
     applyFit();
+    // RIS, `ESC c`. The clear must come before the dump request, and these
+    // three facts give the reason:
+    //
+    // 1. The client never frees a `VtTerminal`, so the terminal that held the
+    //    old screen is the terminal that takes the dump.
+    // 2. It never frees one because `ghostty_terminal_free` of
+    //    ghostty-vt.wasm 0.4.0 corrupts the heap of the module. The comment at
+    //    the top of this section holds the measurement.
+    // 3. A state dump carries no clear of its own. It therefore writes its
+    //    text on top of the text that the screen already holds, and one row of
+    //    "pirate" then reads "piratepirate".
+    //
+    // The reset costs the scrollback. This is a known and accepted cost, not
+    // an oversight: the old client built a new terminal for a theme change and
+    // lost the scrollback the same way, so this restores that behavior and
+    // invents none.
+    //
+    // The order is safe against a race. `term.reset` writes into the local
+    // parser at once, and the dump bytes can arrive only in a later task,
+    // because they need a round trip to the server. `tests/theme.spec.ts`
+    // pins the result.
+    term.reset();
     send(encodeDumpRequest());
   }
 
@@ -300,10 +329,10 @@ async function main(): Promise<void> {
   // Each feature owns one module and gets its handles here. `main.ts` stays
   // wiring, and two features never collide in one file.
   //
-  // `term` is a getter. A rebuild replaces the terminal, and a module that
-  // captured the object once would then hold a dead terminal.
+  // `term` is a getter. A rebuild replaces the facade, and a module that
+  // captured the object once would then hold a stopped facade.
   const runtime: Runtime = {
-    get term(): Terminal {
+    get term(): PirateTerminal {
       return term;
     },
     container,
@@ -312,7 +341,7 @@ async function main(): Promise<void> {
     rebuild,
   };
 
-  // The theme of the active slot. `installTheme` builds the terminal again on
+  // The theme of the active slot. `installTheme` builds the facade again on
   // every later change, and it also sets the `--pirate-*` custom properties.
   buildTerminal(stored[stored.mode]);
 
@@ -343,9 +372,9 @@ async function main(): Promise<void> {
       case SERVER_OUTPUT:
       case SERVER_DUMP:
         // A dump is more bytes on the same stream, so it needs no decoder of
-        // its own. ghostty-web paints from an unconditional
-        // requestAnimationFrame loop, so the quiet that follows a dump still
-        // gets a frame. `tests/dump.spec.ts` measures this.
+        // its own. `src/terminal.ts` paints from an unconditional animation
+        // frame loop, so the quiet that follows a dump still gets a frame.
+        // `tests/dump.spec.ts` measures this.
         term.write(payload);
         break;
       case SERVER_EXIT: {
@@ -441,14 +470,138 @@ async function main(): Promise<void> {
     };
   }
 
-  // Expose the terminal for the Playwright tests. They assert on terminal
-  // state, never on glyph pixels, because font rasterization varies by machine.
+  // ── the test bridge ─────────────────────────────────────────────────────
   //
-  // `term` is a getter here too. A rebuild replaces the terminal, and a value
-  // captured once would give every later test a dead terminal.
+  // CAUTION: The adapter below exists for `web/tests/harness.ts` and
+  // `web/bench/instrument.ts` alone. It has the shape of the xterm.js buffer
+  // API, and no product code reads it. `src/terminal.ts` is the product
+  // surface, and it holds no buffer API and no addon API. Do not call this
+  // adapter from a feature module.
+  //
+  // The tests assert on terminal state, never on glyph pixels, because font
+  // rasterization varies by machine.
+
+  /** The text of one cell, for `getChars` of the adapter. */
+  function charsOf(cell: VtCell, x: number, y: number, viewport: boolean): string {
+    if (cell.width === 0) {
+      // The second half of a wide character holds no text of its own.
+      return "";
+    }
+    if (viewport && cell.graphemeLength > 0) {
+      return vtTerm.getGraphemeString(x, y);
+    }
+    return cell.codepoint === 0 ? "" : String.fromCodePoint(cell.codepoint);
+  }
+
+  /** Wrap one row of cells in the line shape that the harness reads. */
+  function lineOf(cells: VtCell[], row: number, viewport: boolean) {
+    return {
+      translateToString(trim = false): string {
+        let text = "";
+        for (let x = 0; x < cells.length; x += 1) {
+          const chars = charsOf(cells[x], x, row, viewport);
+          // An untouched cell reads as a blank inside a line of text.
+          text += chars === "" && cells[x].width !== 0 ? " " : chars;
+        }
+        return trim ? text.replace(/\s+$/, "") : text;
+      },
+      getCell(x: number) {
+        const cell = cells[x];
+        return cell === undefined
+          ? undefined
+          : { getChars: (): string => charsOf(cell, x, row, viewport) };
+      },
+    };
+  }
+
+  /**
+   * The buffer adapter.
+   *
+   * This is a function declaration, not a `const`. `buildTerminal` runs before
+   * this point in the file, and it reaches the adapter through `buildBridge`.
+   * A `const` would be in its temporal dead zone at that moment.
+   */
+  function bufferAdapter() {
+    return {
+      /**
+       * The scrollback first, then the viewport.
+       *
+       * The viewport row `y` is therefore at index `length - rows + y`.
+       */
+      get active() {
+        const scrollback = vtTerm.getScrollbackLength();
+        return {
+          get cursorX(): number {
+            return vtTerm.getCursor().x;
+          },
+          get cursorY(): number {
+            return vtTerm.getCursor().y;
+          },
+          length: scrollback + vtTerm.rows,
+          getLine(index: number) {
+            if (index < 0) {
+              return undefined;
+            }
+            if (index < scrollback) {
+              const cells = vtTerm.getScrollbackLine(index);
+              return cells === null ? undefined : lineOf(cells, index, false);
+            }
+            const row = index - scrollback;
+            const cells = vtTerm.getLine(row);
+            return cells === null ? undefined : lineOf(cells, row, true);
+          },
+        };
+      },
+    };
+  }
+
+  /**
+   * Build the adapter of one facade.
+   *
+   * The object is stable for the life of its facade. `web/bench/instrument.ts`
+   * wraps `write` and `renderer.render` by assignment, so both must stay on one
+   * object. `tests/theme.spec.ts` reads the identity of this object to measure
+   * a theme change, so a rebuild must give a NEW one.
+   */
+  function buildBridge(facade: PirateTerminal) {
+    return {
+      get cols(): number {
+        return facade.cols;
+      },
+      get rows(): number {
+        return facade.rows;
+      },
+      get buffer() {
+        return bufferAdapter();
+      },
+      renderer: grid,
+      options: facade.options,
+      get animationFrameId(): number | undefined {
+        return facade.animationFrameId;
+      },
+      // `write` forwards the assignment to the facade, so a wrapper that a
+      // caller puts here also sees the writes that `onFrame` makes.
+      // `web/bench/instrument.ts` needs that.
+      get write(): (data: Uint8Array | string) => void {
+        return facade.write;
+      },
+      set write(next: (data: Uint8Array | string) => void) {
+        facade.write = next;
+      },
+      reset(): void {
+        facade.reset();
+      },
+      dispose(): void {
+        facade.dispose();
+      },
+    };
+  }
+
+  // `term` is a getter here too. A rebuild replaces the facade, and a value
+  // captured once would give every later test a stopped facade.
   (globalThis as Record<string, unknown>).__pirate = {
-    get term(): Terminal {
-      return term;
+    get term() {
+      return bridge;
     },
     state,
   };

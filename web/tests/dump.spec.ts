@@ -1,9 +1,9 @@
 /**
  * Dump frames: tag `0x01`, and the stale screen of risk 5.
  *
- * A dump is one large write, and the stream goes quiet after it. Painting in
- * ghostty-web runs on `requestAnimationFrame` and is independent of parsing,
- * so this shape is the one that can leave a stale screen on the canvas.
+ * A dump is one large write, and the stream goes quiet after it. The facade of
+ * `src/terminal.ts` paints from an animation frame loop, independent of the
+ * parse, so this shape is the one that can leave a stale screen on the canvas.
  *
  * The server sends a dump when a socket opens, and again after it drops the
  * backlog of a slow client. Both cases have the same shape.
@@ -116,10 +116,25 @@ test("control: with the paint loop stopped, the same dump leaves a stale screen"
     const before = await canvasSignature(page);
 
     await stopRenderLoop(page);
-    expect(await countRenders(page, 300)).toBe(0);
+
+    // The count must span the arrival of the dump, never a quiet period. A
+    // quiet terminal calls `render` zero times whether the loop runs or not,
+    // because `src/render/index.ts` presents the canvas only for a frame that
+    // paints. A count taken before the dump therefore reads zero in both
+    // cases, and it would not discriminate. The dump makes every row dirty, so
+    // a live loop must call `render` inside this window and a stopped loop
+    // cannot.
+    const counting = countRenders(page, 1500);
+    // The wrapper goes on inside `counting`. Give it the task it needs to
+    // install itself before the dump arrives.
+    await idle(100);
 
     stub.send([{ tag: 0x01, text: screenText(rows, "dump") }]);
     await waitFor(() => viewportLine(page, 0), (line) => line === "dump line 1", "the dump");
+    const rendersOverTheDump = await counting;
+    // eslint-disable-next-line no-console
+    console.log(`  renderer calls while the dump arrived, loop stopped: ${rendersOverTheDump}`);
+    expect(rendersOverTheDump).toBe(0);
     await idle(500);
 
     // The parser has the dump. The canvas does not. This is the stale screen.
@@ -130,19 +145,42 @@ test("control: with the paint loop stopped, the same dump leaves a stale screen"
   });
 });
 
-test("the renderer keeps running while the stream is quiet", async () => {
-  // The mechanism behind the result above. ghostty-web 0.4.0 runs an
-  // unconditional requestAnimationFrame loop, so a quiet stream still gets
+test("the paint loop stays alive through a quiet stream", async () => {
+  // The mechanism behind the result above. `src/terminal.ts` runs one
+  // unconditional `requestAnimationFrame` loop, so a quiet stream still gets
   // frames and a dump cannot wait for another event.
+  //
+  // This test replaces an assertion that counted more than ten renderer calls
+  // in 500 ms of silence. `src/render/index.ts` now presents the canvas only
+  // for a frame that paints, because a WebGL canvas that the page presents on
+  // every frame starves the timers of the client: it held the animation frame
+  // loop at 22 frames per second and halved the key repeat rate of
+  // `src/input.ts`. Silence therefore gives zero renderer calls by design, and
+  // the old count no longer measures a live loop.
+  //
+  // The property that risk 5 needs is unchanged, and this test measures it
+  // directly: after a quiet period, one write with no other event still
+  // reaches the canvas. A dead loop cannot do that.
   const stub = server();
   stub.setOnOpen([{ tag: 0x01, text: screenText(5, "dump") }]);
 
   await withClient(async (page) => {
     await waitFor(() => viewportLine(page, 0), (line) => line === "dump line 1", "row 0");
-    const renders = await countRenders(page, 500);
+    await idle(500);
+    const quiet = await canvasSignature(page);
+
+    // One write, and then no further event of any kind. Only the frame loop
+    // can carry this to the canvas. The text goes to row 20, which the dump
+    // above did not fill, so it lands on a blank row.
+    stub.send([{ tag: 0x00, text: `${ESC}[20;1Hlate write` }]);
+    await waitFor(() => viewportLine(page, 19), (line) => line === "late write", "the late write");
+    const painted = await waitFor(
+      () => canvasSignature(page),
+      (value) => value !== quiet,
+      "the canvas of the late write",
+    );
     // eslint-disable-next-line no-console
-    console.log(`  renderer calls in 500 ms of silence: ${renders}`);
-    // 500 ms at 60 Hz gives about 30 frames. Ten is a wide margin.
-    expect(renders).toBeGreaterThan(10);
+    console.log(`  the canvas changed after a quiet period: ${quiet} -> ${painted}`);
+    expect(painted).not.toBe(quiet);
   });
 });
