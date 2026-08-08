@@ -370,6 +370,121 @@ describe("VtTerminal.resize", () => {
     }, fresh);
   });
 
+  test("a size that the wasm i32 cannot carry throws before the module sees it", () => {
+    // JavaScript converts an argument to an i32 at the wasm boundary, with a
+    // wrap. A measurement of the raw exports gives the result of each wrap.
+    // 2 to the power 31 becomes -2147483648. The module then stops with "Out
+    // of bounds memory access". 2 to the power 32 becomes 0, and the module
+    // stops the same way. 100000 by 100000 does not return at all.
+    //
+    // A trap is not a rejection. The layer frees the cell buffer of the old
+    // grid before it calls the module. A trap therefore also leaves the
+    // terminal unusable, and every later `getViewport` stops the same way.
+    withTerminal(8, 3, (term) => {
+      term.write("pirate");
+
+      for (const [cols, rows] of [
+        [2 ** 31, 1],
+        [1, 2 ** 31],
+        [2 ** 32, 1],
+        [100000, 100000],
+        [65535, 65535],
+        [65536, 1],
+      ] as [number, number][]) {
+        expect(() => term.resize(cols, rows)).toThrow(/is too large/);
+      }
+
+      // The module never saw any of these sizes, so the terminal still reads.
+      expect(term.cols).toBe(8);
+      expect(term.rows).toBe(3);
+      expect(term.getViewport()).toHaveLength(24);
+      expect(rowText(term, 0)).toBe("pirate");
+    });
+  });
+
+  test("Infinity is not a size", () => {
+    withTerminal(8, 3, (term) => {
+      for (const [cols, rows] of [
+        [Number.POSITIVE_INFINITY, 5],
+        [5, Number.POSITIVE_INFINITY],
+        [Number.NEGATIVE_INFINITY, 5],
+      ] as [number, number][]) {
+        expect(() => term.resize(cols, rows)).toThrow(
+          /a terminal needs a positive cols and rows/,
+        );
+      }
+      expect(term.cols).toBe(8);
+    });
+  });
+
+  test("the largest size that the rule allows reaches the module", () => {
+    // `CELLS_MAX` is 2 to the power 24. This grid is that count exactly, so
+    // the rule and the module agree at the limit.
+    withTerminal(8, 3, (term) => {
+      term.resize(16384, 1024);
+
+      expect(term.cols).toBe(16384);
+      expect(term.rows).toBe(1024);
+      expect(term.getLine(1023)).not.toBeNull();
+      expect(term.getLine(1024)).toBeNull();
+    });
+  });
+
+  test("every row is dirty after a resize, and none is after a resize to the same size", () => {
+    withTerminal(8, 3, (term) => {
+      term.write("pirate");
+      term.clearDirty();
+
+      term.resize(20, 5);
+
+      // `needsFullRedraw` and `isRowDirty` must agree. A renderer that trusts
+      // one and not the other would leave a stale row on the screen.
+      expect(term.needsFullRedraw()).toBe(true);
+      for (let row = 0; row < term.rows; row += 1) {
+        expect(term.isRowDirty(row)).toBe(true);
+      }
+
+      term.clearDirty();
+      term.resize(20, 5);
+
+      expect(term.needsFullRedraw()).toBe(false);
+      for (let row = 0; row < term.rows; row += 1) {
+        expect(term.isRowDirty(row)).toBe(false);
+      }
+    });
+  });
+
+  test("400 resizes in a loop keep the content and the buffer", async () => {
+    // The path of a font-size control. This terminal takes its own module,
+    // because the shared module already freed a terminal. See the note on the
+    // scrollback test.
+    const fresh = await loadVt(wasmBytes);
+    withTerminal(
+      80,
+      24,
+      (term) => {
+        for (let i = 0; i < 200; i += 1) {
+          term.resize(60, 18);
+          term.resize(100, 30);
+        }
+        term.write("pirate");
+
+        expect(term.cols).toBe(100);
+        expect(term.rows).toBe(30);
+        expect(term.getViewport()).toHaveLength(3000);
+        expect(rowText(term, 0)).toBe("pirate");
+
+        // No cell outside row 0 holds anything. A stale byte of the wasm heap
+        // shows up here as a codepoint that no write put there.
+        const written = term
+          .getViewport()
+          .filter((cell) => cell.codepoint !== 0);
+        expect(written).toHaveLength(6);
+      },
+      fresh,
+    );
+  });
+
   test("a resize of a disposed terminal throws", () => {
     const term = vt.createTerminal(8, 3);
     term.dispose();

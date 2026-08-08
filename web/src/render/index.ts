@@ -112,6 +112,28 @@ export class GridRenderer {
     canvas.id = `pirate-grid-${canvasCount}`;
     container.append(canvas);
 
+    // Take the WebGL2 context before `@beamterm/renderer` takes it, and ask for
+    // `preserveDrawingBuffer`. `getContext` gives back the context that the
+    // canvas already holds, and it ignores the second argument at that point,
+    // so the later call inside the wasm module reuses this context with this
+    // attribute. The wasm module passes only the context name to `getContext`,
+    // so this attribute is not reachable through the API of the package.
+    //
+    // The drawing buffer then holds the paint after the frame composites, and a
+    // reader outside the paint task can measure the canvas.
+    //
+    // Measurement, in Chromium with `--enable-unsafe-swiftshader`. Without this
+    // call, a read in the same task as `render` gives 167,176,216,255 and a read
+    // after two animation frames gives 0,0,0,0. With this call, both reads give
+    // 167,176,216,255.
+    //
+    // The cost is inside the noise of the measurement. A grid of 80 by 24 gives
+    // a mean `draw` of 0.037 ms without the attribute and 0.032 ms with it. A
+    // grid of 174 by 68 gives 0.147 ms for both. Frame throughput under a
+    // continuous animation frame loop gives 36.8 and 43.3 frames per second for
+    // 80 by 24, and 7.3 for both at 174 by 68.
+    canvas.getContext("webgl2", { preserveDrawingBuffer: true });
+
     // `auto_resize_canvas_css` is false, so this module owns the CSS size of
     // the canvas. With true, `resize` writes the pixel count of the backing
     // store into the CSS size, and the canvas then covers `devicePixelRatio`
@@ -128,14 +150,6 @@ export class GridRenderer {
     grid.resize(first.cols, first.rows);
     return grid;
   }
-
-  /**
-   * The draw call.
-   *
-   * This is an own property of the instance, not a method of the prototype, so
-   * a test can replace it on one instance and count the calls.
-   */
-  render: (...args: unknown[]) => void;
 
   private readonly container: HTMLElement;
   private readonly canvas: HTMLCanvasElement;
@@ -163,12 +177,22 @@ export class GridRenderer {
     this.beam = beam;
     this.fontSize = options.fontSize;
     this.palette = new Palette(options.theme);
-    this.render = (): void => {
-      if (this.disposed) {
-        return;
-      }
-      this.beam.render();
-    };
+  }
+
+  /**
+   * The draw call.
+   *
+   * This is a method of the prototype. A caller that counts the paints assigns
+   * its own function to `render` on one instance, which shadows this method,
+   * and it removes that own property with `delete` to stop counting. A method
+   * of the prototype comes back after that `delete`. An own property of the
+   * instance would not come back, and every later `draw` would then stop.
+   */
+  render(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.beam.render();
   }
 
   get cols(): number {
@@ -206,15 +230,25 @@ export class GridRenderer {
     return { width, height };
   }
 
-  /** The columns and rows that the container holds at the current font size. */
+  /**
+   * The columns and rows that the container holds at the current font size.
+   *
+   * The measurement takes the content box, not the padding box. `clientWidth`
+   * and `clientHeight` count the padding, and `#terminal` of `src/style.css`
+   * carries 8 px of it on every side. A grid built from `clientWidth` is
+   * therefore too wide, and its canvas covers the padding. A change of the
+   * padding alone would also move no column, so the grid would not follow its
+   * container.
+   */
   fit(): FitResult {
     const cell = this.cellSize();
     if (cell.width <= 0 || cell.height <= 0) {
       return { cols: 1, rows: 1 };
     }
+    const box = this.contentBox();
     return {
-      cols: Math.max(1, Math.floor(this.container.clientWidth / cell.width)),
-      rows: Math.max(1, Math.floor(this.container.clientHeight / cell.height)),
+      cols: Math.max(1, Math.floor(box.width / cell.width)),
+      rows: Math.max(1, Math.floor(box.height / cell.height)),
     };
   }
 
@@ -316,6 +350,25 @@ export class GridRenderer {
   // ==========================================================================
   // Private
   // ==========================================================================
+
+  /** The content box of the container, in CSS pixels. */
+  private contentBox(): { width: number; height: number } {
+    const style = getComputedStyle(this.container);
+    const trim = (value: string): number => {
+      const number = parseFloat(value);
+      return Number.isFinite(number) ? number : 0;
+    };
+    return {
+      width: Math.max(
+        0,
+        this.container.clientWidth - trim(style.paddingLeft) - trim(style.paddingRight),
+      ),
+      height: Math.max(
+        0,
+        this.container.clientHeight - trim(style.paddingTop) - trim(style.paddingBottom),
+      ),
+    };
+  }
 
   /**
    * Give the canvas the pixel size of the grid.
@@ -431,8 +484,7 @@ export class GridRenderer {
     }
     // FAINT has no bit in `CellStyle` of `@beamterm/renderer`, so the color
     // carries it: the foreground moves half the way to the background of the
-    // same cell. BLINK has no bit and no clock in this module, so a blinking
-    // cell paints as a steady cell.
+    // same cell.
     if ((cell.flags & VtCellFlags.FAINT) !== 0) {
       fg = faint(fg, bg);
     }
@@ -478,7 +530,17 @@ function symbolOf(term: VtTerminal, cell: VtCell, x: number, y: number): string 
   return cell.codepoint === 0 ? " " : String.fromCodePoint(cell.codepoint);
 }
 
-/** Build the `CellStyle` of one run. The caller frees it. */
+/**
+ * Build the `CellStyle` of one run. The caller frees it.
+ *
+ * This function is the one place where a cell flag becomes a style bit of
+ * `@beamterm/renderer`. The VT layer also carries `VtCellFlags.BLINK`, and
+ * libghostty sets it correctly. `@beamterm/renderer` has no native blink: its
+ * `FontStyle` holds Normal, Bold, Italic, and BoldItalic, and its
+ * `GlyphEffect` holds None, Underline, and Strikethrough. A shim for blink is
+ * out of scope by a decision of the product manager, so a blinking cell paints
+ * as a steady cell.
+ */
 function buildStyle(run: Paint): CellStyle {
   let built = style().fg(run.fg).bg(run.bg);
   if ((run.bits & VtCellFlags.BOLD) !== 0) {
