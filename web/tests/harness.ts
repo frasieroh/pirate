@@ -74,10 +74,18 @@ export const ESC = "";
  * software WebGL2 from the defaults. This list holds the flag for every
  * platform.
  *
- * CAUTION: Do not add `--use-angle=swiftshader` or `--use-gl=angle`. Each of
- * those flags moves the 2D canvas to SwiftShader as well. The paint of the
- * terminal canvas then arrives after the read. The paint assertions of
- * `web/tests` and `web/bench` then fail. The failure is intermittent.
+ * CAUTION: Do not add `--use-angle=swiftshader` or `--use-gl=angle`. The
+ * measured result of either flag: the paint of the terminal canvas arrives
+ * after the read, and the paint assertions of `web/tests` and `web/bench`
+ * fail. The failure is intermittent.
+ *
+ * The flag above asks for a software WebGL2 context alone. The two flags above
+ * move the whole graphics stack of the browser to software, compositing
+ * included, and that is the difference this list depends on. The exact step
+ * that arrives late is not established. An earlier version of this comment
+ * named a 2D canvas, and the client holds none: `src/render/index.ts` draws
+ * with WebGL2, and `paintedPixels` and `canvasSignature` read that context
+ * with `readPixels`.
  *
  * `web/e2e/browser.ts` holds a copy of this list. That module keeps its own
  * copy of every helper here, for the reason in its header.
