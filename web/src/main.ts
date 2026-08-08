@@ -15,6 +15,7 @@ import {
 import { prefs, setPrefs, type ThemeRecord } from "./prefs";
 import { GridRenderer } from "./render";
 import type { Runtime } from "./runtime";
+import { installSelection, selectionInstalls } from "./select";
 import { PirateTerminal } from "./terminal";
 import { installTheme } from "./theme";
 import { loadVt, type VtCell, type VtTerminal } from "./vt";
@@ -358,6 +359,12 @@ async function main(): Promise<void> {
   installFont(runtime);
   installInput(runtime);
 
+  // Mouse selection belongs to the renderer and to its canvas, and both live
+  // for the whole page. `buildTerminal` gives a new facade on every theme
+  // change, so an install inside that function would add a second set of
+  // listeners on each change. This call runs once.
+  const selection = installSelection(grid, container);
+
   // ── frames ──────────────────────────────────────────────────────────────
   function onFrame(data: unknown): void {
     if (!(data instanceof ArrayBuffer)) {
@@ -604,6 +611,18 @@ async function main(): Promise<void> {
       return bridge;
     },
     state,
+    // The selection lives for the whole page, so this is a value and not a
+    // getter. `installs` reports how many times `installSelection` ran.
+    selection: {
+      hasSelection: (): boolean => selection.hasSelection(),
+      text: (): string => selection.text(),
+      clear: (): void => {
+        selection.clear();
+      },
+      get installs(): number {
+        return selectionInstalls();
+      },
+    },
   };
 
   connect();

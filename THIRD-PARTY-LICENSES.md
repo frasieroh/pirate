@@ -1,7 +1,9 @@
 # Third-party licenses
 
 The pirate binary contains the code of the crates and the packages below.
-`cargo about generate` writes this file from `about.hbs`. Do not edit it by hand.
+`cargo about generate` writes the Rust crate sections of this file from
+`about.hbs`. Do not edit those sections by hand. The npm section is static text.
+Add each npm block by hand to `about.hbs` and to this file.
 
 Regenerate it after any dependency change:
 

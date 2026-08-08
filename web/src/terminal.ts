@@ -19,9 +19,30 @@
  * the heap of the module.
  */
 
+import type { BeamtermRenderer } from "@beamterm/renderer/web";
+
 import { GridRenderer, type FitResult } from "./render";
 import type { Theme } from "./theme";
 import { VtKey, VtKeyAction, VtMods, type VtTerminal } from "./vt";
+
+/**
+ * The `BeamtermRenderer` inside a `GridRenderer`.
+ *
+ * `src/render/index.ts` declares the field as `private` and exports no
+ * accessor for it. TypeScript removes `private` at compile time, so the field
+ * stays a plain own property of the object at run time. Measurement, on the
+ * live client in Chromium: `Object.keys(grid)` lists `beam`, and
+ * `grid.beam.hasSelection()` answers false on a fresh page.
+ * `tests/select.spec.ts` holds that measurement as an assertion.
+ *
+ * The whole selection API of `@beamterm/renderer` 1.0.0 sits on this object.
+ * `src/select.ts` is the only caller. This function is the only place in the
+ * client that reads the field. A public getter in `src/render/index.ts`
+ * replaces this function without a change to any caller.
+ */
+export function beamOf(renderer: GridRenderer): BeamtermRenderer {
+  return (renderer as unknown as { beam: BeamtermRenderer }).beam;
+}
 
 /** The values that a caller can change after the terminal is built. */
 export interface TerminalOptions {
