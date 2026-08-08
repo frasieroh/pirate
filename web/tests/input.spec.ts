@@ -686,3 +686,145 @@ test("a chord that is not a clipboard chord keeps its bytes", async () => {
     console.log(`\n${lines.join("\n")}`);
   });
 });
+
+// ── the clipboard chords that cannot complete ─────────────────────────────
+//
+// The tests above all grant `clipboard-read` and `clipboard-write` first. That
+// grant is the state of a browser AFTER the operator answered the permission
+// prompt of the origin. It is not the state of a browser before that answer,
+// and it is not the state of a browser whose operator refused.
+//
+// A clipboard chord returns true, so the facade calls `preventDefault` and
+// encodes nothing. A chord that also fails its clipboard call therefore does
+// nothing at all. The two tests below hold the operator's only sign of that.
+
+/** The text of the fault line of the menu, `#menu-note`. */
+function menuNote(page: Page): Promise<string> {
+  return page.evaluate(() => document.getElementById("menu-note")?.textContent ?? "");
+}
+
+test("a refused clipboard read tells the operator and sends no byte", async () => {
+  // Measured in this Chromium with `clipboard-read` not granted:
+  // `navigator.permissions.query` answers `denied`, and `readText` is rejected
+  // with `NotAllowedError: ... Read permission denied.`. The client then
+  // pastes nothing. Without the fault line the operator gets no sign at all.
+  const stub = server();
+
+  await withClient(async (page) => {
+    // The write permission alone. The read prompt is unanswered.
+    await page.context().grantPermissions(["clipboard-write"]);
+    const state = await page.evaluate(async () => {
+      const read = await navigator.permissions.query({
+        name: "clipboard-read" as PermissionName,
+      });
+      return read.state;
+    });
+    expect(state).not.toBe("granted");
+    await page.evaluate(() => navigator.clipboard.writeText("echo hi"));
+    await page.focus("#terminal");
+    expect(await menuNote(page)).toBe("");
+
+    for (const key of PASTE_CHORDS) {
+      await page.evaluate(() => {
+        document.getElementById("menu-note")!.textContent = "";
+      });
+      await pressSilently(page, stub, key);
+      await waitFor(
+        () => menuNote(page),
+        (text) => text.length > 0,
+        `the fault line after ${key}`,
+      );
+      expect(await menuNote(page)).toBe(
+        "The browser refused the clipboard read. Give this page the clipboard permission. Then paste again.",
+      );
+    }
+  });
+});
+
+test("a refused clipboard write tells the operator and sends no byte", async () => {
+  // No grant at all. `writeText` is rejected, so the copy chord copies
+  // nothing.
+  const stub = server();
+
+  await withClient(async (page) => {
+    await writeAndPaint(page, "hello world", "hello world");
+    await dragCells(page, { col: 0, row: 0 }, { col: 4, row: 0 });
+    await page.focus("#terminal");
+    await page.evaluate(() => {
+      document.getElementById("menu-note")!.textContent = "";
+    });
+
+    await pressSilently(page, stub, "Meta+KeyC");
+    await waitFor(
+      () => menuNote(page),
+      (text) => text.length > 0,
+      "the fault line after Meta+KeyC",
+    );
+    expect(await menuNote(page)).toBe(
+      "The browser refused the clipboard write. Give this page the clipboard permission. Then copy again.",
+    );
+  });
+});
+
+test("a held paste chord pastes once", async () => {
+  // The key repeat of `installKeyRepeat` dispatches a synthetic keydown after
+  // `repeatDelayMs`, and again on the configured rate. A paste chord performs
+  // an action and sends no key byte, so a repeat of it repeats the action.
+  // Measured with the repeat armed: a hold of 1600 ms gave 11 pastes.
+  const stub = server();
+
+  await withClient(async (page) => {
+    await grantClipboard(page);
+    await page.focus("#terminal");
+
+    for (const chord of [
+      { modifier: "Meta", key: "KeyV" },
+      { modifier: "Control", key: "KeyV" },
+    ]) {
+      await seedClipboard(page, "rm -rf /\n");
+      const before = framesWithTag(stub.received, 0x00).length;
+      await page.keyboard.down(chord.modifier);
+      if (chord.modifier === "Control") {
+        await page.keyboard.down("Shift");
+      }
+      await page.keyboard.down(chord.key);
+      // Longer than `repeatDelayMs` of 600 ms, so every repeat tick that the
+      // client would generate lands inside this window.
+      await idle(1600);
+      await page.keyboard.up(chord.key);
+      if (chord.modifier === "Control") {
+        await page.keyboard.up("Shift");
+      }
+      await page.keyboard.up(chord.modifier);
+      await idle(300);
+
+      const frames = framesWithTag(stub.received, 0x00).slice(before);
+      expect(frames.map((frame) => payloadText(frame))).toEqual(["rm -rf /\r"]);
+    }
+  });
+});
+
+test("a held copy chord copies once and still sends no byte", async () => {
+  // The same repeat guard on the copy side. A copy chord sends no byte, so
+  // this test measures the socket and the clipboard together.
+  const stub = server();
+
+  await withClient(async (page) => {
+    await grantClipboard(page);
+    await writeAndPaint(page, "hello world", "hello world");
+    await dragCells(page, { col: 0, row: 0 }, { col: 4, row: 0 });
+    await page.focus("#terminal");
+    await seedClipboard(page, "<no copy>");
+
+    const before = framesWithTag(stub.received, 0x00).length;
+    await page.keyboard.down("Meta");
+    await page.keyboard.down("KeyC");
+    await idle(1600);
+    await page.keyboard.up("KeyC");
+    await page.keyboard.up("Meta");
+    await idle(300);
+
+    expect(framesWithTag(stub.received, 0x00).length).toBe(before);
+    expect(await clipboardText(page)).toBe("hello");
+  });
+});

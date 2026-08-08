@@ -20,7 +20,7 @@
  * later task, because the read of the clipboard is asynchronous.
  */
 
-import { addMenuRow, TERMINAL_GROUP } from "./menu";
+import { addMenuRow, setMenuNote, TERMINAL_GROUP } from "./menu";
 import { setPrefs } from "./prefs";
 import type { Runtime } from "./runtime";
 import type { Selection } from "./select";
@@ -124,6 +124,30 @@ function clampRate(value: number): number {
 // Ctrl+V alone keeps SYN (0x16). That branch is below, and it matches
 // `ctrlKey` alone, so it never matches Ctrl+Shift+V.
 
+// A clipboard call can fail, and the chord then does nothing. The operator
+// must get a sign of that, because the chord swallows the key and sends no
+// byte either. `setMenuNote` with the default `warn` tone writes `#menu-note`,
+// the fault channel of the client (`src/menu.ts:196`). The three lines below
+// are the only signs that the operator gets for a refused clipboard call.
+//
+// Measured in the Chromium of `web/tests`, with `clipboard-write` granted and
+// `clipboard-read` not granted: `navigator.permissions.query` answers `denied`
+// for `clipboard-read`, `readText` is rejected with `NotAllowedError: Failed to
+// execute 'readText' on 'Clipboard': Read permission denied.`, and the client
+// sends zero `0x00` frames. A real browser reaches this same state until the
+// operator answers the permission prompt of the origin, and it reaches it for
+// good when the operator refuses that prompt.
+
+/** The line for a clipboard read that the browser refused. */
+const READ_REFUSED =
+  "The browser refused the clipboard read. Give this page the clipboard permission. Then paste again.";
+/** The line for a clipboard write that the browser refused. */
+const WRITE_REFUSED =
+  "The browser refused the clipboard write. Give this page the clipboard permission. Then copy again.";
+/** The line for a page that holds no `navigator.clipboard`. */
+const CLIPBOARD_ABSENT =
+  "The clipboard needs a secure context. Open this page over https, or from localhost.";
+
 /** The `code` of the copy key. */
 const COPY_CODE = "KeyC";
 /** The `code` of the paste key. */
@@ -159,15 +183,29 @@ function isClipboardChord(event: KeyboardEvent, code: string): boolean {
  * `navigator.clipboard` is undefined outside a secure context. A page that is
  * served over plain HTTP from a name other than `localhost` is such a
  * context. The chord then copies nothing, and it still sends no byte.
+ *
+ * A refused write and an absent clipboard both write the fault line. A write
+ * that resolves clears that line, as `src/theme.ts:315` clears it for the
+ * result of its own action.
  */
 function copySelection(selection: Selection): void {
   const text = selection.text();
-  if (text.length === 0 || navigator.clipboard === undefined) {
+  if (text.length === 0) {
     return;
   }
-  void navigator.clipboard.writeText(text).catch(() => {
-    // The browser refused the write. The operator keeps the old clipboard.
-  });
+  if (navigator.clipboard === undefined) {
+    setMenuNote(CLIPBOARD_ABSENT);
+    return;
+  }
+  void navigator.clipboard.writeText(text).then(
+    () => {
+      setMenuNote("");
+    },
+    () => {
+      // The operator keeps the old clipboard.
+      setMenuNote(WRITE_REFUSED);
+    },
+  );
 }
 
 /**
@@ -218,17 +256,24 @@ function pasteToShell(runtime: Runtime, text: string): void {
  *
  * The read is asynchronous, so the bytes reach the socket after the keydown.
  * The chord sends no other byte, so the shell receives the paste alone.
+ *
+ * A refused read and an absent clipboard both write the fault line. The chord
+ * swallows the key, so without that line the operator gets no sign at all: the
+ * screen does not change, and the shell receives nothing.
  */
 function pasteFromClipboard(runtime: Runtime): void {
   if (navigator.clipboard === undefined) {
+    setMenuNote(CLIPBOARD_ABSENT);
     return;
   }
   void navigator.clipboard.readText().then(
     (text: string) => {
+      setMenuNote("");
       pasteToShell(runtime, text);
     },
     () => {
-      // The browser refused the read. The shell receives nothing.
+      // The shell receives nothing.
+      setMenuNote(READ_REFUSED);
     },
   );
 }
@@ -558,6 +603,17 @@ function installKeyRepeat(runtime: Runtime): void {
       }
       if (MODIFIER_CODE.test(event.code)) {
         // A modifier alone holds no character, so it never repeats.
+        return;
+      }
+      if (isClipboardChord(event, COPY_CODE) || isClipboardChord(event, PASTE_CODE)) {
+        // A clipboard chord holds no character either. It performs an action,
+        // and part A of this file sends no key byte for it, so a repeat of it
+        // repeats the action.
+        //
+        // Measured with the repeat armed, with `X` on the clipboard: a hold of
+        // Cmd+V for 1600 ms gave 11 `0x00` frames of `X`. A clipboard that
+        // ends in a line break, with bracketed paste off, then runs its last
+        // line 11 times.
         return;
       }
       startRepeat(event);
