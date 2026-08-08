@@ -344,10 +344,11 @@ test("the light palette meets the contrast floors", async () => {
 });
 
 test("a theme change refills the screen from the dump, and sends no resize frame", async () => {
-  // ghostty-web 0.4.0 bakes the cell colors at `open()` time, so the client
-  // builds a new terminal for a theme change. The new terminal starts empty,
-  // and the `0x02` dump request brings the screen back from the server. The
-  // guard that stays from the old behavior: the rebuild sends no resize frame.
+  // A theme change builds a new terminal facade. The VT terminal below it lives
+  // on, so `src/main.ts` clears the screen with RIS before it asks for the
+  // dump, and the `0x02` dump request then brings the screen back from the
+  // server. Without that clear the dump would land on the old text. The guard
+  // that stays from the old behavior: the rebuild sends no resize frame.
   const stub = server();
   stub.setOnDump([{ tag: 0x01, text: "pirate" }]);
 
@@ -623,13 +624,16 @@ test("the new terminal carries the new theme, and its canvas paints the new back
   });
 });
 
-test("a rebuild removes the document mouseup listener that ghostty-web leaks", async () => {
-  // ghostty-web 0.4.0 registers `handleMouseUp` on the document in `open()`.
-  // `dispose` sets `isOpen` to false before it calls `cleanupComponents`, and
-  // `cleanupComponents` removes that listener only while `isOpen` is true, so
-  // the listener stays and holds the dead terminal. `rebuild` of
-  // `src/main.ts` removes it. Without that call the count grows by one for
-  // each theme change.
+test("a rebuild adds no document mouseup listener", async () => {
+  // The old client drove ghostty-web, which registered `handleMouseUp` on the
+  // document in `open()` and never removed it, so each theme change leaked one
+  // listener. `src/main.ts` carried a removal call for it.
+  //
+  // The renderer of `src/render` registers no listener on the document, and
+  // the facade of `src/terminal.ts` registers its one `keydown` listener on
+  // `#terminal` and removes it in `dispose`. The removal call is therefore
+  // gone from `src/main.ts`, and the count below stays at zero because nothing
+  // registers and nothing removes.
   const stub = server();
 
   await withClient(async (page) => {
@@ -650,7 +654,7 @@ test("a rebuild removes the document mouseup listener that ghostty-web leaks", a
       "the dump request of the second rebuild",
     );
 
-    // Two rebuilds: two removals and two registrations.
+    // Two rebuilds. Neither one touches the document.
     const count = await mouseUpListeners(page);
     // eslint-disable-next-line no-console
     console.log(`  document mouseup listeners after two rebuilds: ${count >= 0 ? "+" : ""}${count}`);
