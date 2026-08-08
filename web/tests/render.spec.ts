@@ -849,6 +849,39 @@ describe("the dirty state", () => {
     expect(counts.two).toBe(2);
   });
 
+  test("a full redraw with no dirty row still paints every row", async () => {
+    await make(20, 6);
+    const drawn = await page.evaluate(() => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const box = (globalThis as unknown as { __grid: any }).__grid;
+      box.grid.draw(box.term);
+      box.grid.draw(box.term);
+      // The shim reports a full redraw and no dirty row. The two answers
+      // disagree, and the full redraw must win.
+      const shim = Object.create(box.term);
+      shim.needsFullRedraw = (): boolean => true;
+      shim.isRowDirty = (): boolean => false;
+      box.grid.draw(shim);
+      return Array.from(box.grid.lastDrawnRows as number[]);
+    });
+    expect(drawn).toEqual([0, 1, 2, 3, 4, 5]);
+  });
+
+  test("a resize to a larger grid paints every row again", async () => {
+    await make(20, 6);
+    const drawn = await page.evaluate(() => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const box = (globalThis as unknown as { __grid: any }).__grid;
+      box.grid.draw(box.term);
+      box.grid.draw(box.term);
+      box.grid.resize(30, 12);
+      box.grid.draw(box.term);
+      return Array.from(box.grid.lastDrawnRows as number[]);
+    });
+    // The terminal holds six rows, so the draw paints the six rows that exist.
+    expect(drawn).toEqual([0, 1, 2, 3, 4, 5]);
+  });
+
   test("draw calls the render property of the instance", async () => {
     await make(20, 6);
     const calls = await page.evaluate(() => {
@@ -974,6 +1007,31 @@ describe("the lifetime", () => {
     });
     expect(result.error).toBeNull();
     expect(result.drawn).toEqual([]);
+  });
+
+  test("the VT terminal still works after a dispose", async () => {
+    await make(20, 6);
+    // ghostty-vt.wasm 0.4.0 corrupts its heap when a grid that held a grapheme
+    // cluster is freed. This test writes a cluster and a wide character, then
+    // it disposes the renderer and reads the terminal again. A free of the
+    // terminal inside the renderer traps here.
+    const result = await page.evaluate((esc: string) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const box = (globalThis as unknown as { __grid: any }).__grid;
+      box.write(`${esc}[38;2;255;255;255mAé漢`);
+      box.grid.draw(box.term);
+      box.grid.dispose();
+      try {
+        box.term.write("ok");
+        const cells = box.term.getViewport();
+        return { error: null as string | null, cols: box.term.cols, first: cells[0].codepoint };
+      } catch (e) {
+        return { error: String(e), cols: 0, first: 0 };
+      }
+    }, ESC);
+    expect(result.error).toBeNull();
+    expect(result.cols).toBe(20);
+    expect(result.first).toBe(0x41);
   });
 
   test("a second dispose does nothing", async () => {
