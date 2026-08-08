@@ -38,10 +38,11 @@ function show(key: string, frame: Uint8Array): string {
 
 test("the client takes the keyboard focus at load, with no click", async () => {
   // Every other test in this file calls `page.focus("#terminal")` first. That
-  // call is a precondition that no test asserted. It can also hide a fault: a
+  // call is a precondition that no test asserted. It can also hide a fault. A
   // client that takes no focus at load sends nothing for the keystrokes of an
-  // operator, until a click lands on the page, and every test still passes.
-  // This test presses one key with no focus call and no click.
+  // operator, until a click lands on the page. Every other test still passes
+  // over that fault. This test presses one key with no focus call and no
+  // click.
   //
   // The constructor of `PirateTerminal` takes the focus at
   // `src/terminal.ts:354`.

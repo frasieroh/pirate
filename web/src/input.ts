@@ -63,7 +63,7 @@ function clampRate(value: number): number {
   return Math.min(RATE_MAX, Math.max(RATE_MIN, value));
 }
 
-// ── A. the chords that the fallback encoder gets wrong ─────────────────────
+// ── A. the chords that the fallback encoder encodes wrongly ────────────────
 //
 // The correction runs inside `term.attachCustomKeyEventHandler`. Each branch
 // below matches one measured defect, sends the correct bytes, and returns
@@ -73,8 +73,8 @@ function clampRate(value: number): number {
 // The fallback encoder is the KeyEncoder of libghostty, inside
 // ghostty-vt.wasm. `PirateTerminal.onKeyDown` calls it through
 // `this.vt.encodeKey` (`src/terminal.ts:527`). The client binds one option of
-// that encoder, `OPT_CURSOR_KEY_APPLICATION` (`src/vt/exports.ts:103`), and
-// `src/vt/terminal.ts:536` sets that one option before each call. Every other
+// that encoder, `OPT_CURSOR_KEY_APPLICATION` (`src/vt/exports.ts:104`), and
+// `src/vt/terminal.ts:541` sets that one option before each call. Every other
 // option keeps its default.
 //
 // Each branch below states the bytes that the fallback encoder gave for its
@@ -83,8 +83,9 @@ function clampRate(value: number): number {
 // browser harness of `web/tests`. The stated bytes are the payload of the
 // `0x00` frame that the stub server received. Four of the Ctrl chords gave a
 // Kitty CSI-u sequence from the encoder defaults. The client negotiates no
-// Kitty keyboard protocol: `grep -ri kitty web/src` finds no flag and no
-// query, only a comment on a buffer size.
+// Kitty keyboard protocol. `grep -ri kitty web/src` finds no flag and no
+// query. Outside the comments of this file, the one hit is
+// `src/vt/exports.ts:120`, a note on a buffer size.
 //
 // `term.input(data, true)` sends `data` as the answer to the key. The second
 // argument is `wasUserInput`. When it is true, the facade fires the `onData`
@@ -185,7 +186,7 @@ function buildKeyCorrection(runtime: Runtime): (event: KeyboardEvent) => boolean
     // `src/terminal.ts:527` gives that text to the encoder.
     //
     // The three menu bindings, `alt+h`, `alt+-`, and `alt+=`, never reach
-    // this handler. `src/keys.ts:277` attaches one keydown listener on
+    // this handler. `src/keys.ts:279` attaches one keydown listener on
     // `window`, in the capture phase. `window` is an ancestor of `#terminal`,
     // so that listener runs before the bubble-phase listener of the facade on
     // `#terminal` (`src/terminal.ts:323`). A chord that matches a binding
@@ -489,7 +490,7 @@ function installRepeatRateRow(runtime: Runtime): void {
 /**
  * Install the input corrections and the key repeat.
  *
- * The function corrects the chords that the fallback encoder gets wrong,
+ * The function corrects the chords that the fallback encoder encodes wrongly,
  * holds the focus on the terminal, and generates the key repeat.
  */
 export function installInput(runtime: Runtime): void {
