@@ -29,6 +29,15 @@
  * hash stops matching the grid
  * (`beamterm-core/src/gl/terminal_grid.rs:847`). The recorded range alone is
  * therefore not proof of a live selection.
+ *
+ * A change of the selection repaints nothing by itself. The highlight lives in
+ * the state of the package, the VT terminal knows nothing about it, and `draw`
+ * of `src/render/index.ts` returns early for a frame with no dirty row. This
+ * module therefore calls `requestRedraw` of the renderer at each point where
+ * the selection can change: the mouse-down, the mouse-move of a drag, the
+ * mouse-up, and `clear`. Each call asks for one paint, and the next frame
+ * gives it. A pointer that moves with no button down asks for nothing, so an
+ * idle terminal still presents zero frames.
  */
 
 import { CellQuery, SelectionMode } from "@beamterm/renderer/web";
@@ -146,10 +155,24 @@ export function installSelection(renderer: GridRenderer, container: HTMLElement)
     start = cell;
     end = null;
     dragging = true;
+    renderer.requestRedraw();
   });
 
   canvas.addEventListener("mousemove", (event: MouseEvent) => {
     if (!dragging) {
+      return;
+    }
+    if ((event.buttons & 1) === 0) {
+      // The mouse-up of this drag went to another element. The listeners of
+      // this module sit on the canvas alone, so that mouse-up never arrives
+      // here. A move with the left button up therefore ends the drag.
+      //
+      // Measurement, on the 1000 by 600 client of `tests/harness.ts`: without
+      // this arm, a mouse-up 14 pixels below the canvas kept `dragging` true.
+      // 20 later moves over the canvas, with no button down, gave 20 paints
+      // of every row, and `text` grew from "hello world" to "hello world" and
+      // five empty rows.
+      dragging = false;
       return;
     }
     const cell = cellOf(event);
@@ -157,6 +180,7 @@ export function installSelection(renderer: GridRenderer, container: HTMLElement)
       return;
     }
     end = cell;
+    renderer.requestRedraw();
   });
 
   canvas.addEventListener("mouseup", (event: MouseEvent) => {
@@ -171,6 +195,7 @@ export function installSelection(renderer: GridRenderer, container: HTMLElement)
     }
     end = cell;
     dragging = false;
+    renderer.requestRedraw();
   });
 
   return {
@@ -202,6 +227,7 @@ export function installSelection(renderer: GridRenderer, container: HTMLElement)
       start = null;
       end = null;
       dragging = false;
+      renderer.requestRedraw();
     },
   };
 }

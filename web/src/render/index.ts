@@ -196,6 +196,44 @@ export class GridRenderer {
     this.beam.render();
   }
 
+  /**
+   * Ask the next `draw` to paint every row one time.
+   *
+   * The selection highlight of `@beamterm/renderer` lives in the state of the
+   * package, not in the cells of the VT terminal. A drag makes no row dirty
+   * and moves no cursor, so `draw` takes its early return, and the canvas
+   * keeps the last paint until an unrelated event produces a frame. This
+   * request produces that frame.
+   *
+   * A present alone does not carry the highlight. Measurement, in Chromium
+   * with `--enable-unsafe-swiftshader`, on the 1000 by 600 client of
+   * `tests/harness.ts`: after a drag over 11 cells of row 0, the hash of every
+   * canvas pixel was 3823779166 before the drag, 3823779166 after a bare
+   * `beam.render`, and 1019021528 after a draw that painted every row. The
+   * package applies the highlight to the cells that a batch writes, so the
+   * rows must go to the GPU again. A one-shot request for a present alone
+   * therefore shows nothing.
+   *
+   * The cost is one paint of every row for each mouse event of a drag, and
+   * nothing between two drags. Measurement on the same client, a grid of 109
+   * by 38 cells, with the test "the frames of a drag follow the mouse events,
+   * not the animation frames": a drag of 23 mouse events over 1127 ms gave 21
+   * frames inside a window of 4000 ms. The animation frame loop offers about
+   * 240 frames in that window, so the rate follows the pointer and not the
+   * loop. One such frame costs 0.50 ms of draw on that grid, from the test
+   * "the paint of a screen event scales with the cells on the screen" of
+   * `bench/latency.spec.ts`.
+   *
+   * The request is one-shot, because `draw` clears `fullRedraw` after it
+   * paints. A request that stayed set would paint every row on every frame.
+   */
+  requestRedraw(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.fullRedraw = true;
+  }
+
   get cols(): number {
     return this.gridCols;
   }

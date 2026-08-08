@@ -18,7 +18,19 @@
 
 import { beforeEach, expect, test } from "bun:test";
 import type { Page } from "playwright";
-import { clientState, paintedPixels, server, viewportLine, waitFor, withClient } from "./harness";
+import {
+  canvasSignature,
+  clientState,
+  countRenders,
+  cursor,
+  idle,
+  paintedPixels,
+  server,
+  viewportLine,
+  viewportText,
+  waitFor,
+  withClient,
+} from "./harness";
 
 beforeEach(() => {
   server().reset();
@@ -36,7 +48,14 @@ type SelectWindow = {
   __pirate: {
     selection: SelectionApi;
     term: {
-      renderer: { cellSize(): { width: number; height: number }; cols: number; rows: number };
+      renderer: {
+        cellSize(): { width: number; height: number };
+        cols: number;
+        rows: number;
+        render(...args: unknown[]): void;
+        draw(...args: unknown[]): void;
+        readonly lastDrawnRows: readonly number[];
+      };
     };
   };
 };
@@ -459,5 +478,372 @@ test("a mouse-down alone reports a selection and extracts no text", async () => 
     expect(await selectedText(page)).toBe("");
 
     await page.mouse.up();
+  });
+});
+
+
+// ============================================================================
+// The repaint of a selection change
+// ============================================================================
+//
+// The client holds no select-all command. The proof:
+//
+//     $ grep -rn "selectAll\|select-all\|selectall" web/src web/tests web/e2e
+//     (no match)
+//
+// The paths that change the selection are therefore the drag, the click that
+// cancels a selection, and `clear`.
+//
+// Every test in this section states the absence as well as the presence. A
+// frame that another event produced repaints the highlight as a side effect,
+// and such a frame hides a missing repaint. Each test therefore measures a
+// quiet terminal first, and it compares the cursor, the text of the viewport,
+// the client state, and the count of the frames that the client sent to the
+// host. The probe below reports the rows that each frame painted: a frame of
+// the selection paints every row, and a frame of a write paints the dirty rows
+// alone.
+
+/** What the probe counted between `startProbe` and `stopProbe`. */
+interface FrameProbe {
+  /** The count of `render` calls of the renderer. */
+  renders: number;
+  /** The rows that each `draw` painted. One entry for each frame. */
+  drawnRows: number[][];
+}
+
+type ProbeWindow = SelectWindow & { __probe?: FrameProbe };
+
+/**
+ * Count the frames of the renderer, and record the rows that each one painted.
+ *
+ * Both wrappers are own properties of the renderer, and `delete` removes them.
+ * `render` and `draw` of `GridRenderer` are methods of the prototype, so both
+ * come back after that `delete`.
+ */
+async function startProbe(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const renderer = (globalThis as unknown as ProbeWindow).__pirate.term.renderer;
+    const probe: FrameProbe = { renders: 0, drawnRows: [] };
+    (globalThis as unknown as ProbeWindow).__probe = probe;
+    const render = renderer.render.bind(renderer);
+    renderer.render = (...args: unknown[]): void => {
+      probe.renders += 1;
+      render(...args);
+    };
+    const draw = renderer.draw.bind(renderer);
+    renderer.draw = (...args: unknown[]): void => {
+      draw(...args);
+      probe.drawnRows.push(Array.from(renderer.lastDrawnRows));
+    };
+  });
+}
+
+/** Stop the probe and read what it counted. */
+function stopProbe(page: Page): Promise<FrameProbe> {
+  return page.evaluate(() => {
+    const globals = globalThis as unknown as ProbeWindow;
+    const renderer = globals.__pirate.term.renderer;
+    delete (renderer as unknown as Record<string, unknown>).render;
+    delete (renderer as unknown as Record<string, unknown>).draw;
+    const probe = globals.__probe ?? { renders: -1, drawnRows: [] };
+    globals.__probe = undefined;
+    return probe;
+  });
+}
+
+/**
+ * Prove that the terminal presents no frame over `ms` milliseconds.
+ *
+ * The paint of an earlier write can arrive inside the first window.
+ * Measurement: the first window after `writeAndPaint` counted one present.
+ * The wait therefore ends on a window with no present, and the assertion then
+ * measures a second window of the same length.
+ */
+async function expectQuiet(page: Page, ms = 400): Promise<void> {
+  await waitFor(
+    () => countRenders(page, ms),
+    (renders) => renders === 0,
+    "a terminal that presents no frame",
+  );
+  expect(await countRenders(page, ms)).toBe(0);
+}
+
+/**
+ * Prove that every frame of the probe painted every row, or no row at all.
+ *
+ * A frame of a selection change paints every row, because `requestRedraw` asks
+ * for a full redraw. A frame that a write produced paints the dirty rows
+ * alone. A partial list therefore names another cause for the repaint, and
+ * this function rejects it.
+ */
+function expectSelectionFrames(probe: FrameProbe, rows: number): void {
+  const full = Array.from({ length: rows }, (_unused, index) => index);
+  const painted = probe.drawnRows.filter((row) => row.length > 0);
+  expect(probe.drawnRows.length).toBeGreaterThan(0);
+  expect(painted.length).toBeGreaterThan(0);
+  for (const row of painted) {
+    expect(row).toEqual(full);
+  }
+}
+
+/**
+ * The time for the frame that serves the last mouse event of a drag.
+ *
+ * The request of `src/select.ts` is one-shot, and the next animation frame
+ * serves it. A measurement of a quiet terminal that starts before that frame
+ * counts the frame of the drag. One animation frame takes about 16 ms at 60
+ * frames per second, and this value holds nine of them.
+ */
+const SETTLE_MS = 150;
+
+/**
+ * The point in the middle of one cell, in page coordinates.
+ *
+ * The assertions state the preconditions of the drag, as `dragCells` states
+ * them: the cell size is more than zero, and the grid holds the cell.
+ */
+async function pointOf(page: Page, col: number, row: number): Promise<[number, number]> {
+  const origin = await canvasBox(page);
+  const cell = await cellSize(page);
+  expect(cell.width).toBeGreaterThan(0);
+  expect(cell.height).toBeGreaterThan(0);
+  const grid = await gridSize(page);
+  expect(col).toBeLessThan(grid.cols);
+  expect(row).toBeLessThan(grid.rows);
+  return [origin.x + (col + 0.5) * cell.width, origin.y + (row + 0.5) * cell.height];
+}
+
+test("a drag repaints the canvas while no row is dirty", async () => {
+  await withClient(async (page) => {
+    await writeAndPaint(page, "hello world", "hello world");
+    // The precondition of this test. A terminal that still paints gives the
+    // highlight a frame that the drag did not ask for.
+    await expectQuiet(page);
+
+    const grid = await gridSize(page);
+    const before = await canvasSignature(page);
+    const cursorBefore = await cursor(page);
+    const textBefore = await viewportText(page);
+    const stateBefore = await clientState(page);
+    const sentBefore = server().received.length;
+
+    await startProbe(page);
+    const [x0, y0] = await pointOf(page, 0, 0);
+    const [x1, y1] = await pointOf(page, 4, 0);
+    const [x2, y2] = await pointOf(page, 10, 0);
+    await page.mouse.move(x0, y0);
+    await page.mouse.down();
+
+    await page.mouse.move(x1, y1, { steps: 4 });
+    const short = await waitFor(
+      () => canvasSignature(page),
+      (value) => value !== before,
+      "the canvas after the start of the drag",
+    );
+
+    await page.mouse.move(x2, y2, { steps: 4 });
+    const long = await waitFor(
+      () => canvasSignature(page),
+      (value) => value !== short,
+      "the canvas after the drag covered more cells",
+    );
+
+    await page.mouse.up();
+    const probe = await stopProbe(page);
+
+    // Criterion 25. The pixels of the canvas changed two times during the
+    // drag, so the highlight followed the pointer.
+    expect(short).not.toBe(before);
+    expect(long).not.toBe(short);
+    expect(probe.renders).toBeGreaterThan(0);
+    expect(await hasSelection(page)).toBe(true);
+
+    // The absence half. No other event produced these frames. The cells of
+    // the terminal did not change, so the new pixels carry the highlight and
+    // nothing else. Every frame that painted painted every row, which is the
+    // signature of the selection path.
+    expectSelectionFrames(probe, grid.rows);
+    expect(await cursor(page)).toEqual(cursorBefore);
+    expect(await viewportText(page)).toEqual(textBefore);
+    expect(await clientState(page)).toEqual(stateBefore);
+    expect(server().received.length).toBe(sentBefore);
+  });
+});
+
+test("a completed drag leaves the terminal quiet and keeps the highlight", async () => {
+  await withClient(async (page) => {
+    await writeAndPaint(page, "hello world", "hello world");
+
+    // Criterion 26, the first half. A quiet terminal with no selection
+    // activity presents zero frames.
+    await expectQuiet(page);
+    const quiet = await canvasSignature(page);
+
+    await dragCells(page, { col: 0, row: 0 }, { col: 10, row: 0 });
+    expect(await hasSelection(page)).toBe(true);
+    const highlighted = await waitFor(
+      () => canvasSignature(page),
+      (value) => value !== quiet,
+      "the canvas after the drag",
+    );
+    await idle(SETTLE_MS);
+
+    // Criterion 26, the second half. The request of each mouse event is
+    // one-shot, so the terminal is quiet again after the last one. A request
+    // that stayed set would paint every row on every frame.
+    await expectQuiet(page);
+
+    // The canvas holds the highlight over that quiet period, because the
+    // drawing buffer is preserved.
+    expect(await canvasSignature(page)).toBe(highlighted);
+  });
+});
+
+test("a clear repaints the canvas back to the paint with no highlight", async () => {
+  await withClient(async (page) => {
+    await writeAndPaint(page, "hello world", "hello world");
+    await expectQuiet(page);
+    const grid = await gridSize(page);
+    const quiet = await canvasSignature(page);
+
+    await dragCells(page, { col: 0, row: 0 }, { col: 10, row: 0 });
+    const highlighted = await waitFor(
+      () => canvasSignature(page),
+      (value) => value !== quiet,
+      "the canvas after the drag",
+    );
+    await idle(SETTLE_MS);
+
+    const cursorBefore = await cursor(page);
+    const textBefore = await viewportText(page);
+    const sentBefore = server().received.length;
+
+    await startProbe(page);
+    await clearSelection(page);
+    const cleared = await waitFor(
+      () => canvasSignature(page),
+      (value) => value !== highlighted,
+      "the canvas after the clear",
+    );
+    const probe = await stopProbe(page);
+
+    // Criterion 25 for the clear. The canvas came back to the paint that
+    // carried no highlight, and no other event produced that frame.
+    expect(await hasSelection(page)).toBe(false);
+    expect(cleared).toBe(quiet);
+    expect(probe.renders).toBeGreaterThan(0);
+    expectSelectionFrames(probe, grid.rows);
+    expect(await cursor(page)).toEqual(cursorBefore);
+    expect(await viewportText(page)).toEqual(textBefore);
+    expect(server().received.length).toBe(sentBefore);
+  });
+});
+
+test("the frames of a drag follow the mouse events, not the animation frames", async () => {
+  // The measurement behind the choice of a full redraw over a present. A
+  // present alone leaves the pixels of the canvas unchanged (see
+  // `requestRedraw` of `src/render/index.ts`), so the rows must go to the GPU
+  // again. The cost of that choice is bounded here: the terminal presents one
+  // frame for each mouse event of the drag at most, never one for each
+  // animation frame of the browser. A request that never cleared would give
+  // one frame for each animation frame.
+  const STEPS = 20;
+  /** The mouse events of the drag: the first move, the steps, down, and up. */
+  const EVENTS = STEPS + 3;
+  /** The window of the count. It covers the drag and a quiet tail. */
+  const WINDOW_MS = 4000;
+
+  await withClient(async (page) => {
+    await writeAndPaint(page, "hello world", "hello world");
+    await expectQuiet(page);
+
+    const grid = await gridSize(page);
+    const [x0, y0] = await pointOf(page, 0, 0);
+    const [x1, y1] = await pointOf(page, grid.cols - 1, grid.rows - 1);
+
+    const counting = countRenders(page, WINDOW_MS);
+    // The wrapper goes on inside `counting`. Give it the task it needs before
+    // the drag starts.
+    await idle(100);
+
+    const started = Date.now();
+    await page.mouse.move(x0, y0);
+    await page.mouse.down();
+    await page.mouse.move(x1, y1, { steps: STEPS });
+    await page.mouse.up();
+    const elapsed = Date.now() - started;
+    const renders = await counting;
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `  drag over ${grid.cols}x${grid.rows} cells: ${renders} frames for ${EVENTS} mouse ` +
+        `events, drag ${elapsed} ms, window ${WINDOW_MS} ms`,
+    );
+    expect(await hasSelection(page)).toBe(true);
+    expect(elapsed).toBeLessThan(WINDOW_MS);
+    expect(renders).toBeGreaterThan(0);
+    expect(renders).toBeLessThanOrEqual(EVENTS);
+  });
+});
+
+/**
+ * A point below the canvas, inside the page.
+ *
+ * The canvas of the 1000 by 600 client sits at 8, 8 and it measures 981 by
+ * 570, so the page holds a band of 14 pixels below it. A mouse-up in that band
+ * reaches the page and it reaches no listener of the canvas.
+ */
+async function pointBelowCanvas(page: Page): Promise<[number, number]> {
+  const box = await page.locator("#terminal canvas").boundingBox();
+  expect(box).not.toBeNull();
+  const view = page.viewportSize();
+  expect(view).not.toBeNull();
+  const below = box!.y + box!.height + 2;
+  expect(below).toBeLessThan(view!.height);
+  return [box!.x + box!.width / 2, below];
+}
+
+test("a mouse-up outside the canvas ends the drag, and a later hover paints nothing", async () => {
+  await withClient(async (page) => {
+    await writeAndPaint(page, "hello world", "hello world");
+    await expectQuiet(page);
+
+    // The drag leaves the canvas with the button down and it ends outside.
+    // The mouse-up listener sits on the canvas, so it never sees this event.
+    const [x0, y0] = await pointOf(page, 0, 0);
+    const [x1, y1] = await pointOf(page, 10, 0);
+    const [xOut, yOut] = await pointBelowCanvas(page);
+    await page.mouse.move(x0, y0);
+    await page.mouse.down();
+    await page.mouse.move(x1, y1, { steps: 4 });
+    await page.mouse.move(xOut, yOut, { steps: 4 });
+    await page.mouse.up();
+    await idle(SETTLE_MS);
+    await expectQuiet(page);
+
+    const textAfterDrag = await selectedText(page);
+    const grid = await gridSize(page);
+
+    // Criterion 26. The pointer crosses the canvas with no button down. This
+    // is no selection activity, so the terminal presents zero frames.
+    await startProbe(page);
+    const hovering = (async () => {
+      for (let index = 0; index < 12; index += 1) {
+        const [hx, hy] = await pointOf(page, 20 + index, Math.min(5, grid.rows - 1));
+        await page.mouse.move(hx, hy);
+        await idle(20);
+      }
+    })();
+    const renders = await countRenders(page, 800);
+    await hovering;
+    const probe = await stopProbe(page);
+
+    expect(renders).toBe(0);
+    expect(probe.renders).toBe(0);
+    // The hover also moves no end cell of the drag that ended outside. The
+    // drag crossed the rows below row 0 on its way out, so the text of the
+    // selection covers them. The hover must not add to it.
+    expect(textAfterDrag).toContain("hello world");
+    expect(await selectedText(page)).toBe(textAfterDrag);
   });
 });

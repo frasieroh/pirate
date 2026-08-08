@@ -926,6 +926,98 @@ describe("the dirty state", () => {
 });
 
 // ============================================================================
+// The redraw request
+// ============================================================================
+//
+// `requestRedraw` serves the selection highlight of `@beamterm/renderer`. A
+// change of the selection makes no row dirty, so the early return of `draw`
+// holds the last paint on the canvas. A present alone does not carry the
+// highlight: the package applies it to the cells that a batch writes, so the
+// rows must go to the GPU again. `tests/select.spec.ts` holds that
+// measurement. The request is one-shot, because `draw` clears the full-redraw
+// state after it paints. A request that stayed set would paint every row on
+// every frame, and the dirty-region optimization would then do nothing.
+
+describe("the redraw request", () => {
+  test("a request paints every row one time, then the state is quiet again", async () => {
+    await make(20, 6);
+    const result = await page.evaluate(() => {
+      const grid = (globalThis as unknown as { __grid: GridApi }).__grid;
+      grid.write("hello");
+      grid.draw();
+      grid.draw();
+      const before = grid.state().renderCalls;
+
+      grid.call("requestRedraw");
+      grid.draw();
+      const served = grid.state();
+
+      grid.draw();
+      const after = grid.state();
+      return {
+        before,
+        servedCalls: served.renderCalls,
+        servedRows: served.lastDrawnRows,
+        afterCalls: after.renderCalls,
+        afterRows: after.lastDrawnRows,
+      };
+    });
+    // The request paints every row and presents the canvas one time.
+    expect(result.servedRows).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(result.servedCalls).toBe(result.before + 1);
+    // The request is one-shot. The next draw paints no row and presents
+    // nothing.
+    expect(result.afterRows).toEqual([]);
+    expect(result.afterCalls).toBe(result.servedCalls);
+  });
+
+  test("a request with one dirty row still paints every row", async () => {
+    await make(20, 6);
+    const rows = await page.evaluate(() => {
+      const grid = (globalThis as unknown as { __grid: GridApi }).__grid;
+      grid.write("\r\n\r\n\r\n");
+      grid.draw();
+      grid.draw();
+
+      // The write makes row 3 dirty. The request must widen that paint to
+      // every row, because the highlight can cover any row.
+      grid.write("hello");
+      grid.call("requestRedraw");
+      grid.draw();
+      return grid.state().lastDrawnRows;
+    });
+    expect(rows).toEqual([0, 1, 2, 3, 4, 5]);
+  });
+
+  test("a request on a disposed renderer paints nothing and throws no error", async () => {
+    await make(20, 6);
+    const result = await page.evaluate(() => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const box = (globalThis as unknown as { __grid: any }).__grid;
+      box.grid.draw(box.term);
+      box.grid.dispose();
+      const before = box.renderCalls as number;
+      let error: string | null = null;
+      try {
+        box.grid.requestRedraw();
+        box.grid.draw(box.term);
+      } catch (e) {
+        error = String(e);
+      }
+      return {
+        error,
+        before,
+        after: box.renderCalls as number,
+        drawn: Array.from(box.grid.lastDrawnRows as number[]),
+      };
+    });
+    expect(result.error).toBeNull();
+    expect(result.after).toBe(result.before);
+    expect(result.drawn).toEqual([]);
+  });
+});
+
+// ============================================================================
 // The fit
 // ============================================================================
 
