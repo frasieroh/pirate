@@ -11,7 +11,8 @@
  * The file states each precondition as an assertion. `canvasBox` proves that
  * the page holds exactly one canvas, that this canvas is inside `#terminal`,
  * and that its box is not empty. `dragCells` proves that the cell size is more
- * than zero. The first test proves that the `beam` field of the renderer is
+ * than zero, and that the grid holds every column and every row that the drag
+ * asks for. The first test proves that the `beam` field of the renderer is
  * reachable at run time, which is the base of `beamOf` in `src/terminal.ts`.
  */
 
@@ -34,18 +35,20 @@ interface SelectionApi {
 type SelectWindow = {
   __pirate: {
     selection: SelectionApi;
-    term: { renderer: { cellSize(): { width: number; height: number } } };
+    term: {
+      renderer: { cellSize(): { width: number; height: number }; cols: number; rows: number };
+    };
   };
 };
 
-/** True while a completed selection covers one cell or more. */
+/** True from the mouse-down of a drag until the selection ends. */
 function hasSelection(page: Page): Promise<boolean> {
   return page.evaluate(() =>
     (globalThis as unknown as SelectWindow).__pirate.selection.hasSelection(),
   );
 }
 
-/** The text of the completed selection. */
+/** The text of the selection, or the empty string. */
 function selectedText(page: Page): Promise<string> {
   return page.evaluate(() => (globalThis as unknown as SelectWindow).__pirate.selection.text());
 }
@@ -67,6 +70,14 @@ function cellSize(page: Page): Promise<{ width: number; height: number }> {
   return page.evaluate(() =>
     (globalThis as unknown as SelectWindow).__pirate.term.renderer.cellSize(),
   );
+}
+
+/** The grid size in cells, as the renderer reports it. */
+function gridSize(page: Page): Promise<{ cols: number; rows: number }> {
+  return page.evaluate(() => {
+    const renderer = (globalThis as unknown as SelectWindow).__pirate.term.renderer;
+    return { cols: renderer.cols, rows: renderer.rows };
+  });
 }
 
 /**
@@ -108,6 +119,16 @@ async function dragCells(
   expect(cell.width).toBeGreaterThan(0);
   expect(cell.height).toBeGreaterThan(0);
 
+  // Both beamterm and `src/select.ts` drop a mouse event outside the grid
+  // (`beamterm-renderer/src/mouse.rs:317`). A drag to a column or a row that
+  // the grid does not hold therefore records a different range than the one
+  // that the test asks for. This assertion names that precondition.
+  const grid = await gridSize(page);
+  for (const target of [from, to]) {
+    expect(target.col).toBeLessThan(grid.cols);
+    expect(target.row).toBeLessThan(grid.rows);
+  }
+
   const at = (col: number, row: number): [number, number] => [
     origin.x + (col + 0.5) * cell.width,
     origin.y + (row + 0.5) * cell.height,
@@ -142,6 +163,23 @@ async function grantClipboard(page: Page): Promise<void> {
 /** The text of the system clipboard. */
 function clipboardText(page: Page): Promise<string> {
   return page.evaluate(() => navigator.clipboard.readText());
+}
+
+/** The value that `resetClipboard` writes. No drag in this file gives it. */
+const NO_COPY = "<no copy>";
+
+/**
+ * Put a sentinel on the clipboard, and prove that the sentinel is there.
+ *
+ * `withClient` opens a new browser context for each test, but the clipboard
+ * belongs to the browser and it outlives the context. A test that waits for
+ * an expected value therefore reads a value that an earlier test wrote, and it
+ * passes while the copy under test does nothing. This function removes that
+ * path.
+ */
+async function resetClipboard(page: Page): Promise<void> {
+  await page.evaluate((value: string) => navigator.clipboard.writeText(value), NO_COPY);
+  expect(await clipboardText(page)).toBe(NO_COPY);
 }
 
 test("the renderer holds a reachable beam field, and it reports no selection at open", async () => {
@@ -279,16 +317,18 @@ test("clearSelection returns the terminal to the state with no selection", async
 test("the drag puts the selected text on the system clipboard", async () => {
   await withClient(async (page) => {
     await grantClipboard(page);
+    await resetClipboard(page);
     await writeAndPaint(page, "hello world", "hello world");
 
     await dragCells(page, { col: 0, row: 0 }, { col: 10, row: 0 });
 
     // beamterm writes the clipboard through `navigator.clipboard.writeText`
     // and awaits no promise (`beamterm-renderer/src/js.rs:68`), so the write
-    // lands in a later task than the mouse-up.
+    // lands in a later task than the mouse-up. The wait ends on any value
+    // other than the sentinel, so only a write of this drag can end it.
     const text = await waitFor(
       () => clipboardText(page),
-      (value) => value === "hello world",
+      (value) => value !== NO_COPY,
       "the clipboard",
     );
     expect(text).toBe("hello world");
@@ -330,5 +370,94 @@ test("selection is installed once, and it survives a theme change", async () => 
 
     expect(await hasSelection(page)).toBe(true);
     expect(await selectedText(page)).toBe("hello world");
+  });
+});
+
+test("a backward drag across a row gives the same text as a forward drag", async () => {
+  await withClient(async (page) => {
+    await writeAndPaint(page, "hello world", "hello world");
+
+    // `src/select.ts` records the mouse-down cell as the start, and beamterm
+    // records the same cell as the start of its own query. `CellQuery` orders
+    // the two corners before it reads the cells
+    // (`beamterm-core/src/gl/cell_query.rs:111`), so the direction of the drag
+    // does not change the text.
+    await dragCells(page, { col: 10, row: 0 }, { col: 0, row: 0 });
+
+    expect(await hasSelection(page)).toBe(true);
+    expect(await selectedText(page)).toBe("hello world");
+  });
+});
+
+test("a backward drag over two rows joins them in reading order", async () => {
+  await withClient(async (page) => {
+    await writeAndPaint(page, "alpha\r\nbravo", "alpha");
+    expect(await viewportLine(page, 1)).toBe("bravo");
+
+    await dragCells(page, { col: 4, row: 1 }, { col: 0, row: 0 });
+
+    expect(await selectedText(page)).toBe("alpha\nbravo");
+  });
+});
+
+test("the clipboard and the extracted text agree on a row with a blank tail", async () => {
+  await withClient(async (page) => {
+    await grantClipboard(page);
+    await resetClipboard(page);
+    await writeAndPaint(page, "alpha\r\nbravo", "alpha");
+
+    // `src/select.ts` builds one `CellQuery` and beamterm builds another one
+    // for the copy. Both must trim the trailing blanks, or the extracted text
+    // and the clipboard differ. Row 0 holds "alpha" and then blanks to the
+    // right edge, and this drag covers that blank tail.
+    await dragCells(page, { col: 0, row: 0 }, { col: 10, row: 1 });
+
+    const copied = await waitFor(
+      () => clipboardText(page),
+      (value) => value !== NO_COPY,
+      "the clipboard",
+    );
+    expect(await selectedText(page)).toBe(copied);
+    expect(copied).toBe("alpha\nbravo");
+  });
+});
+
+test("a second drag replaces the first one with no clear between them", async () => {
+  await withClient(async (page) => {
+    await grantClipboard(page);
+    await writeAndPaint(page, "hello world", "hello world");
+
+    await dragCells(page, { col: 0, row: 0 }, { col: 4, row: 0 });
+    expect(await selectedText(page)).toBe("hello");
+
+    await resetClipboard(page);
+    await dragCells(page, { col: 6, row: 0 }, { col: 10, row: 0 });
+
+    expect(await selectedText(page)).toBe("world");
+    const copied = await waitFor(
+      () => clipboardText(page),
+      (value) => value !== NO_COPY,
+      "the clipboard",
+    );
+    expect(copied).toBe("world");
+  });
+});
+
+test("a mouse-down alone reports a selection and extracts no text", async () => {
+  await withClient(async (page) => {
+    await writeAndPaint(page, "hello world", "hello world");
+    const origin = await canvasBox(page);
+    const cell = await cellSize(page);
+    await page.mouse.move(origin.x + 0.5 * cell.width, origin.y + 0.5 * cell.height);
+    await page.mouse.down();
+
+    // Measured. `hasSelection` of beamterm reads the selection tracker, and
+    // the mouse-down arm fills that tracker before the drag moves
+    // (`beamterm-renderer/src/mouse.rs:440`). `text` needs an end cell, and
+    // only a mouse-move or a mouse-up records one.
+    expect(await hasSelection(page)).toBe(true);
+    expect(await selectedText(page)).toBe("");
+
+    await page.mouse.up();
   });
 });

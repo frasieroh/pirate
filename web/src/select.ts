@@ -24,9 +24,11 @@
  * outside the grid gives no cell, and the package drops such an event as well.
  *
  * `text` answers the empty string when the package reports no selection. The
- * package clears the selection when the cells under it change
- * (`beamterm-renderer/src/mouse.rs:453`), so the recorded range alone is not
- * proof of a live selection.
+ * package stores a hash of the selected cells at the mouse-up
+ * (`beamterm-renderer/src/mouse.rs:456`) and drops the selection when that
+ * hash stops matching the grid
+ * (`beamterm-core/src/gl/terminal_grid.rs:847`). The recorded range alone is
+ * therefore not proof of a live selection.
  */
 
 import { CellQuery, SelectionMode } from "@beamterm/renderer/web";
@@ -42,9 +44,23 @@ interface Cell {
 
 /** The selection of the page. `src/main.ts` exposes it to the tests. */
 export interface Selection {
-  /** True while a completed selection covers one cell or more. */
+  /**
+   * True from the mouse-down of a drag until the selection ends.
+   *
+   * The package answers from its selection tracker
+   * (`beamterm-renderer/src/terminal.rs:510`). The mouse-down arm fills that
+   * tracker (`beamterm-renderer/src/mouse.rs:440`), so the answer is true
+   * during a drag as well as after it. A canceled drag empties the tracker,
+   * and `clear` empties it too.
+   */
   hasSelection(): boolean;
-  /** The text of the completed selection, or the empty string. */
+  /**
+   * The text of the selection, or the empty string.
+   *
+   * The answer stays the empty string until the drag records a start cell and
+   * an end cell. A mouse-down alone therefore gives the empty string while
+   * `hasSelection` already answers true.
+   */
   text(): string;
   /** Drop the selection. `hasSelection` then answers false. */
   clear(): void;

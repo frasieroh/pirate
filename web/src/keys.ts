@@ -6,9 +6,11 @@
  * code stays `KeyH` and `Equal` on every platform and every keyboard layout.
  *
  * The registry attaches ONE keydown listener on `window`, in the capture
- * phase. The capture phase runs before the listener of ghostty-web on the
- * container. A chord that matches a binding gets `preventDefault` and
- * `stopImmediatePropagation`, so ghostty-web never sees the event and the
+ * phase (`src/keys.ts:277`). `PirateTerminal` attaches its own listener on
+ * the container, in the bubble phase (`src/terminal.ts:323`). `window` is an
+ * ancestor of the container, so the capture listener here runs first. A chord
+ * that matches a binding gets `preventDefault` and
+ * `stopImmediatePropagation`, so the terminal never sees the event and the
  * client sends no bytes for it. This is the only defense against a
  * double-sent keystroke: the client never adds a second path to `onData`.
  *

@@ -1,10 +1,13 @@
 /**
  * Input frames: tag `0x00` from the client.
  *
- * ghostty-web attaches its own InputHandler and encodes each key with the
- * KeyEncoder of libghostty. `src/main.ts` sends the bytes of the `onData`
- * event and holds no key table. These tests assert the exact bytes that the
- * stub server received.
+ * `PirateTerminal` of `src/terminal.ts` attaches one keydown listener and
+ * encodes each key with the KeyEncoder of libghostty, through `vt.encodeKey`.
+ * The one key table of the client is `KEY_OF_CODE`, at `src/terminal.ts:53`.
+ * It maps `KeyboardEvent.code` to a `VtKey`, and the wasm encoder makes the
+ * bytes. `src/main.ts` sends the bytes of the `onData` event as one `0x00`
+ * frame, and it holds no key table and no encoder. These tests assert the
+ * exact bytes that the stub server received.
  */
 
 import { beforeEach, expect, test } from "bun:test";
@@ -32,6 +35,29 @@ async function press(page: Page, stub: Stub, key: string): Promise<Uint8Array> {
 function show(key: string, frame: Uint8Array): string {
   return `  ${key.padEnd(12)} tag ${hex(frame.subarray(0, 1))}  payload ${hex(frame.subarray(1))}`;
 }
+
+test("the client takes the keyboard focus at load, with no click", async () => {
+  // Every other test in this file calls `page.focus("#terminal")` first. That
+  // call is a precondition that no test asserted. It can also hide a fault: a
+  // client that takes no focus at load sends nothing for the keystrokes of an
+  // operator, until a click lands on the page, and every test still passes.
+  // This test presses one key with no focus call and no click.
+  //
+  // The constructor of `PirateTerminal` takes the focus at
+  // `src/terminal.ts:354`.
+  const stub = server();
+
+  await withClient(async (page) => {
+    const first = stub.received.length;
+    await page.keyboard.press("x");
+    await waitFor(
+      async () => stub.received.length,
+      (count) => count > first,
+      "an input frame with no focus call and no click",
+    );
+    expect(Array.from(stub.received[first])).toEqual([0x00, 0x78]);
+  });
+});
 
 test("each key gives one 0x00 frame with the encoded bytes", async () => {
   const stub = server();
@@ -88,9 +114,14 @@ async function pressOnce(page: Page, stub: Stub, key: string): Promise<Uint8Arra
 }
 
 test("the corrected chords give the right bytes, each in one frame", async () => {
-  // These seven chords are the measured defects of ghostty-web. Each one
-  // goes through `attachCustomKeyEventHandler` in `src/input.ts`, and each
-  // must give exactly one frame, with the bytes of a real terminal.
+  // These seven chords go through `attachCustomKeyEventHandler` in
+  // `src/input.ts`, and each must give exactly one frame, with the bytes of a
+  // real terminal. `src/input.ts` states the bytes that the fallback encoder
+  // gave for each chord, measured with the correction branch disabled. Five
+  // of the seven differ from the bytes below. Ctrl+V and Shift+Tab do not:
+  // the fallback gave `16` and `1b 5b 5a` for those two, so the correction
+  // changes no byte for them today. These assertions hold the contract for
+  // all seven.
   const stub = server();
 
   await withClient(async (page) => {

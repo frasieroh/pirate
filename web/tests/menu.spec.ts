@@ -3,7 +3,7 @@
  *
  * Three properties matter here. The menu must never change the box of the
  * terminal, because a change of the box gives a second resize frame for one
- * window size. A matched chord must never reach ghostty-web, because a chord
+ * window size. A matched chord must never reach the terminal, because a chord
  * that reaches it gives a second path to the socket. The stored state must
  * come back after a reload, because the cookie is the whole store.
  */
@@ -169,8 +169,9 @@ test("the hotkey takes the menu off the screen and brings it back", async () => 
 });
 
 test("the hotkey sends no input frame", async () => {
-  // The double-send guard. The registry stops the event in the capture phase,
-  // so ghostty-web never encodes it and the client sends no bytes.
+  // The double-send guard. The registry of `src/keys.ts` stops the event in
+  // the capture phase, so `PirateTerminal` never encodes it and the client
+  // sends no bytes.
   const stub = server();
 
   await withClient(async (page) => {

@@ -1,17 +1,19 @@
 /**
  * Keyboard input: the control characters, the focus, and the key repeat.
  *
- * ghostty-web attaches its own listener to `#terminal` and encodes each key
- * with the KeyEncoder of libghostty. `src/main.ts` sends every `onData`
- * string as one `0x00` frame, so this module adds no second path to the
- * socket. It corrects a small set of chords through
- * `term.attachCustomKeyEventHandler`, the one hook that ghostty-web calls
- * before it encodes a key itself.
+ * `PirateTerminal` of `src/terminal.ts` attaches one keydown listener to
+ * `#terminal` and encodes each key with the KeyEncoder of libghostty, through
+ * `vt.encodeKey` (`src/terminal.ts:323` and `src/terminal.ts:527`).
+ * `src/main.ts` sends every `onData` string as one `0x00` frame, so this
+ * module adds no second path to the socket. It corrects a small set of chords
+ * through `term.attachCustomKeyEventHandler`, the one hook that the facade
+ * calls before it encodes a key itself (`src/terminal.ts:522`).
  *
- * A truthy return from that handler makes ghostty-web call `preventDefault`
- * and stop. A false return lets ghostty-web encode the key as it does today.
- * This module never does both for the same key. Each corrected chord returns
- * true and sends its own bytes. Every other chord returns false.
+ * A truthy return from that handler makes the facade call `preventDefault`
+ * and encode nothing (`src/terminal.ts:522` to `src/terminal.ts:525`). A
+ * false return lets the facade encode the key. This module never does both
+ * for the same key. Each corrected chord returns true and sends its own
+ * bytes. Every other chord returns false.
  */
 
 import { addMenuRow, TERMINAL_GROUP } from "./menu";
@@ -61,20 +63,36 @@ function clampRate(value: number): number {
   return Math.min(RATE_MAX, Math.max(RATE_MIN, value));
 }
 
-// ── A. the chords that ghostty-web encodes wrongly ─────────────────────────
+// ── A. the chords that the fallback encoder gets wrong ─────────────────────
 //
 // The correction runs inside `term.attachCustomKeyEventHandler`. Each branch
 // below matches one measured defect, sends the correct bytes, and returns
-// true. Every other key returns false, and ghostty-web encodes it as before.
+// true. Every other key returns false, and the facade encodes it with the
+// fallback encoder.
+//
+// The fallback encoder is the KeyEncoder of libghostty, inside
+// ghostty-vt.wasm. `PirateTerminal.onKeyDown` calls it through
+// `this.vt.encodeKey` (`src/terminal.ts:527`). The client binds one option of
+// that encoder, `OPT_CURSOR_KEY_APPLICATION` (`src/vt/exports.ts:103`), and
+// `src/vt/terminal.ts:536` sets that one option before each call. Every other
+// option keeps its default.
+//
+// Each branch below states the bytes that the fallback encoder gave for its
+// chord. The measurement: `buildKeyCorrection` was made to return false for
+// every event, the client was built again, and each chord was pressed in the
+// browser harness of `web/tests`. The stated bytes are the payload of the
+// `0x00` frame that the stub server received. Four of the Ctrl chords gave a
+// Kitty CSI-u sequence from the encoder defaults. The client negotiates no
+// Kitty keyboard protocol: `grep -ri kitty web/src` finds no flag and no
+// query, only a comment on a buffer size.
 //
 // `term.input(data, true)` sends `data` as the answer to the key. The second
-// argument is `wasUserInput`. When it is true, ghostty-web fires `onData`
-// with the string and does not write the string to the screen. A read of
-// `input` in `node_modules/ghostty-web/dist/ghostty-web.js` confirms this:
-// `input(A, B = false) { ...; B ? this.dataEmitter.fire(A) : this.write(A); }`.
-// A local echo of a control character would be a fault, and this path has
-// none. `src/main.ts` already turns every `onData` string into one `0x00`
-// frame, so this module opens no second path to the socket.
+// argument is `wasUserInput`. When it is true, the facade fires the `onData`
+// callback and writes nothing to the screen (`src/terminal.ts:387` to
+// `src/terminal.ts:396`). A local echo of a control character would be a
+// fault, and this path has none. `src/main.ts` already turns every `onData`
+// string into one `0x00` frame, so this module opens no second path to the
+// socket.
 
 /** Build the corrected key handler for `runtime.term`. */
 function buildKeyCorrection(runtime: Runtime): (event: KeyboardEvent) => boolean {
@@ -83,36 +101,48 @@ function buildKeyCorrection(runtime: Runtime): (event: KeyboardEvent) => boolean
 
     // Ctrl+V. A real terminal sends SYN (0x16) to the shell for this chord.
     // Ctrl+Shift+V and Cmd+V are paste chords of the browser, not of the
-    // shell. This handler leaves them alone, so the native `paste` event of
-    // the browser still reaches the `paste` listener of ghostty-web.
+    // shell. This branch matches neither of them, because it needs `ctrlKey`
+    // alone.
+    //
+    // Measured fallback: `16`. The branch below gives the same byte, so it
+    // changes no byte today. `tests/input.spec.ts` holds the assertion.
+    //
+    // OPEN DESIGN QUESTION, not a property of this branch: no module of
+    // `web/src` registers a `paste` listener or a `clipboard` listener, so
+    // the client holds no destination for a paste event. Measured fallback
+    // for Ctrl+Shift+V: `16`, and `src/terminal.ts:537` calls
+    // `preventDefault` for it.
     if (ctrlKey && !altKey && !shiftKey && !metaKey && code === "KeyV") {
       runtime.term.input("\x16", true);
       return true;
     }
 
-    // Ctrl+I. The dictionary of ghostty-web sends a Kitty CSI-u sequence for
-    // this chord today. tmux and vim read Tab (0x09) for it, because pirate
-    // never negotiated the Kitty keyboard protocol with the server.
+    // Ctrl+I. Measured fallback: `1b 5b 31 30 35 3b 35 75`, the Kitty
+    // sequence `CSI 105;5u`. tmux and vim read Tab (0x09) for this chord,
+    // because the client negotiates no Kitty keyboard protocol.
     if (ctrlKey && !altKey && !shiftKey && !metaKey && code === "KeyI") {
       runtime.term.input("\x09", true);
       return true;
     }
 
-    // Ctrl+M. The same Kitty defect. A shell reads carriage return (0x0d)
-    // for this chord.
+    // Ctrl+M. Measured fallback: `1b 5b 31 30 39 3b 35 75`, the Kitty
+    // sequence `CSI 109;5u`. A shell reads carriage return (0x0d) for this
+    // chord.
     if (ctrlKey && !altKey && !shiftKey && !metaKey && code === "KeyM") {
       runtime.term.input("\x0d", true);
       return true;
     }
 
-    // Ctrl+[. This chord is the escape key of vim. A shell reads ESC (0x1b)
-    // for it, not the Kitty sequence that ghostty-web sends today.
+    // Ctrl+[. This chord is the escape key of vim. Measured fallback:
+    // `1b 5b 39 31 3b 35 75`, the Kitty sequence `CSI 91;5u`. A shell reads
+    // ESC (0x1b) for this chord.
     if (ctrlKey && !altKey && !shiftKey && !metaKey && code === "BracketLeft") {
       runtime.term.input("\x1b", true);
       return true;
     }
 
-    // Ctrl+-. A shell reads unit separator (0x1f) for this chord.
+    // Ctrl+-. Measured fallback: `1b 5b 34 35 3b 35 75`, the Kitty sequence
+    // `CSI 45;5u`. A shell reads unit separator (0x1f) for this chord.
     if (ctrlKey && !altKey && !shiftKey && !metaKey && code === "Minus") {
       runtime.term.input("\x1f", true);
       return true;
@@ -120,8 +150,9 @@ function buildKeyCorrection(runtime: Runtime): (event: KeyboardEvent) => boolean
 
     // Shift+Tab. A shell reads the CSI Z sequence for this chord, which
     // requests the previous completion or the previous field of a form.
-    // ghostty-web sends plain Tab (0x09) for it today, so the shell cannot
-    // tell Shift+Tab from Tab.
+    // Measured fallback: `1b 5b 5a`, the same three bytes. The branch below
+    // changes no byte today. `tests/input.spec.ts` holds the assertion for
+    // those bytes.
     if (shiftKey && !ctrlKey && !altKey && !metaKey && code === "Tab") {
       runtime.term.input("\x1b[Z", true);
       return true;
@@ -129,8 +160,12 @@ function buildKeyCorrection(runtime: Runtime): (event: KeyboardEvent) => boolean
 
     // Alt plus one character. A real terminal sends ESC, then the character.
     // This is the Meta-sends-Escape behavior that readline and tmux expect
-    // for word motion and for Meta bindings. ghostty-web sends the bare
-    // character today, with no ESC in front of it.
+    // for word motion and for Meta bindings. Measured fallback: `62` for
+    // Alt+B, `66` for Alt+F, `33` for Alt+3. The fallback encoder sends the
+    // bare character, with no ESC in front of it.
+    //
+    // Measured fallback for Alt+Shift+B: `62`, the lowercase letter. The
+    // branch below gives `1b 42`, because it reads `shiftKey` itself.
     //
     // The character comes from `event.code`, never from `event.key`.
     // `src/keys.ts` states the reason: on macOS, Option plus a letter gives
@@ -144,17 +179,20 @@ function buildKeyCorrection(runtime: Runtime): (event: KeyboardEvent) => boolean
     // real terminal binding needs most: readline's word motion is
     // Alt-plus-letter. A digit or a punctuation code held with Shift falls
     // through to `false`, because the character that Shift gives for it
-    // depends on the keyboard layout, and `code` alone cannot give it.
-    // ghostty-web then encodes the key with its own `key`, composed or not.
+    // depends on the keyboard layout, and `code` alone cannot give it. The
+    // facade then encodes the key from `event.key`, composed or not:
+    // `textOf` at `src/terminal.ts:213` reads `event.key`, and
+    // `src/terminal.ts:527` gives that text to the encoder.
     //
     // The three menu bindings, `alt+h`, `alt+-`, and `alt+=`, never reach
-    // this handler. `src/keys.ts` attaches one keydown listener on `window`,
-    // in the capture phase, and it runs before the listener of ghostty-web
-    // on `#terminal`. A chord that matches a binding gets `preventDefault`
-    // and `stopImmediatePropagation` there, so the event never reaches
-    // `#terminal`, and this handler never sees it. A read of `src/keys.ts`
-    // confirms this: the registry stops a matched chord before the check for
-    // the key repeat, and well before ghostty-web attaches its own listener.
+    // this handler. `src/keys.ts:277` attaches one keydown listener on
+    // `window`, in the capture phase. `window` is an ancestor of `#terminal`,
+    // so that listener runs before the bubble-phase listener of the facade on
+    // `#terminal` (`src/terminal.ts:323`). A chord that matches a binding
+    // gets `preventDefault` and `stopImmediatePropagation` there, so the
+    // event never reaches `#terminal`, and this handler never sees it. A read
+    // of `src/keys.ts` confirms this: the registry stops a matched chord
+    // before the check for the key repeat.
     if (altKey && !ctrlKey && !metaKey) {
       const letter = letterFromCode(code);
       if (letter !== null) {
@@ -176,8 +214,9 @@ function buildKeyCorrection(runtime: Runtime): (event: KeyboardEvent) => boolean
  * Put the key correction on the terminal of `runtime`.
  *
  * `installInput` calls this at install time. `src/main.ts` calls it again for
- * each terminal that `rebuild` builds, because a new terminal starts with no
- * handler and would then encode the seven corrected chords wrongly again.
+ * each terminal that `rebuild` builds. A new terminal starts with no handler
+ * (`src/terminal.ts:276`), and the seven corrected chords would then go to
+ * the fallback encoder again.
  */
 export function attachKeyCorrection(runtime: Runtime): void {
   runtime.term.attachCustomKeyEventHandler(buildKeyCorrection(runtime));
@@ -193,13 +232,19 @@ export function attachKeyCorrection(runtime: Runtime): void {
 // `preventDefault` is not called here. A call to it on `mousedown` would
 // stop the browser from starting a text selection inside the terminal.
 //
-// A read of `node_modules/ghostty-web/dist/ghostty-web.js` shows no listener
-// for `focus` or `blur` on the terminal element, and no change to the
-// cursor style on either event. ghostty-web gives the operator no visible
-// sign of a lost focus today. This module adds none either. The mousedown
-// handler below returns the focus before the next keystroke, so the operator
-// has no window in which the focus is away and a sign of it would matter. An
-// indicator for a state that the fix already closes is unnecessary.
+// `term.focus()` gives the focus to a hidden `<textarea>` inside `#terminal`
+// (`src/terminal.ts:398` to `src/terminal.ts:401`). The constructor of the
+// facade takes the focus once, unconditionally (`src/terminal.ts:354`), so
+// the operator can type after a load with no click.
+//
+// A read of `src/terminal.ts` shows one `addEventListener` call, for
+// `keydown` on the container (`src/terminal.ts:323`). The facade registers no
+// `focus` listener and no `blur` listener, and it changes no cursor style on
+// either event. The client therefore gives the operator no visible sign of a
+// lost focus. This module adds none either. The mousedown handler below
+// returns the focus before the next keystroke, so the operator has no window
+// in which the focus is away and a sign of it would matter. An indicator for
+// a state that the fix already closes is unnecessary.
 function installFocusGuard(runtime: Runtime): void {
   const menu = document.getElementById("menu");
   window.addEventListener("mousedown", (event: MouseEvent) => {
@@ -225,23 +270,24 @@ function installFocusGuard(runtime: Runtime): void {
 // listener in the capture phase, on an ancestor of the real target of a key
 // press, always runs before a listener in the bubble phase on the same
 // element: the capture sweep runs down from `window` to the target, and only
-// then does the bubble sweep run back up. ghostty-web attaches its own
-// keydown listener to `#terminal` in the bubble phase, when `term.open`
-// runs, and it runs before this module attaches its listener. Registration
-// order does not change the outcome here, because the phases run in a fixed
-// order: capture, then target, then bubble. A capture-phase listener on
-// `#terminal` therefore always runs before the bubble-phase listener of
-// ghostty-web, for the real keydown that the operating system sends to the
-// focused element inside `#terminal`.
+// then does the bubble sweep run back up. The facade attaches its own keydown
+// listener to `#terminal` in the bubble phase, in its constructor
+// (`src/terminal.ts:323`, no capture argument). That constructor runs before
+// this module attaches its listener. Registration order does not change the
+// outcome here, because the phases run in a fixed order: capture, then
+// target, then bubble. A capture-phase listener on `#terminal` therefore
+// always runs before the bubble-phase listener of the facade, for the real
+// keydown that the operating system sends to the focused element inside
+// `#terminal`.
 //
 // The listener below calls `stopImmediatePropagation` on an event that
 // carries `repeat === true`. That call stops every listener that would run
-// after it, on every node, including the bubble-phase listener of
-// ghostty-web on `#terminal`. ghostty-web then never encodes the event, and
-// the native repeat sends no byte. This is a gate, not a second path: the
-// listener never itself calls `term.input` or writes to the socket for a
-// real key press. The one path to a byte for a real press stays inside
-// ghostty-web, through its own encoder or through the correction of part A.
+// after it, on every node, including the bubble-phase listener of the facade
+// on `#terminal`. The facade then never encodes the event, and the native
+// repeat sends no byte. This is a gate, not a second path: the listener never
+// itself calls `term.input` or writes to the socket for a real key press. The
+// one path to a byte for a real press stays inside the facade, through the
+// fallback encoder or through the correction of part A.
 //
 // A window-capture listener in `src/keys.ts` already stops a matched hotkey
 // chord before it reaches `#terminal`, for its first press and for every
@@ -253,12 +299,13 @@ function installFocusGuard(runtime: Runtime): void {
 // menu bindings therefore never reach this module, and this module needs no
 // check of its own for them.
 //
-// A timer in this module dispatches a synthetic keydown on `#terminal`
-// after the first press, and again on the configured rate. ghostty-web
-// encodes that event with its own KeyEncoder, the same encoder as the first
-// press, so this module keeps no key table. A `WeakSet` marks each synthetic
-// event, so the listener below knows its own dispatch, lets it continue
-// unstopped to ghostty-web, and starts no second repeat from it.
+// A timer in this module dispatches a synthetic keydown on `#terminal` after
+// the first press, and again on the configured rate. The facade encodes that
+// event on the same path as the first press, so this module keeps no key
+// table of its own. The key table of the client is `KEY_OF_CODE`, at
+// `src/terminal.ts:53`. A `WeakSet` marks each synthetic event, so the
+// listener below knows its own dispatch, lets it continue unstopped to the
+// facade, and starts no second repeat from it.
 
 /** The fields of a keydown event that a synthetic repeat event must carry. */
 interface HeldKey {
@@ -330,27 +377,27 @@ function installKeyRepeat(runtime: Runtime): void {
     "keydown",
     (event: KeyboardEvent) => {
       if (synthetic.has(event)) {
-        // This is a tick that this module dispatched. Let it continue to
-        // ghostty-web unstopped, and take no action, so that one tick does
-        // not reset the timer of the next tick.
+        // This is a tick that this module dispatched. Let it continue to the
+        // facade unstopped, and take no action, so that one tick does not
+        // reset the timer of the next tick.
         return;
       }
       if (event.isComposing || event.keyCode === 229) {
-        // A keydown of an IME composition. ghostty-web's own `handleKeyDown`
-        // checks exactly these two conditions first, and it encodes nothing
-        // for either one: a read of `node_modules/ghostty-web/dist/ghostty-web.js`,
-        // line 850 to 851, confirms this. This listener runs before that
-        // check, in the capture phase, so it must bail the same way. Without
-        // this check, this module would arm a repeat for a keydown that
-        // ghostty-web itself ignores, and the timer would later dispatch
-        // synthetic keydowns that send bytes the operator never typed.
+        // A keydown of an IME composition. `PirateTerminal.onKeyDown` tests
+        // exactly these two conditions first, and it encodes nothing for
+        // either one (`src/terminal.ts:517` to `src/terminal.ts:521`). This
+        // listener runs before that test, in the capture phase, so it must
+        // bail the same way. Without this test, this module would arm a
+        // repeat for a keydown that the facade itself ignores, and the timer
+        // would later dispatch synthetic keydowns that send bytes the
+        // operator never typed.
         return;
       }
       if (event.repeat) {
         // The native repeat. Stop it here, in the capture phase, before the
-        // bubble-phase listener of ghostty-web on this same element can
-        // encode it. This is the one place that a native repeat can still
-        // reach a byte, and this call closes it.
+        // bubble-phase listener of the facade on this same element can encode
+        // it. This is the one place that a native repeat can still reach a
+        // byte, and this call closes it.
         event.preventDefault();
         event.stopImmediatePropagation();
         return;
@@ -442,8 +489,8 @@ function installRepeatRateRow(runtime: Runtime): void {
 /**
  * Install the input corrections and the key repeat.
  *
- * The function corrects the chords that ghostty-web encodes wrongly, holds
- * the focus on the terminal, and generates the key repeat.
+ * The function corrects the chords that the fallback encoder gets wrong,
+ * holds the focus on the terminal, and generates the key repeat.
  */
 export function installInput(runtime: Runtime): void {
   attachKeyCorrection(runtime);
