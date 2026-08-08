@@ -26,6 +26,7 @@ import {
   clientReady,
   clientState,
   closeBrowser,
+  focusReport,
   LIGHT_BACKGROUND,
   login,
   newSession,
@@ -33,6 +34,7 @@ import {
   staysFalse,
   statusText,
   strictContext,
+  terminalGlReport,
   viewportText,
   waitFor,
   waitForConnected,
@@ -379,7 +381,7 @@ describe("the end of the session", () => {
 // ── 9. the WebGL2 context ─────────────────────────────────────────────────
 describe("WebGL2", () => {
   test("the page gets a working WebGL2 context", async () => {
-    const server = await startPirate();
+    const server = await startPirate({ recorder: true });
     const { page, context } = await newSession(server);
     try {
       const report = await webgl2Report(page);
@@ -398,6 +400,90 @@ describe("WebGL2", () => {
       // The context ran one command and gave the result back. A context that
       // answers every call with a default cannot pass this step.
       expect(report.usable).toBe(true);
+
+      // The steps above use a canvas of the helper. The steps below use the
+      // canvas that the client draws on, which is the stronger claim. The
+      // renderer of `src/render/index.ts` builds that canvas after the login,
+      // so the login comes first.
+      await login(page, server.token);
+      await waitForConnected(page);
+      await waitForLine(page, (lines) => lines[0] === RECORDER_READY, "the recorder marker");
+
+      const terminal = await terminalGlReport(page);
+
+      // A 2D canvas gives null for a WebGL2 context, so `present` proves the
+      // context kind of the real canvas.
+      expect(terminal.present).toBe(true);
+      expect(terminal.version).toContain("WebGL 2.0");
+
+      // `preserveDrawingBuffer` is the attribute that lets a later task read
+      // the paint. Every paint assertion of this suite depends on it.
+      expect(terminal.preserved).toBe(true);
+
+      // The real renderer painted the marker row through that context.
+      expect(await paintedPixels(page, 0)).toBeGreaterThan(0);
+    } finally {
+      await context.close();
+      await server.stop();
+    }
+  });
+});
+
+// ── 10. the keyboard focus ────────────────────────────────────────────────
+//
+// CAUTION: No test below calls `page.focus`. That call gives the focus to the
+// terminal, which is the state that these tests measure. A test that calls it
+// first passes against a client that gives the focus to nothing.
+//
+// The unit suite cannot hold these tests. Every test of `web/tests` calls
+// `page.focus("#terminal")` before it types, and the stub of `web/tests` has
+// no login form. The login path is reachable from this file alone.
+describe("the keyboard focus", () => {
+  test("the login form keeps the keyboard until the operator logs in", async () => {
+    const server = await startPirate({ recorder: true });
+    const { page, context } = await newSession(server);
+    try {
+      await page.waitForSelector("#login");
+
+      // `src/login.ts` gives the focus to the token field. The terminal does
+      // not exist at this point, so it takes the focus from nothing.
+      const report = await focusReport(page);
+      expect(report.id).toBe("login-token");
+      expect(report.inTerminal).toBe(false);
+
+      // The proof that the keyboard reaches the form: the characters land in
+      // the field. A terminal that took the focus would swallow them.
+      await page.keyboard.type("abc");
+      expect(await page.inputValue("#login-token")).toBe("abc");
+
+      // The terminal never started, so no client state exists to steal focus.
+      expect(await clientReady(page)).toBe(false);
+    } finally {
+      await context.close();
+      await server.stop();
+    }
+  });
+
+  test("the terminal takes the keyboard when the client opens, with no click", async () => {
+    const server = await startPirate({ recorder: true });
+    const { page, context } = await newSession(server);
+    try {
+      await login(page, server.token);
+      await waitForConnected(page);
+      await waitForLine(page, (lines) => lines[0] === RECORDER_READY, "the recorder marker");
+
+      // No click and no `page.focus` ran between the login and this read.
+      const report = await focusReport(page);
+      expect(`the focus is in #terminal: ${report.inTerminal}, on ${report.tag}`).toBe(
+        "the focus is in #terminal: true, on TEXTAREA",
+      );
+
+      // The stronger claim: the bytes reach the server. The recorder shell
+      // echoes with `cat -vt`, so the word on the screen came back from the
+      // PTY. The path is the keyboard, the socket, the server, and the shell.
+      await page.keyboard.type("typed");
+      const lines = await waitForLine(page, (l) => l[1] === "typed", "the typed word");
+      expect(lines[1]).toBe("typed");
     } finally {
       await context.close();
       await server.stop();
