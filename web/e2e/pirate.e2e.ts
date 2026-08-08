@@ -388,7 +388,7 @@ describe("WebGL2", () => {
       // renderer of the client cannot start against a null context.
       expect(report.present).toBe(true);
 
-      // Only a real context gives a version string, and it names WebGL 2.0.
+      // Only a real context gives a version string. The string names WebGL 2.0.
       expect(report.version).toContain("WebGL 2.0");
 
       // SwiftShader is the CPU backend of ANGLE. The name of the renderer is

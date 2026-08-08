@@ -73,18 +73,18 @@ const POLL_MS = 25;
 /**
  * The Chromium flag that gives a software WebGL2 context.
  *
- * Headless Chromium has no GPU. Chromium then refuses a WebGL context, and
+ * Headless Chromium has no GPU. Chromium then refuses a WebGL context.
  * `getContext("webgl2")` gives null. This flag permits the SwiftShader
  * backend of ANGLE, which draws on the CPU.
  *
  * Playwright adds this flag on macOS only. Linux CI therefore gets no
- * software WebGL2 from the defaults, and this list holds it for every
+ * software WebGL2 from the defaults. This list holds the flag for every
  * platform.
  *
  * CAUTION: Do not add `--use-angle=swiftshader` or `--use-gl=angle`. Each of
  * those flags moves the 2D canvas to SwiftShader as well. The paint of the
- * terminal canvas then arrives after the read, and the pixel counts of this
- * suite and of `web/bench/latency.spec.ts` give 0.
+ * terminal canvas then arrives after the read. The paint assertions of this
+ * suite then fail. The failure is intermittent.
  *
  * `web/tests/harness.ts` holds a copy of this list, for the reason in the
  * header of this file.
