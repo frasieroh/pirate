@@ -7,9 +7,10 @@
  *
  * - `parse` is the time inside `term.write`, which is the WebAssembly parser.
  * - `wait` is the time from the end of the parse to the start of the next paint.
- *   The paint loop of ghostty-web runs on `requestAnimationFrame`, so this value
- *   is one frame of the display at most.
- * - `render` is the time inside that paint.
+ *   The paint loop of `src/terminal.ts` runs on `requestAnimationFrame`, so this
+ *   value is one frame of the display at most.
+ * - `draw` is the time inside that paint, which is `draw` of
+ *   `src/render/index.ts`.
  *
  * These tests print a table and assert loose bounds only. A tight assertion on
  * a time is a flaky assertion, because the machine that runs it varies. The
@@ -25,7 +26,7 @@ import {
   type Budget,
   chunked,
   fixture,
-  idleRenderMs,
+  idleDrawMs,
   instrument,
   resetTimings,
 } from "./instrument";
@@ -69,11 +70,11 @@ function report(name: string, samples: Budget[]): void {
     `  ${name.padEnd(22)} ${String(samples[0].bytes).padStart(9)} B  ` +
       `parse ${of((b) => b.parseMs).padStart(7)} ms  ` +
       `wait ${of((b) => b.waitMs).padStart(6)} ms  ` +
-      `render ${of((b) => b.renderMs).padStart(7)} ms  ` +
+      `draw ${of((b) => b.drawMs).padStart(7)} ms  ` +
       `total ${of((b) => b.totalMs).padStart(7)} ms  ` +
       // The paints that ran while the bytes were still arriving. Each one costs
-      // a full `render`, so this column says where the rest of `total` went.
-      `paints ${of((b) => b.rendersBefore).padStart(6)}`,
+      // a full `draw`, so this column says where the rest of `total` went.
+      `paints ${of((b) => b.drawsBefore).padStart(6)}`,
   );
 }
 
@@ -125,9 +126,10 @@ test("the client-side latency budget of each recorded screen event", async () =>
     const { rows } = await size(page);
     const filled = filledScreen(rows);
 
-    // The floor. A paint runs every animation frame whether the screen changed
-    // or not, so no event can cost less than this.
-    const floor = await idleRenderMs(page, 500);
+    // The floor. `draw` runs every animation frame whether the screen changed
+    // or not, so no event can cost less than this. A `draw` that finds no
+    // change returns after the check, so the floor is that check.
+    const floor = await idleDrawMs(page, 500);
     // eslint-disable-next-line no-console
     console.log(`\n  paint of a screen that did not change: ${floor.toFixed(2)} ms (the floor)\n`);
 
@@ -230,11 +232,11 @@ test("the paint of a screen event scales with the cells on the screen", async ()
             await sample(page, stub, () => stub.send([{ tag: 0x00, bytes: filled }]), [clear]),
           );
         }
-        const paint = median(samples.map((b) => b.renderMs));
+        const paint = median(samples.map((b) => b.drawMs));
         // eslint-disable-next-line no-console
         console.log(
           `  ${`${cols}x${rows}`.padEnd(10)} ${String(cols * rows).padStart(6)} cells  ` +
-            `render ${paint.toFixed(2).padStart(6)} ms  ` +
+            `draw ${paint.toFixed(2).padStart(6)} ms  ` +
             `${((paint * 1000) / (cols * rows)).toFixed(3)} us per cell`,
         );
         expect(paint).toBeGreaterThan(0);
