@@ -63,6 +63,27 @@ const BACKGROUND: [number, number, number] = [0x16, 0x16, 0x1e];
 /** The escape character. Tests build VT sequences with it. */
 export const ESC = "";
 
+/**
+ * The Chromium flag that gives a software WebGL2 context.
+ *
+ * Headless Chromium has no GPU. Chromium then refuses a WebGL context, and
+ * `getContext("webgl2")` gives null. This flag permits the SwiftShader
+ * backend of ANGLE, which draws on the CPU.
+ *
+ * Playwright adds this flag on macOS only. Linux CI therefore gets no
+ * software WebGL2 from the defaults, and this list holds it for every
+ * platform.
+ *
+ * CAUTION: Do not add `--use-angle=swiftshader` or `--use-gl=angle`. Each of
+ * those flags moves the 2D canvas to SwiftShader as well. The paint of the
+ * terminal canvas then arrives after the read, and the pixel counts of this
+ * suite and of `web/bench/latency.spec.ts` give 0.
+ *
+ * `web/e2e/browser.ts` holds a copy of this list. That module keeps its own
+ * copy of every helper here, for the reason in its header.
+ */
+const WEBGL_ARGS = ["--enable-unsafe-swiftshader"];
+
 let browser: Browser | undefined;
 let stub: Stub | undefined;
 
@@ -73,7 +94,7 @@ let stub: Stub | undefined;
  */
 export async function start(): Promise<Stub> {
   if (browser === undefined) {
-    browser = await chromium.launch();
+    browser = await chromium.launch({ args: WEBGL_ARGS });
   }
   if (stub === undefined) {
     stub = startStub(`${import.meta.dir}/../dist`);
