@@ -613,6 +613,11 @@ jobs:
 
       # No Linux binary has ever run in this project. Architecture and static
       # linkage are proven. Run-time behavior is not.
+      #
+      # The run takes the default transport, which is TLS with a certificate
+      # that pirate generates at startup. This step therefore also proves that
+      # the static binary generates that certificate and completes a handshake.
+      # `curl -k` accepts the certificate, because no authority signed it.
       - name: Run the musl binary and request the index page
         run: |
           set -euo pipefail
@@ -621,7 +626,7 @@ jobs:
           pid=$!
           served=0
           for _ in $(seq 1 50); do
-            if curl -fsS -o /dev/null "http://127.0.0.1:8099/"; then
+            if curl -fsSk -o /dev/null "https://127.0.0.1:8099/"; then
               served=1
               break
             fi
@@ -632,7 +637,7 @@ jobs:
             kill "$pid" || true
             exit 1
           fi
-          body=$(curl -fsS "http://127.0.0.1:8099/")
+          body=$(curl -fsSk "https://127.0.0.1:8099/")
           kill "$pid"
           if ! printf '%s' "$body" | grep -q 'id="terminal"'; then
             echo "FAILURE: the index page has no terminal element."

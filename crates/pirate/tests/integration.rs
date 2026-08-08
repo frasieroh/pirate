@@ -605,6 +605,14 @@ async fn a_burst_arrives_whole_and_in_far_fewer_messages_than_reads() {
     //
     // `seq` writes a known stream that no line of the output can produce by
     // chance, and each line names its own place in the order.
+    //
+    // The line discipline ends each line, and not the program. ONLCR turns the
+    // newline into a carriage return and a newline, and the two go into the
+    // output queue of the tty one at a time. On macOS, a full queue takes the
+    // carriage return and refuses the newline. The kernel then writes the whole
+    // pair again, so the line ends with two carriage returns and a newline. A
+    // loaded machine fills that queue, and this test therefore reads a line as
+    // the text up to the newline, without the carriage returns that end it.
     let dir = temp_dir("burst");
     let script = write_script(&dir, "burst.sh", "#!/bin/sh\nstty -echo\nseq 1 8000\n");
     let addr = start(script).await;
@@ -613,7 +621,7 @@ async fn a_burst_arrives_whole_and_in_far_fewer_messages_than_reads() {
     let mut text = String::new();
     let mut messages = 0_usize;
     let deadline = Instant::now() + WAIT;
-    while Instant::now() < deadline && !text.contains("\r\n8000\r\n") {
+    while Instant::now() < deadline && !text.contains("\n8000\r") {
         let frame = next_binary(&mut socket).await;
         if let Ok(ServerFrame::Output(bytes)) = ServerFrame::decode(&frame) {
             messages += 1;
@@ -622,7 +630,11 @@ async fn a_burst_arrives_whole_and_in_far_fewer_messages_than_reads() {
     }
 
     // Every line, in order, and none missing.
-    let lines: Vec<&str> = text.trim_end().split("\r\n").collect();
+    let lines: Vec<&str> = text
+        .trim_end()
+        .split('\n')
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
     let expected: Vec<String> = (1..=8_000).map(|n| n.to_string()).collect();
     assert_eq!(
         lines.len(),
