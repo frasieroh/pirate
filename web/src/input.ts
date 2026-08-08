@@ -14,11 +14,16 @@
  * false return lets the facade encode the key. This module never does both
  * for the same key. Each corrected chord returns true and sends its own
  * bytes. Every other chord returns false.
+ *
+ * The copy chord and the paste chord return true and send no key byte. The
+ * paste chord sends the clipboard text on the same `term.input` path, in a
+ * later task, because the read of the clipboard is asynchronous.
  */
 
 import { addMenuRow, TERMINAL_GROUP } from "./menu";
 import { setPrefs } from "./prefs";
 import type { Runtime } from "./runtime";
+import type { Selection } from "./select";
 
 /** The smallest key repeat rate, in keys per second. */
 const RATE_MIN = 2;
@@ -95,24 +100,168 @@ function clampRate(value: number): number {
 // string into one `0x00` frame, so this module opens no second path to the
 // socket.
 
+// The clipboard chords are part of this same set. The fallback encoder gives
+// wrong bytes for all four of them, and each one also performs a clipboard
+// action. Measured fallback, with the correction branch disabled, in the
+// Chromium of `web/tests`:
+//
+//   Ctrl+Shift+C   1b 5b 39 39 3b 35 75   the Kitty sequence `CSI 99;5u`
+//   Ctrl+Shift+V   1b 5b 31 31 38 3b 35 75  the Kitty sequence `CSI 118;5u`
+//   Cmd+C          63                     the bare letter `c`
+//   Cmd+V          76                     the bare letter `v`
+//
+// A copy chord must send no byte, and a paste chord must send the clipboard
+// text alone. The four branches below therefore return true, and the facade
+// then calls `preventDefault` and encodes nothing.
+//
+// The client accepts both pairs on every platform. Cmd+C and Cmd+V are the
+// chords of macOS. Ctrl+Shift+C and Ctrl+Shift+V are the chords of Linux and
+// of Windows, because Ctrl+C and Ctrl+V already carry SIGINT and SYN to the
+// shell. No module of `web/src` detects the platform, and none is needed
+// here: a chord of one platform is unreachable on the other, because that
+// keyboard holds no such modifier.
+//
+// Ctrl+V alone keeps SYN (0x16). That branch is below, and it matches
+// `ctrlKey` alone, so it never matches Ctrl+Shift+V.
+
+/** The `code` of the copy key. */
+const COPY_CODE = "KeyC";
+/** The `code` of the paste key. */
+const PASTE_CODE = "KeyV";
+
+/**
+ * True for Cmd plus `code`, or for Ctrl+Shift plus `code`.
+ *
+ * Alt is never part of a clipboard chord. Alt plus a letter is the
+ * Meta-sends-Escape chord of readline, and its branch is below.
+ */
+function isClipboardChord(event: KeyboardEvent, code: string): boolean {
+  if (event.altKey || event.code !== code) {
+    return false;
+  }
+  if (event.metaKey) {
+    return !event.ctrlKey && !event.shiftKey;
+  }
+  return event.ctrlKey && event.shiftKey;
+}
+
+/**
+ * Put the text of the selection on the system clipboard.
+ *
+ * An empty selection writes nothing. A write of the empty string would drop
+ * the text that the operator copied before.
+ *
+ * `navigator.clipboard.writeText` needs a transient user activation, and a
+ * keydown gives one. Measured in the Chromium of `web/tests`: the call is
+ * rejected with `Write permission denied` until the test grants
+ * `clipboard-write`, and it resolves after that grant.
+ *
+ * `navigator.clipboard` is undefined outside a secure context. A page that is
+ * served over plain HTTP from a name other than `localhost` is such a
+ * context. The chord then copies nothing, and it still sends no byte.
+ */
+function copySelection(selection: Selection): void {
+  const text = selection.text();
+  if (text.length === 0 || navigator.clipboard === undefined) {
+    return;
+  }
+  void navigator.clipboard.writeText(text).catch(() => {
+    // The browser refused the write. The operator keeps the old clipboard.
+  });
+}
+
+/**
+ * Send `text` to the shell as a paste.
+ *
+ * Each line break becomes one carriage return (0x0d), the byte that the
+ * Enter key sends. A shell reads a line feed as the end of a line only after
+ * the terminal converts it.
+ *
+ * With bracketed paste on, the terminal wraps the text in `ESC [200~` and
+ * `ESC [201~`. The shell then holds the text as one block and runs no line of
+ * it. The end marker is removed from the body first: a clipboard that carries
+ * `ESC [201~` would otherwise close the block early, and the rest of that
+ * clipboard would reach the shell as typed input.
+ *
+ * An empty clipboard sends nothing, brackets included.
+ */
+function pasteToShell(runtime: Runtime, text: string): void {
+  if (text.length === 0) {
+    return;
+  }
+  const body = text.replace(/\r\n|\n|\r/g, "\r");
+  if (!runtime.term.vt.hasBracketedPaste()) {
+    runtime.term.input(body, true);
+    return;
+  }
+  runtime.term.input(`\x1b[200~${body.split("\x1b[201~").join("")}\x1b[201~`, true);
+}
+
+/**
+ * Read the system clipboard and send it to the shell.
+ *
+ * The client reads the clipboard through `navigator.clipboard.readText`, and
+ * not through the `paste` event of the browser. The measurements behind that
+ * choice, in the Chromium of `web/tests` on macOS:
+ *
+ * - A `paste` event fires for Cmd+V and for Shift+Insert alone. Those two are
+ *   the paste accelerators of the browser on this platform. Ctrl+Shift+V
+ *   fires none, so a client that waits for a `paste` event pastes nothing for
+ *   the chord of Linux. The accelerator set differs with the platform, and
+ *   `bun run test` runs on `ubuntu-24.04` in CI and on macOS on a
+ *   workstation. `readText` behaves the same on both.
+ * - `readText` is rejected with `Read permission denied` until the page holds
+ *   the `clipboard-read` permission. It resolves under a keydown after that
+ *   grant. A browser asks the operator for that permission once per origin.
+ *   `tests/input.spec.ts` grants it with `context.grantPermissions`, and it
+ *   asserts the grant before it presses a chord.
+ *
+ * The read is asynchronous, so the bytes reach the socket after the keydown.
+ * The chord sends no other byte, so the shell receives the paste alone.
+ */
+function pasteFromClipboard(runtime: Runtime): void {
+  if (navigator.clipboard === undefined) {
+    return;
+  }
+  void navigator.clipboard.readText().then(
+    (text: string) => {
+      pasteToShell(runtime, text);
+    },
+    () => {
+      // The browser refused the read. The shell receives nothing.
+    },
+  );
+}
+
 /** Build the corrected key handler for `runtime.term`. */
-function buildKeyCorrection(runtime: Runtime): (event: KeyboardEvent) => boolean {
+function buildKeyCorrection(
+  runtime: Runtime,
+  selection: Selection,
+): (event: KeyboardEvent) => boolean {
   return (event: KeyboardEvent): boolean => {
     const { ctrlKey, altKey, shiftKey, metaKey, code } = event;
 
+    // Cmd+C and Ctrl+Shift+C. The chord copies the selection and sends no
+    // byte.
+    if (isClipboardChord(event, COPY_CODE)) {
+      copySelection(selection);
+      return true;
+    }
+
+    // Cmd+V and Ctrl+Shift+V. The chord pastes the clipboard and sends no
+    // byte of its own.
+    if (isClipboardChord(event, PASTE_CODE)) {
+      pasteFromClipboard(runtime);
+      return true;
+    }
+
     // Ctrl+V. A real terminal sends SYN (0x16) to the shell for this chord.
-    // Ctrl+Shift+V and Cmd+V are paste chords of the browser, not of the
-    // shell. This branch matches neither of them, because it needs `ctrlKey`
-    // alone.
+    // Ctrl+Shift+V and Cmd+V are the paste chords, and the two branches above
+    // hold them. This branch needs `ctrlKey` alone, so it matches neither one,
+    // and Ctrl+V pastes nothing.
     //
     // Measured fallback: `16`. The branch below gives the same byte, so it
     // changes no byte today. `tests/input.spec.ts` holds the assertion.
-    //
-    // OPEN DESIGN QUESTION, not a property of this branch: no module of
-    // `web/src` registers a `paste` listener or a `clipboard` listener, so
-    // the client holds no destination for a paste event. Measured fallback
-    // for Ctrl+Shift+V: `16`, and `src/terminal.ts:537` calls
-    // `preventDefault` for it.
     if (ctrlKey && !altKey && !shiftKey && !metaKey && code === "KeyV") {
       runtime.term.input("\x16", true);
       return true;
@@ -216,11 +365,15 @@ function buildKeyCorrection(runtime: Runtime): (event: KeyboardEvent) => boolean
  *
  * `installInput` calls this at install time. `src/main.ts` calls it again for
  * each terminal that `rebuild` builds. A new terminal starts with no handler
- * (`src/terminal.ts:276`), and the seven corrected chords would then go to
- * the fallback encoder again.
+ * (`src/terminal.ts:276`), and the corrected chords would then go to the
+ * fallback encoder again.
+ *
+ * `selection` is the one selection of the page. `src/main.ts` builds it once,
+ * before the first facade, and it survives every rebuild. The copy chord
+ * reads it. `Runtime` carries no selection, so the caller gives it here.
  */
-export function attachKeyCorrection(runtime: Runtime): void {
-  runtime.term.attachCustomKeyEventHandler(buildKeyCorrection(runtime));
+export function attachKeyCorrection(runtime: Runtime, selection: Selection): void {
+  runtime.term.attachCustomKeyEventHandler(buildKeyCorrection(runtime, selection));
 }
 
 // ── B. the focus ────────────────────────────────────────────────────────
@@ -493,8 +646,8 @@ function installRepeatRateRow(runtime: Runtime): void {
  * The function corrects the chords that the fallback encoder encodes wrongly,
  * holds the focus on the terminal, and generates the key repeat.
  */
-export function installInput(runtime: Runtime): void {
-  attachKeyCorrection(runtime);
+export function installInput(runtime: Runtime, selection: Selection): void {
+  attachKeyCorrection(runtime, selection);
   installFocusGuard(runtime);
   installKeyRepeat(runtime);
   installRepeatRateRow(runtime);

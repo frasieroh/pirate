@@ -481,14 +481,13 @@ test("a mouse-down alone reports a selection and extracts no text", async () => 
   });
 });
 
-
 // ============================================================================
 // The repaint of a selection change
 // ============================================================================
 //
 // The client holds no select-all command. The proof:
 //
-//     $ grep -rn "selectAll\|select-all\|selectall" web/src web/tests web/e2e
+//     $ grep -rn "selectAll\|select-all\|selectall" web/src web/e2e
 //     (no match)
 //
 // The paths that change the selection are therefore the drag, the click that

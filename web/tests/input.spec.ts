@@ -12,7 +12,17 @@
 
 import { beforeEach, expect, test } from "bun:test";
 import type { Page } from "playwright";
-import { framesWithTag, hex, idle, server, waitFor, withClient } from "./harness";
+import {
+  ESC,
+  framesWithTag,
+  hex,
+  idle,
+  paintedPixels,
+  server,
+  viewportLine,
+  waitFor,
+  withClient,
+} from "./harness";
 import type { Stub } from "./stub-server";
 
 beforeEach(() => {
@@ -294,5 +304,385 @@ test("typed text gives one frame for each character", async () => {
     );
     expect(Array.from(stub.received[first])).toEqual([0x00, 0x6c]);
     expect(Array.from(stub.received[first + 1])).toEqual([0x00, 0x73]);
+  });
+});
+
+// ── the clipboard chords ──────────────────────────────────────────────────
+//
+// Criterion 27 has two halves, and a test that asserts one half alone passes
+// over the defect. The defect that this section pins: the chord performed its
+// clipboard action AND sent characters to the shell. A test that asserts the
+// clipboard content alone never sees those characters. Every test below
+// therefore asserts the socket as well: a copy chord and an idle chord carry
+// ZERO `0x00` frames, and a paste chord carries exactly ONE, with the
+// clipboard text as its whole payload.
+//
+// The chord table that these tests pin. Both pairs work on every platform,
+// because the handler reads `metaKey`, `ctrlKey`, and `shiftKey` alone.
+//
+//   Cmd+C          copy    0 bytes to the shell
+//   Ctrl+Shift+C   copy    0 bytes to the shell
+//   Cmd+V          paste   the clipboard text alone
+//   Ctrl+Shift+V   paste   the clipboard text alone
+//   Ctrl+V         none    16, SYN, the byte of a real terminal
+
+/** The copy chords, in the order of the report. */
+const COPY_CHORDS = ["Meta+KeyC", "Control+Shift+KeyC"];
+/** The paste chords, in the order of the report. */
+const PASTE_CHORDS = ["Meta+KeyV", "Control+Shift+KeyV"];
+
+/** The text of the payload of one input frame. */
+function payloadText(frame: Uint8Array): string {
+  return new TextDecoder().decode(frame.subarray(1));
+}
+
+/**
+ * Grant the clipboard permissions, and assert the grant.
+ *
+ * This grant is a precondition of every test below. Measured in the Chromium
+ * of this harness, with no grant: `writeText` and `readText` are both
+ * rejected with a permission error, and the client then copies nothing and
+ * pastes nothing. A test that presses a chord without this call therefore
+ * measures the permission, not the chord. The assertion names the
+ * precondition instead of trusting it.
+ *
+ * A browser asks the operator for `clipboard-read` once per origin.
+ * `src/input.ts` states that tradeoff and the measurement behind it.
+ */
+async function grantClipboard(page: Page): Promise<void> {
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  const state = await page.evaluate(async () => {
+    const read = await navigator.permissions.query({
+      name: "clipboard-read" as PermissionName,
+    });
+    return read.state;
+  });
+  expect(state).toBe("granted");
+}
+
+/** The text of the system clipboard. */
+function clipboardText(page: Page): Promise<string> {
+  return page.evaluate(() => navigator.clipboard.readText());
+}
+
+/**
+ * Put `text` on the system clipboard, and assert that it is there.
+ *
+ * `withClient` opens a new browser context for each test, and the clipboard
+ * outlives that context. A test that reads an expected value therefore can
+ * read a value that an earlier test wrote, and it then passes while the copy
+ * under test does nothing. Every test below writes a sentinel first.
+ */
+async function seedClipboard(page: Page, text: string): Promise<void> {
+  await page.evaluate((value: string) => navigator.clipboard.writeText(value), text);
+  expect(await clipboardText(page)).toBe(text);
+}
+
+/**
+ * Press `key` and prove that the client sent NO input frame for it.
+ *
+ * The wait is longer than the wait of `pressOnce`, because the client reads
+ * the clipboard in a later task. A byte from a wrong branch arrives inside
+ * this window.
+ */
+async function pressSilently(page: Page, stub: Stub, key: string): Promise<void> {
+  const before = framesWithTag(stub.received, 0x00).length;
+  await page.keyboard.press(key);
+  await idle(300);
+  const after = framesWithTag(stub.received, 0x00);
+  expect(after.map((frame) => hex(frame))).toEqual(
+    framesWithTag(stub.received, 0x00)
+      .slice(0, before)
+      .map((frame) => hex(frame)),
+  );
+  expect(after.length).toBe(before);
+}
+
+/** Press `key` and return the one input frame that the client sent for it. */
+async function pasteFrame(page: Page, stub: Stub, key: string): Promise<Uint8Array> {
+  const before = framesWithTag(stub.received, 0x00).length;
+  await page.keyboard.press(key);
+  await waitFor(
+    async () => framesWithTag(stub.received, 0x00).length,
+    (count) => count > before,
+    `a paste frame for ${key}`,
+  );
+  // A settle wait. A key byte from a second path would arrive inside this
+  // window, next to the paste.
+  await idle(200);
+  const after = framesWithTag(stub.received, 0x00);
+  expect(after.length).toBe(before + 1);
+  return after[before];
+}
+
+/** Write `text` to the terminal and wait until row 0 holds `first`. */
+async function writeAndPaint(page: Page, text: string, first: string): Promise<void> {
+  server().send([{ tag: 0x00, text }]);
+  await waitFor(
+    () => viewportLine(page, 0),
+    (line) => line === first,
+    "row 0",
+  );
+  await waitFor(
+    () => paintedPixels(page, 0),
+    (count) => count > 50,
+    "paint on row 0",
+  );
+}
+
+/**
+ * Drag the left button from one cell to another, with real mouse input.
+ *
+ * `@beamterm/renderer` attaches its mouse listeners to the canvas from Rust,
+ * so a synthetic `MouseEvent` moves nothing. Every coordinate comes from the
+ * box of the canvas and from the cell size that the renderer reports. The
+ * assertions name the preconditions: one canvas, a box that is not empty, a
+ * cell size of more than zero, and a grid that holds every cell of the drag.
+ */
+async function dragCells(
+  page: Page,
+  from: { col: number; row: number },
+  to: { col: number; row: number },
+): Promise<void> {
+  const count = await page.evaluate(() => document.querySelectorAll("#terminal canvas").length);
+  expect(count).toBe(1);
+  const box = await page.locator("#terminal canvas").boundingBox();
+  expect(box).not.toBeNull();
+  expect(box!.width).toBeGreaterThan(0);
+
+  const grid = await page.evaluate(() => {
+    const renderer = (
+      globalThis as unknown as {
+        __pirate: {
+          term: {
+            renderer: { cellSize(): { width: number; height: number }; cols: number; rows: number };
+          };
+        };
+      }
+    ).__pirate.term.renderer;
+    const size = renderer.cellSize();
+    return { width: size.width, height: size.height, cols: renderer.cols, rows: renderer.rows };
+  });
+  expect(grid.width).toBeGreaterThan(0);
+  expect(grid.height).toBeGreaterThan(0);
+  for (const target of [from, to]) {
+    expect(target.col).toBeLessThan(grid.cols);
+    expect(target.row).toBeLessThan(grid.rows);
+  }
+
+  const at = (col: number, row: number): [number, number] => [
+    box!.x + (col + 0.5) * grid.width,
+    box!.y + (row + 0.5) * grid.height,
+  ];
+  const [x0, y0] = at(from.col, from.row);
+  const [x1, y1] = at(to.col, to.row);
+  await page.mouse.move(x0, y0);
+  await page.mouse.down();
+  await page.mouse.move(x1, y1, { steps: 8 });
+  await page.mouse.up();
+}
+
+test("a copy chord copies the selection and sends no byte to the shell", async () => {
+  const stub = server();
+
+  await withClient(async (page) => {
+    await grantClipboard(page);
+    await writeAndPaint(page, "hello world", "hello world");
+    await dragCells(page, { col: 0, row: 0 }, { col: 4, row: 0 });
+    expect(
+      await page.evaluate(() =>
+        (
+          globalThis as unknown as { __pirate: { selection: { text(): string } } }
+        ).__pirate.selection.text(),
+      ),
+    ).toBe("hello");
+    await page.focus("#terminal");
+
+    for (const key of COPY_CHORDS) {
+      // The package copies on its own at the mouse-up of a drag
+      // (`src/select.ts:6`). The sentinel removes that copy, so the assertion
+      // below reads the copy of the chord alone.
+      await seedClipboard(page, `<no copy for ${key}>`);
+      await pressSilently(page, stub, key);
+      await waitFor(
+        () => clipboardText(page),
+        (text) => text === "hello",
+        `the clipboard after ${key}`,
+      );
+      expect(await clipboardText(page)).toBe("hello");
+    }
+  });
+});
+
+test("a copy chord with no selection keeps the clipboard and sends no byte", async () => {
+  // The empty input. A write of the empty string would drop the text that the
+  // operator copied before, and the fallback encoder would send a byte.
+  const stub = server();
+
+  await withClient(async (page) => {
+    await grantClipboard(page);
+    await page.focus("#terminal");
+
+    for (const key of COPY_CHORDS) {
+      await seedClipboard(page, "<kept>");
+      await pressSilently(page, stub, key);
+      await idle(150);
+      expect(await clipboardText(page)).toBe("<kept>");
+    }
+  });
+});
+
+test("a paste chord sends the clipboard text, and no key byte with it", async () => {
+  const stub = server();
+
+  await withClient(async (page) => {
+    await grantClipboard(page);
+    await page.focus("#terminal");
+
+    const lines: string[] = [];
+    for (const key of PASTE_CHORDS) {
+      await seedClipboard(page, "echo hi");
+      const frame = await pasteFrame(page, stub, key);
+      lines.push(show(key, frame));
+      // The whole payload is the clipboard text. A `v` byte from the fallback
+      // encoder, or a Kitty sequence from it, would appear here.
+      expect(payloadText(frame)).toBe("echo hi");
+      expect(Array.from(frame)).toEqual([0x00, ...Array.from(new TextEncoder().encode("echo hi"))]);
+    }
+    // eslint-disable-next-line no-console
+    console.log(`\n${lines.join("\n")}`);
+  });
+});
+
+test("an empty clipboard sends nothing for a paste chord", async () => {
+  const stub = server();
+
+  await withClient(async (page) => {
+    await grantClipboard(page);
+    await page.focus("#terminal");
+
+    for (const key of PASTE_CHORDS) {
+      await seedClipboard(page, "");
+      await pressSilently(page, stub, key);
+    }
+  });
+});
+
+test("Ctrl+V sends SYN and pastes nothing", async () => {
+  // Criterion 27 keeps this byte. `Ctrl+V` is the chord of a real terminal,
+  // and it is not a paste chord. The single frame proves that no clipboard
+  // text follows the byte.
+  const stub = server();
+
+  await withClient(async (page) => {
+    await grantClipboard(page);
+    await seedClipboard(page, "MUST NOT PASTE");
+    await page.focus("#terminal");
+
+    const frame = await pressOnce(page, stub, "Control+v");
+    expect(Array.from(frame)).toEqual([0x00, 0x16]);
+    // A paste would arrive as a second frame. `pressOnce` waits 150 ms, and
+    // this wait adds to it, because the clipboard read is asynchronous.
+    await idle(200);
+    const tail = framesWithTag(stub.received, 0x00);
+    expect(payloadText(tail[tail.length - 1])).toBe("\x16");
+  });
+});
+
+test("a paste chord wraps the text when bracketed paste is on", async () => {
+  const stub = server();
+
+  await withClient(async (page) => {
+    await grantClipboard(page);
+    await page.focus("#terminal");
+
+    // Bracketed paste is off after a load, so the paste carries no marker.
+    await seedClipboard(page, "plain");
+    expect(payloadText(await pasteFrame(page, stub, "Meta+KeyV"))).toBe("plain");
+
+    // `ESC [?2004h` turns bracketed paste on. The shell of the operator sends
+    // this sequence itself.
+    stub.send([{ tag: 0x00, text: `${ESC}[?2004h` }]);
+    await idle(150);
+
+    await seedClipboard(page, "wrapped");
+    expect(payloadText(await pasteFrame(page, stub, "Meta+KeyV"))).toBe(
+      `${ESC}[200~wrapped${ESC}[201~`,
+    );
+
+    // A clipboard that carries the end marker cannot close the block early.
+    // Without this guard the shell reads `rm -rf /` as typed input and runs
+    // it on the carriage return that follows.
+    await seedClipboard(page, `a${ESC}[201~rm -rf /\n`);
+    expect(payloadText(await pasteFrame(page, stub, "Meta+KeyV"))).toBe(
+      `${ESC}[200~arm -rf /\r${ESC}[201~`,
+    );
+
+    // `ESC [?2004l` turns bracketed paste off again.
+    stub.send([{ tag: 0x00, text: `${ESC}[?2004l` }]);
+    await idle(150);
+    await seedClipboard(page, "bare");
+    expect(payloadText(await pasteFrame(page, stub, "Meta+KeyV"))).toBe("bare");
+  });
+});
+
+test("a paste sends one carriage return for each line break", async () => {
+  const stub = server();
+
+  await withClient(async (page) => {
+    await grantClipboard(page);
+    await page.focus("#terminal");
+
+    await seedClipboard(page, "one\ntwo\r\nthree\rfour");
+    const frame = await pasteFrame(page, stub, "Control+Shift+KeyV");
+    expect(payloadText(frame)).toBe("one\rtwo\rthree\rfour");
+  });
+});
+
+test("a chord that is not a clipboard chord keeps its bytes", async () => {
+  // The over-application guard. A branch that swallowed every chord with a
+  // modifier, or every chord on the C key or the V key, would take these
+  // bytes away. Each row below is a measured fallback of this client.
+  const stub = server();
+
+  await withClient(async (page) => {
+    await grantClipboard(page);
+    await seedClipboard(page, "MUST NOT PASTE");
+    await page.focus("#terminal");
+
+    const cases: Array<{ key: string; expected: number[]; note: string }> = [
+      { key: "Control+c", expected: [0x00, 0x03], note: "the interrupt" },
+      { key: "Control+v", expected: [0x00, 0x16], note: "SYN" },
+      { key: "Meta+Shift+KeyC", expected: [0x00, 0x43], note: "Cmd+Shift+C, the letter C" },
+      { key: "Meta+Shift+KeyV", expected: [0x00, 0x56], note: "Cmd+Shift+V, the letter V" },
+      { key: "Meta+KeyX", expected: [0x00, 0x78], note: "Cmd+X, the letter x" },
+      {
+        key: "Control+Shift+KeyX",
+        expected: [0x00, 0x1b, 0x5b, 0x31, 0x32, 0x30, 0x3b, 0x35, 0x75],
+        note: "Ctrl+Shift+X, the Kitty sequence CSI 120;5u",
+      },
+      {
+        key: "Control+Shift+KeyA",
+        expected: [0x00, 0x1b, 0x5b, 0x39, 0x37, 0x3b, 0x35, 0x75],
+        note: "Ctrl+Shift+A, the Kitty sequence CSI 97;5u",
+      },
+      { key: "Control+Alt+KeyV", expected: [0x00, 0x1b, 0x16], note: "Ctrl+Alt+V, ESC then SYN" },
+      { key: "Control+Alt+KeyC", expected: [0x00, 0x1b, 0x03], note: "Ctrl+Alt+C, ESC then ETX" },
+      {
+        key: "Meta+Control+KeyV",
+        expected: [0x00, 0x1b, 0x5b, 0x31, 0x31, 0x38, 0x3b, 0x35, 0x75],
+        note: "Cmd+Ctrl+V, the Kitty sequence CSI 118;5u",
+      },
+      { key: "Meta+Alt+KeyV", expected: [0x00, 0x76], note: "Cmd+Alt+V, the letter v" },
+    ];
+
+    const lines: string[] = [];
+    for (const item of cases) {
+      const frame = await pressOnce(page, stub, item.key);
+      lines.push(`${show(item.key, frame)}  (${item.note})`);
+      expect(Array.from(frame)).toEqual(item.expected);
+    }
+    // eslint-disable-next-line no-console
+    console.log(`\n${lines.join("\n")}`);
   });
 });

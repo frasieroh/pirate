@@ -209,9 +209,9 @@ async function main(): Promise<void> {
       send(encodeInput(encoder.encode(data)));
     });
     bridge = buildBridge(term);
-    // A new facade carries no custom key handler, so the seven corrected
-    // chords of `src/input.ts` need this call again.
-    attachKeyCorrection(runtime);
+    // A new facade carries no custom key handler, so the corrected chords of
+    // `src/input.ts` need this call again.
+    attachKeyCorrection(runtime, selection);
   }
 
   // ── resize ──────────────────────────────────────────────────────────────
@@ -342,6 +342,16 @@ async function main(): Promise<void> {
     rebuild,
   };
 
+  // Mouse selection belongs to the renderer and to its canvas, and both live
+  // for the whole page. `buildTerminal` gives a new facade on every theme
+  // change, so an install inside that function would add a second set of
+  // listeners on each change. This call runs once.
+  //
+  // The call comes before `buildTerminal`, because `buildTerminal` gives the
+  // selection to `attachKeyCorrection` for the copy chord. The renderer built
+  // the canvas above, and `installSelection` needs no facade.
+  const selection = installSelection(grid, container);
+
   // The theme of the active slot. `installTheme` builds the facade again on
   // every later change, and it also sets the `--pirate-*` custom properties.
   buildTerminal(stored[stored.mode]);
@@ -357,13 +367,7 @@ async function main(): Promise<void> {
 
   installTheme(runtime);
   installFont(runtime);
-  installInput(runtime);
-
-  // Mouse selection belongs to the renderer and to its canvas, and both live
-  // for the whole page. `buildTerminal` gives a new facade on every theme
-  // change, so an install inside that function would add a second set of
-  // listeners on each change. This call runs once.
-  const selection = installSelection(grid, container);
+  installInput(runtime, selection);
 
   // ── frames ──────────────────────────────────────────────────────────────
   function onFrame(data: unknown): void {
