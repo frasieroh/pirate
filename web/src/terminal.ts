@@ -322,6 +322,37 @@ export class PirateTerminal {
     // bubble-phase listener on the same element, so that gate holds.
     this.container.addEventListener("keydown", this.onKeyDown);
 
+    // Take the focus, but only when no other element holds it. Without this
+    // call the active element after a load is BODY, and every keystroke of the
+    // operator goes nowhere until a click lands on the page. `src/input.ts`
+    // returns the focus on `mousedown`, so one click hides the fault, and an
+    // operator who logs in and types sees nothing at all.
+    //
+    // This constructor is the `open` of this facade. It appends the text
+    // field, it makes the container focusable, and it attaches the key
+    // listener. ghostty-web ended its own `open` with a focus call for the
+    // same reason, and this facade has no other lifecycle point.
+    //
+    // The call belongs here and not in `src/main.ts`, because `dispose`
+    // removes the text field of the old facade. A theme change builds a new
+    // facade, so the focused node leaves the document and the focus falls to
+    // BODY. A call in `main.ts` at load time alone would leave that second
+    // path broken.
+    //
+    // The call is unconditional. Measurement of the three paths that must not
+    // lose the focus of the operator:
+    //
+    // - The login form. `requireSession` of `src/login.ts` removes the form
+    //   before it resolves, and `src/main.ts` awaits it before it builds
+    //   anything. No terminal exists while the form is on the screen.
+    // - The menu. A rebuild runs for a theme change alone. `src/theme.ts`
+    //   calls `term.focus()` on its own line after every `rebuild`, as
+    //   `src/font.ts` and `src/input.ts` do for their own menu rows, so this
+    //   call changes no end state there. A menu button that the operator holds
+    //   without a theme change keeps the focus, because no rebuild runs.
+    // - A reconnect. `ws.onopen` builds no facade, so the focus does not move.
+    this.focus();
+
     this.animationFrameId = requestAnimationFrame(this.loop);
   }
 

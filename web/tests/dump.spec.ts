@@ -116,10 +116,25 @@ test("control: with the paint loop stopped, the same dump leaves a stale screen"
     const before = await canvasSignature(page);
 
     await stopRenderLoop(page);
-    expect(await countRenders(page, 300)).toBe(0);
+
+    // The count must span the arrival of the dump, never a quiet period. A
+    // quiet terminal calls `render` zero times whether the loop runs or not,
+    // because `src/render/index.ts` presents the canvas only for a frame that
+    // paints. A count taken before the dump therefore reads zero in both
+    // cases, and it would not discriminate. The dump makes every row dirty, so
+    // a live loop must call `render` inside this window and a stopped loop
+    // cannot.
+    const counting = countRenders(page, 1500);
+    // The wrapper goes on inside `counting`. Give it the task it needs to
+    // install itself before the dump arrives.
+    await idle(100);
 
     stub.send([{ tag: 0x01, text: screenText(rows, "dump") }]);
     await waitFor(() => viewportLine(page, 0), (line) => line === "dump line 1", "the dump");
+    const rendersOverTheDump = await counting;
+    // eslint-disable-next-line no-console
+    console.log(`  renderer calls while the dump arrived, loop stopped: ${rendersOverTheDump}`);
+    expect(rendersOverTheDump).toBe(0);
     await idle(500);
 
     // The parser has the dump. The canvas does not. This is the stale screen.
