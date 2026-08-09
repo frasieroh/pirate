@@ -2,6 +2,13 @@
 resolver = "2"
 members = ["crates/pirate", "crates/pirate-bench", "crates/xtask"]
 
+# vendor/beamterm is a workspace of its own. It builds for
+# wasm32-unknown-unknown only, and it declares edition 2024 with its own lint
+# set and its own rustfmt.toml. A member here would put those crates into
+# `cargo clippy --workspace --all-targets`, into `cargo test --workspace`, and
+# into `cargo fmt --all --check`, and all three run on the host.
+exclude = ["vendor/beamterm"]
+
 # The only version number in the repository. `cargo xtask version <x.y.z>`
 # writes this value and propagates it to web/package.json.
 [workspace.package]

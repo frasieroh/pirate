@@ -1,4 +1,6 @@
 /target
+/vendor/beamterm/target
+/vendor/beamterm/pkg
 /.toolchain
 /web/dist
 /web/build-info.toml

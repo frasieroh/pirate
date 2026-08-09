@@ -133,6 +133,65 @@ url = "https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-darwin-x
 checksum = "sha256:3e35ad6f53971a9834bf9e6786e2adf72b5f1921cc9a9c5fde073d2972944076"
 url = "https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-darwin-x64-baseline.zip"
 
+[[tools."github:rustwasm/wasm-bindgen"]]
+version = "0.2.127"
+backend = "github:rustwasm/wasm-bindgen"
+
+[tools."github:rustwasm/wasm-bindgen"."platforms.linux-arm64"]
+checksum = "sha256:1ce0ebd74e378d989651091f93c917bd7700996945d4c5ce37ec9507f149225c"
+url = "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.127/wasm-bindgen-0.2.127-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/wasm-bindgen/wasm-bindgen/releases/assets/505858464"
+provenance = "github-attestations"
+
+[tools."github:rustwasm/wasm-bindgen"."platforms.linux-arm64-musl"]
+checksum = "sha256:699ddbb724ece16f912b73a98b5341a75f4b8c7886ce152d40dbe09f694e46c7"
+url = "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.127/wasm-bindgen-0.2.127-aarch64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/wasm-bindgen/wasm-bindgen/releases/assets/505858466"
+provenance = "github-attestations"
+
+[tools."github:rustwasm/wasm-bindgen"."platforms.linux-x64"]
+checksum = "sha256:61d4a7dc85acfa0d2354ccc0b8361928c7e52a746d17f28ebaa795ed3dc1614a"
+url = "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.127/wasm-bindgen-0.2.127-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/wasm-bindgen/wasm-bindgen/releases/assets/505858453"
+provenance = "github-attestations"
+
+[tools."github:rustwasm/wasm-bindgen"."platforms.linux-x64-baseline"]
+checksum = "sha256:61d4a7dc85acfa0d2354ccc0b8361928c7e52a746d17f28ebaa795ed3dc1614a"
+url = "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.127/wasm-bindgen-0.2.127-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/wasm-bindgen/wasm-bindgen/releases/assets/505858453"
+provenance = "github-attestations"
+
+[tools."github:rustwasm/wasm-bindgen"."platforms.linux-x64-musl"]
+checksum = "sha256:61d4a7dc85acfa0d2354ccc0b8361928c7e52a746d17f28ebaa795ed3dc1614a"
+url = "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.127/wasm-bindgen-0.2.127-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/wasm-bindgen/wasm-bindgen/releases/assets/505858453"
+provenance = "github-attestations"
+
+[tools."github:rustwasm/wasm-bindgen"."platforms.linux-x64-musl-baseline"]
+checksum = "sha256:61d4a7dc85acfa0d2354ccc0b8361928c7e52a746d17f28ebaa795ed3dc1614a"
+url = "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.127/wasm-bindgen-0.2.127-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/wasm-bindgen/wasm-bindgen/releases/assets/505858453"
+provenance = "github-attestations"
+
+[tools."github:rustwasm/wasm-bindgen"."platforms.macos-arm64"]
+checksum = "sha256:cd93e691eb5953ace5d8ffce52a20b024077a3dac3e2215b8224136b0efb7585"
+url = "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.127/wasm-bindgen-0.2.127-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/wasm-bindgen/wasm-bindgen/releases/assets/505858463"
+provenance = "github-attestations"
+provenance_verified = true
+
+[tools."github:rustwasm/wasm-bindgen"."platforms.macos-x64"]
+checksum = "sha256:81049c79f4e283e1725e6582a0528af1301a70ad23add1df1c4d042ec825263d"
+url = "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.127/wasm-bindgen-0.2.127-x86_64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/wasm-bindgen/wasm-bindgen/releases/assets/505858457"
+provenance = "github-attestations"
+
+[tools."github:rustwasm/wasm-bindgen"."platforms.macos-x64-baseline"]
+checksum = "sha256:81049c79f4e283e1725e6582a0528af1301a70ad23add1df1c4d042ec825263d"
+url = "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.127/wasm-bindgen-0.2.127-x86_64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/wasm-bindgen/wasm-bindgen/releases/assets/505858457"
+provenance = "github-attestations"
+
 [[tools.rust]]
 version = "1.97.1"
 backend = "core:rust"
@@ -140,7 +199,7 @@ backend = "core:rust"
 [tools.rust.options]
 components = "clippy,rustfmt"
 profile = "minimal"
-targets = "aarch64-apple-darwin,aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl,x86_64-apple-darwin,x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl"
+targets = "aarch64-apple-darwin,aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl,wasm32-unknown-unknown,x86_64-apple-darwin,x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl"
 
 [[tools.zig]]
 version = "0.15.2"

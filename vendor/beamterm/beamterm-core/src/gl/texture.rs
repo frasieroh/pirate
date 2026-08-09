@@ -1,0 +1,231 @@
+use beamterm_data::FontAtlasData;
+use glow::HasContext;
+
+use crate::error::Error;
+
+/// Number of glyphs stored per texture layer (1x32 vertical grid)
+const GLYPHS_PER_LAYER: i32 = 32;
+
+/// Platform-agnostic rasterized glyph data for texture upload.
+#[derive(Debug, Clone)]
+pub struct RasterizedGlyph {
+    /// Raw RGBA pixel data.
+    pub pixels: Vec<u8>,
+    /// Glyph width in pixels.
+    pub width: u32,
+    /// Glyph height in pixels.
+    pub height: u32,
+}
+
+impl RasterizedGlyph {
+    /// Creates a new rasterized glyph from pixel data and dimensions.
+    #[must_use]
+    pub fn new(pixels: Vec<u8>, width: u32, height: u32) -> Self {
+        Self { pixels, width, height }
+    }
+
+    /// Returns true if the glyph produced no visible pixels.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pixels
+            .iter()
+            .skip(3)
+            .step_by(4)
+            .all(|&a| a == 0)
+    }
+}
+
+#[derive(Debug)]
+pub struct Texture {
+    gl_texture: glow::Texture,
+    /// Texture dimensions (width, height, layers)
+    dimensions: (i32, i32, i32),
+}
+
+impl Texture {
+    pub fn from_font_atlas_data(gl: &glow::Context, atlas: &FontAtlasData) -> Result<Self, Error> {
+        let (width, height, layers) = atlas.texture_dimensions();
+
+        // prepare texture
+        let gl_texture = unsafe { gl.create_texture() }.map_err(Error::texture_creation_failed)?;
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(gl_texture));
+            gl.tex_storage_3d(
+                glow::TEXTURE_2D_ARRAY,
+                1,
+                glow::RGBA8,
+                width,
+                height,
+                layers,
+            );
+
+            // upload the texture data; convert to u8 array
+            gl.tex_sub_image_3d(
+                glow::TEXTURE_2D_ARRAY,
+                0, // level
+                0,
+                0,
+                0, // offset
+                width,
+                height,
+                layers, // texture size
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(atlas.texture_data())),
+            );
+        }
+
+        Self::setup_sampling(gl);
+
+        let (width, height, layers) = atlas.texture_dimensions();
+        Ok(Self { gl_texture, dimensions: (width, height, layers) })
+    }
+
+    /// Creates an empty texture array for dynamic glyph rasterization.
+    ///
+    /// Allocates a fixed-size 2D texture array and initializes all layers to transparent
+    /// black (RGBA 0,0,0,0).
+    ///
+    /// **LRU eviction**: When the glyph cache evicts old entries, the texture slots
+    /// are reused. The new glyph completely overwrites the slot, so no explicit
+    /// clearing is needed on eviction.
+    ///
+    /// # Arguments
+    /// * `gl` - GL context
+    /// * `cell_size` - dimensions of each glyph cell in pixels
+    /// * `initial_layers` - Number of texture layers to allocate initially
+    pub fn for_dynamic_font_atlas(
+        gl: &glow::Context,
+        cell_size: beamterm_data::CellSize,
+        initial_layers: i32,
+    ) -> Result<Self, Error> {
+        let (cell_w, cell_h) = (cell_size.width, cell_size.height);
+
+        // Each layer holds 32 glyphs in a 1x32 vertical grid
+        // Match static atlas layout: single cell width per layer
+        // (double-width glyphs like emoji use two consecutive glyph slots)
+        let width = cell_w;
+        let height = cell_h * GLYPHS_PER_LAYER;
+
+        let gl_texture = unsafe { gl.create_texture() }.map_err(Error::texture_creation_failed)?;
+
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(gl_texture));
+            gl.tex_storage_3d(
+                glow::TEXTURE_2D_ARRAY,
+                1, // mip levels
+                glow::RGBA8,
+                width,
+                height,
+                initial_layers,
+            );
+
+            // Initialize all layers to transparent black to prevent undefined memory artifacts.
+            // See doc comment above for rationale. We upload all layers in a single call to
+            // minimize GPU state changes (1 call vs 128 per-layer calls).
+            let empty_data = vec![0u8; (width * height * initial_layers * 4) as usize];
+            gl.tex_sub_image_3d(
+                glow::TEXTURE_2D_ARRAY,
+                0, // mip level
+                0, // x offset
+                0, // y offset
+                0, // z offset (first layer)
+                width,
+                height,
+                initial_layers, // all layers at once
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&empty_data)),
+            );
+        }
+
+        Self::setup_sampling(gl);
+
+        Ok(Self {
+            gl_texture,
+            dimensions: (width, height, initial_layers),
+        })
+    }
+
+    /// Uploads a rasterized glyph to the texture at the position determined by its ID.
+    ///
+    /// Glyph positions follow the layout: layer = id / 32, y = (id % 32) * cell_height
+    pub fn upload_glyph(
+        &self,
+        gl: &glow::Context,
+        glyph_id: u16,
+        padded_cell_size: beamterm_data::CellSize,
+        rasterized: &RasterizedGlyph,
+    ) -> Result<(), Error> {
+        let cell_h = padded_cell_size.height;
+
+        // Calculate position in texture array
+        let layer = (glyph_id as i32) / GLYPHS_PER_LAYER;
+        let glyph_index = (glyph_id as i32) % GLYPHS_PER_LAYER;
+        let y_offset = glyph_index * cell_h;
+
+        if layer >= self.dimensions.2 {
+            return Err(Error::texture_creation_failed(format_args!(
+                "glyph id {glyph_id} exceeds texture layer count {}",
+                self.dimensions.2
+            )));
+        }
+
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(self.gl_texture));
+
+            gl.tex_sub_image_3d(
+                glow::TEXTURE_2D_ARRAY,
+                0, // level
+                0,
+                y_offset,
+                layer, // x, y, z offset
+                rasterized.width as i32,
+                rasterized.height as i32,
+                1, // depth (single layer)
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&rasterized.pixels)),
+            );
+        }
+
+        Ok(())
+    }
+
+    pub fn bind(&self, gl: &glow::Context) {
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(self.gl_texture));
+        }
+    }
+
+    pub fn delete(&self, gl: &glow::Context) {
+        unsafe {
+            gl.delete_texture(self.gl_texture);
+        }
+    }
+
+    fn setup_sampling(gl: &glow::Context) {
+        unsafe {
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D_ARRAY,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D_ARRAY,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D_ARRAY,
+                glow::TEXTURE_WRAP_S,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D_ARRAY,
+                glow::TEXTURE_WRAP_T,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+        }
+    }
+}

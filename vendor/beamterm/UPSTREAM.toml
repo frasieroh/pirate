@@ -1,0 +1,54 @@
+# The upstream pin of the vendored beamterm source.
+#
+# pirate builds the WebGL2 renderer from this tree. The npm package
+# `@beamterm/renderer` is no longer a registry dependency. `cargo xtask wasm`
+# compiles this source and writes the JavaScript package into
+# `vendor/beamterm/pkg`.
+#
+# `cargo xtask verify-pins` reads `commit` and fails when it is not a full
+# git commit.
+#
+# To move the pin, clone the upstream repository at the new commit, copy the
+# four crates again, and apply the change list below by hand.
+
+url = "https://github.com/junkdog/beamterm"
+tag = "beamterm-v1.0.0"
+commit = "fd8066e840ebf4d7ad26dbfcc0ac5f4b7b34b7e3"
+
+# The wasm-bindgen version of this tree. mise installs the command-line tool at
+# this same version. The two must be equal, or the generated bindings do not
+# match the wasm module. `cargo xtask verify-pins` compares them.
+wasm_bindgen = "0.2.127"
+
+# Every difference from the upstream tree.
+#
+# files_removed  Upstream files that this tree does not hold.
+# files_changed  Upstream files that this tree changes. Each change carries a
+#                `CHANGED FROM UPSTREAM` comment at the line.
+[delta]
+files_removed = [
+    # beamterm-renderer needs beamterm-core, beamterm-data, and
+    # beamterm-unicode. The other three crates build the font atlas and the
+    # native examples.
+    "beamterm-atlas/",
+    "beamterm-rasterizer/",
+    "examples/",
+    "js/",
+    "scripts/",
+    "docs/",
+    # The test suites need dev dependencies that pirate does not build.
+    "beamterm-core/tests/",
+    "beamterm-unicode/tests/",
+    # Inputs of the atlas generator, which this tree does not hold.
+    "beamterm-data/atlas/bitmap_font.png",
+    "beamterm-data/atlas/additional-symbols.txt",
+]
+files_changed = [
+    # The member list holds the four vendored crates.
+    "Cargo.toml",
+    # The `native-dynamic-atlas` feature loses its beamterm-rasterizer
+    # dependency and stays empty.
+    "beamterm-core/Cargo.toml",
+    # The `emojis` dev dependency goes with the deleted test suite.
+    "beamterm-unicode/Cargo.toml",
+]

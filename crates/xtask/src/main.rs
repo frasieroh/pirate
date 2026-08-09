@@ -11,6 +11,7 @@
 mod dist;
 mod pins;
 mod toolchain;
+mod wasm;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -21,7 +22,10 @@ const HELP: &str = "\
 cargo xtask <command>
 
 Commands:
-  web                    Build the web assets. The web build compresses them.
+  wasm                   Build vendor/beamterm for wasm32 and write the local
+                         npm package into vendor/beamterm/pkg.
+  web                    Build the wasm package, then the web assets. The web
+                         build compresses them.
   build [--release]      Build the web assets, then the binary.
         [--target T]     Cross-compile. Linux targets use cargo-zigbuild.
   dist [--target T]...   Build each target, then write a tarball for each one
@@ -35,6 +39,7 @@ fn main() {
     let cmd = args.first().map(String::as_str).unwrap_or("help");
 
     let result = match cmd {
+        "wasm" => cmd_wasm_alone(),
         "web" => cmd_web_alone(),
         "build" => cmd_build(&args[1..]),
         "dist" => dist::run(&args[1..]),
@@ -71,6 +76,13 @@ pub fn repo_root() -> PathBuf {
 /// `build.rs` script of pirate reads web/build-info.toml.
 const WEB_OUTPUTS: &[&str] = &["dist/index.html", "build-info.toml"];
 
+/// The `wasm` command on its own. `wasm-bindgen` must come from mise, so this
+/// command builds the same environment that a full build gives.
+fn cmd_wasm_alone() -> Result<()> {
+    let env = toolchain::build_env()?;
+    wasm::build(&env)
+}
+
 /// The `web` command on its own. It builds the same environment that a full
 /// build gives, because `bun` must come from mise here too.
 fn cmd_web_alone() -> Result<()> {
@@ -78,9 +90,10 @@ fn cmd_web_alone() -> Result<()> {
     cmd_web(&env)
 }
 
-/// The web build. Vite writes web/dist, compresses every large asset into a gzip
-/// and a brotli copy, and writes web/build-info.toml. The Rust build embeds all
-/// three forms of each asset.
+/// The web build. It builds the wasm package of vendor/beamterm first. Then Vite
+/// writes web/dist, compresses every large asset into a gzip and a brotli copy,
+/// and writes web/build-info.toml. The Rust build embeds all three forms of each
+/// asset.
 ///
 /// CAUTION: Run `bun` with the build environment of mise. mise pins the bun
 /// version and puts that bun on PATH. A bun from the machine ignores the pin,
@@ -90,6 +103,11 @@ pub fn cmd_web(env: &[(String, String)]) -> Result<()> {
     if !web.join("package.json").is_file() {
         return Err(format!("no package.json in {}", web.display()).into());
     }
+
+    // CAUTION: Build the wasm package first. web/package.json resolves
+    // `@beamterm/renderer` to vendor/beamterm/pkg, and `bun install` fails when
+    // that directory holds no package.json.
+    wasm::build(env)?;
 
     run_with_env("bun", &["install", "--frozen-lockfile"], &web, env)
         .or_else(|_| run_with_env("bun", &["install"], &web, env))?;

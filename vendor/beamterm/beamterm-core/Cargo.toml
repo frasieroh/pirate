@@ -1,0 +1,46 @@
+[package]
+name = "beamterm-core"
+description = "Platform-agnostic OpenGL terminal renderer using glow"
+readme = "../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = [
+    "src/**/*.rs",
+    "src/shaders/*",
+    "tests/**/*.rs",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE*",
+]
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+
+# CHANGED FROM UPSTREAM. `native-dynamic-atlas` needs beamterm-rasterizer, and
+# pirate does not vendor that crate. The feature stays declared and empty, so
+# rustc reports no unexpected `cfg`. The code behind the feature stays unbuilt.
+# CAUTION: Do not turn this feature on. It does not compile without
+# beamterm-rasterizer.
+[features]
+default = []
+native-dynamic-atlas = []
+
+[dependencies]
+bitflags.workspace = true
+beamterm-data = { path = "../beamterm-data", version = "1.0.0" }
+beamterm-unicode = { path = "../beamterm-unicode", version = "1.0.0" }
+compact_str = { workspace = true }
+thiserror = { workspace = true }
+unicode-width.workspace = true
+glow.workspace = true
+lru = "0.16"
+rustc-hash = "2.1.1"
+
+[dev-dependencies]
+
+[lints]
+workspace = true
