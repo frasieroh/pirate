@@ -68,6 +68,10 @@ mise exec -- cargo xtask dist
 `cargo xtask wasm` builds this source for `wasm32-unknown-unknown` and writes the local npm
 package into `vendor/beamterm/pkg`.
 
+CAUTION: Run `cargo xtask wasm` under mise. mise puts the pinned `wasm-bindgen` and the
+pinned `wasm-opt` on PATH. A `wasm-bindgen` from your machine writes bindings that do not
+match the wasm module.
+
 The source comes from `https://github.com/junkdog/beamterm`, tag `beamterm-v1.0.0`, at commit
 `fd8066e840ebf4d7ad26dbfcc0ac5f4b7b34b7e3`. `vendor/beamterm/UPSTREAM.toml` records this pin.
 
@@ -96,6 +100,8 @@ so activate mise in your shell, or write `mise exec -- cargo build`.
 | zig, bun, rust, cargo-zigbuild, cargo-deny, wasm-bindgen, binaryen | `mise.toml` |
 | The SHA-256 of every tool download, per platform | `mise.lock` |
 | The Ghostty commit | `toolchain/ghostty.toml` |
+| The beamterm commit and the wasm-bindgen version of the vendored tree | `vendor/beamterm/UPSTREAM.toml` |
+| The dependencies of the vendored renderer | `vendor/beamterm/Cargo.lock` |
 | Rust dependencies | `Cargo.toml` and `Cargo.lock` |
 | Web dependencies | `web/package.json` and `web/bun.lock` |
 | GitHub Actions | a full commit SHA in each `uses:` line |
