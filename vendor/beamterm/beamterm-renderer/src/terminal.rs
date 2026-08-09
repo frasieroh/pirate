@@ -257,6 +257,8 @@ impl Terminal {
     /// # Parameters
     /// * `font_family` - Font family names in priority order (e.g., `&["JetBrains Mono", "Hack"]`)
     /// * `font_size` - Font size in pixels
+    /// * `line_height` - ADDED BY PIRATE. Multiplier of the measured cell
+    ///   height. It clamps to the range 1.0 to 2.0.
     ///
     /// # Example
     /// ```rust,no_run
@@ -265,7 +267,7 @@ impl Terminal {
     /// let mut terminal = Terminal::builder("#canvas").build().unwrap();
     ///
     /// // Switch to a different font at runtime
-    /// terminal.replace_with_dynamic_atlas(&["Fira Code", "Hack"], 15.0).unwrap();
+    /// terminal.replace_with_dynamic_atlas(&["Fira Code", "Hack"], 15.0, 1.0).unwrap();
     /// ```
     ///
     /// # Errors
@@ -276,6 +278,7 @@ impl Terminal {
         &mut self,
         font_family: &[&str],
         font_size: f32,
+        line_height: f32,
     ) -> Result<(), Error> {
         let gl = self.renderer.gl();
         let pixel_ratio = device_pixel_ratio();
@@ -284,8 +287,9 @@ impl Terminal {
             .map(|&s| format_compact!("'{s}'"))
             .join_compact(", ");
         let effective_font_size = font_size * pixel_ratio;
-        let rasterizer = CanvasGlyphRasterizer::new(&font_family_css, effective_font_size)
-            .map_err(|e| Error::Rasterization(e.to_string()))?;
+        let rasterizer =
+            CanvasGlyphRasterizer::new(&font_family_css, effective_font_size, line_height)
+                .map_err(|e| Error::Rasterization(e.to_string()))?;
         let atlas = DynamicFontAtlas::new(gl, rasterizer, font_size, pixel_ratio)?;
         self.grid
             .borrow_mut()
@@ -587,12 +591,15 @@ pub struct TerminalBuilder {
 #[derive(Debug)]
 enum AtlasKind {
     Static(Option<FontAtlasData>),
+    // ADDED BY PIRATE: the `line_height` field of both dynamic variants.
     Dynamic {
         font_size: f32,
+        line_height: f32,
         font_family: Vec<CompactString>,
     },
     DebugDynamic {
         font_size: f32,
+        line_height: f32,
         font_family: Vec<CompactString>,
         debug_space_pattern: DebugSpacePattern,
     },
@@ -639,13 +646,21 @@ impl TerminalBuilder {
     /// # Parameters
     /// * `font_family` - Font family names in priority order (e.g., `&["JetBrains Mono", "Fira Code"]`)
     /// * `font_size` - Font size in pixels
+    /// * `line_height` - ADDED BY PIRATE. Multiplier of the measured cell
+    ///   height. It clamps to the range 1.0 to 2.0.
     ///
     /// For pre-generated atlases with fixed character sets, see [`font_atlas`](Self::font_atlas).
     #[must_use]
-    pub fn dynamic_font_atlas(mut self, font_family: &[&str], font_size: f32) -> Self {
+    pub fn dynamic_font_atlas(
+        mut self,
+        font_family: &[&str],
+        font_size: f32,
+        line_height: f32,
+    ) -> Self {
         self.atlas_kind = AtlasKind::Dynamic {
             font_family: font_family.iter().map(|&s| s.into()).collect(),
             font_size,
+            line_height,
         };
         self
     }
@@ -658,17 +673,21 @@ impl TerminalBuilder {
     /// # Parameters
     /// * `font_family` - Font family names in priority order
     /// * `font_size` - Font size in pixels
+    /// * `line_height` - ADDED BY PIRATE. Multiplier of the measured cell
+    ///   height. It clamps to the range 1.0 to 2.0.
     /// * `pattern` - The checkered pattern to use (1px or 2x2 pixels)
     #[must_use]
     pub fn debug_dynamic_font_atlas(
         mut self,
         font_family: &[&str],
         font_size: f32,
+        line_height: f32,
         pattern: DebugSpacePattern,
     ) -> Self {
         self.atlas_kind = AtlasKind::DebugDynamic {
             font_family: font_family.iter().map(|&s| s.into()).collect(),
             font_size,
+            line_height,
             debug_space_pattern: pattern,
         };
         self
@@ -780,14 +799,27 @@ impl TerminalBuilder {
             AtlasKind::Static(atlas_data) => {
                 StaticFontAtlas::load(gl, atlas_data.unwrap_or_default())?.into()
             },
-            AtlasKind::Dynamic { font_family, font_size } => {
-                let rasterizer =
-                    create_canvas_rasterizer(&font_family, font_size, raw_pixel_ratio)?;
+            AtlasKind::Dynamic { font_family, font_size, line_height } => {
+                let rasterizer = create_canvas_rasterizer(
+                    &font_family,
+                    font_size,
+                    line_height,
+                    raw_pixel_ratio,
+                )?;
                 DynamicFontAtlas::new(gl, rasterizer, font_size, raw_pixel_ratio)?.into()
             },
-            AtlasKind::DebugDynamic { font_family, font_size, debug_space_pattern } => {
-                let rasterizer =
-                    create_canvas_rasterizer(&font_family, font_size, raw_pixel_ratio)?;
+            AtlasKind::DebugDynamic {
+                font_family,
+                font_size,
+                line_height,
+                debug_space_pattern,
+            } => {
+                let rasterizer = create_canvas_rasterizer(
+                    &font_family,
+                    font_size,
+                    line_height,
+                    raw_pixel_ratio,
+                )?;
                 DynamicFontAtlas::with_debug_spaces(
                     gl,
                     rasterizer,
@@ -1027,9 +1059,11 @@ impl<'a> From<&'a web_sys::HtmlCanvasElement> for CanvasSource {
     }
 }
 
+// ADDED BY PIRATE: the `line_height` parameter.
 fn create_canvas_rasterizer(
     font_family: &[CompactString],
     font_size: f32,
+    line_height: f32,
     pixel_ratio: f32,
 ) -> Result<CanvasGlyphRasterizer, Error> {
     let font_family_css = font_family
@@ -1037,5 +1071,5 @@ fn create_canvas_rasterizer(
         .map(|s| format_compact!("'{s}'"))
         .join_compact(", ");
     let effective_font_size = font_size * pixel_ratio;
-    CanvasGlyphRasterizer::new(&font_family_css, effective_font_size)
+    CanvasGlyphRasterizer::new(&font_family_css, effective_font_size, line_height)
 }

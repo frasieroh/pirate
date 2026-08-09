@@ -17,6 +17,10 @@ use crate::{
     mouse::{ModifierKeys as RustModifierKeys, MouseSelectOptions, TerminalMouseEvent},
 };
 
+// ADDED BY PIRATE. A caller that sends no line height gets the upstream cell.
+/// Line height multiplier of the dynamic atlas when the caller sends none.
+const DEFAULT_LINE_HEIGHT: f32 = 1.0;
+
 /// JavaScript wrapper for the terminal renderer.
 ///
 /// Thin `#[wasm_bindgen]` wrapper that delegates to [`Terminal`].
@@ -557,6 +561,9 @@ impl BeamtermRenderer {
     /// * `canvas_id` - CSS selector for the canvas element
     /// * `font_family` - Array of font family names (e.g., `["Hack", "JetBrains Mono"]`)
     /// * `font_size` - Font size in pixels
+    /// * `line_height` - ADDED BY PIRATE. Multiplier of the measured cell
+    ///   height. It clamps to the range 1.0 to 2.0. Defaults to 1.0 if not
+    ///   specified.
     /// * `auto_resize_canvas_css` - Whether to automatically set canvas CSS dimensions
     ///   on resize. Set to `false` when external CSS (flexbox, grid) controls sizing.
     ///   Defaults to `true` if not specified.
@@ -566,7 +573,8 @@ impl BeamtermRenderer {
     /// const renderer = BeamtermRenderer.withDynamicAtlas(
     ///     "#terminal",
     ///     ["JetBrains Mono", "Fira Code"],
-    ///     16.0
+    ///     16.0,
+    ///     1.25
     /// );
     /// ```
     #[wasm_bindgen(js_name = "withDynamicAtlas")]
@@ -574,6 +582,9 @@ impl BeamtermRenderer {
         canvas_id: &str,
         font_family: js_sys::Array,
         font_size: f32,
+        // ADDED BY PIRATE. The position of this parameter is a contract with
+        // the client. It stays before `auto_resize_canvas_css`.
+        line_height: Option<f32>,
         auto_resize_canvas_css: Option<bool>,
     ) -> Result<BeamtermRenderer, JsValue> {
         console_error_panic_hook::set_once();
@@ -591,7 +602,7 @@ impl BeamtermRenderer {
 
         let terminal = Terminal::builder(canvas_id)
             .auto_resize_canvas_css(auto_resize_canvas_css.unwrap_or(true))
-            .dynamic_font_atlas(&refs, font_size)
+            .dynamic_font_atlas(&refs, font_size, line_height.unwrap_or(DEFAULT_LINE_HEIGHT))
             .build()?;
 
         Ok(BeamtermRenderer { terminal })
@@ -802,16 +813,21 @@ impl BeamtermRenderer {
     /// # Arguments
     /// * `font_family` - Array of font family names (e.g., `["Hack", "JetBrains Mono"]`)
     /// * `font_size` - Font size in pixels
+    /// * `line_height` - ADDED BY PIRATE. Multiplier of the measured cell
+    ///   height. It clamps to the range 1.0 to 2.0. Defaults to 1.0 if not
+    ///   specified.
     ///
     /// # Example
     /// ```javascript
-    /// renderer.replaceWithDynamicAtlas(["Fira Code", "monospace"], 18.0);
+    /// renderer.replaceWithDynamicAtlas(["Fira Code", "monospace"], 18.0, 1.25);
     /// ```
     #[wasm_bindgen(js_name = "replaceWithDynamicAtlas")]
     pub fn replace_with_dynamic_atlas(
         &mut self,
         font_family: js_sys::Array,
         font_size: f32,
+        // ADDED BY PIRATE.
+        line_height: Option<f32>,
     ) -> Result<(), JsValue> {
         let font_families: Vec<String> = font_family
             .iter()
@@ -823,9 +839,11 @@ impl BeamtermRenderer {
         }
 
         let refs: Vec<&str> = font_families.iter().map(String::as_str).collect();
-        Ok(self
-            .terminal
-            .replace_with_dynamic_atlas(&refs, font_size)?)
+        Ok(self.terminal.replace_with_dynamic_atlas(
+            &refs,
+            font_size,
+            line_height.unwrap_or(DEFAULT_LINE_HEIGHT),
+        )?)
     }
 }
 

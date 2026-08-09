@@ -46,13 +46,72 @@ const OFFSCREEN_CANVAS_WIDTH: u32 = 256;
 /// Canvas height is scaled to fit this many glyphs.
 const GLYPH_BATCH_SIZE: usize = 32;
 
+// ADDED BY PIRATE. Upstream takes the ink box of the reference glyph as the
+// cell, and it gives no way to make the cell taller. pirate needs a line height
+// setting. The extra pixels go into the rasterized bitmap, not into the quad.
+// The fragment shader samples the glyph across the full quad, so a taller quad
+// with an unchanged bitmap stretches the glyph.
+/// Smallest line height multiplier.
+pub(super) const LINE_HEIGHT_MIN: f32 = 1.0;
+/// Largest line height multiplier.
+pub(super) const LINE_HEIGHT_MAX: f32 = 2.0;
+
+// ADDED BY PIRATE. The arithmetic is in a free function, and a host test calls
+// it. The rest of this module needs a browser.
+/// Vertical layout of one cell after the line height multiplier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LineHeightLayout {
+    /// Ink height of the reference glyph, in device pixels.
+    pub(super) glyph_height: u32,
+    /// Cell height after the multiplier, in device pixels.
+    pub(super) cell_height: u32,
+    /// Device pixels added above the glyph box.
+    pub(super) pad_top: u32,
+    /// Device pixels added below the glyph box.
+    pub(super) pad_bottom: u32,
+}
+
+/// Computes the vertical layout of one cell for a line height multiplier.
+///
+/// The multiplier clamps to the range `LINE_HEIGHT_MIN` to `LINE_HEIGHT_MAX`.
+/// A NaN multiplier gives the same layout as `LINE_HEIGHT_MIN`. The extra
+/// height splits above and below the glyph. When the extra height is an odd
+/// number of device pixels, the top gets the larger half.
+pub(super) fn line_height_layout(glyph_height: u32, line_height: f32) -> LineHeightLayout {
+    let multiplier = line_height.clamp(LINE_HEIGHT_MIN, LINE_HEIGHT_MAX);
+
+    // `as u32` saturates. NaN gives 0, and `max` then gives the glyph height.
+    let scaled = (glyph_height as f32 * multiplier).round() as u32;
+    let cell_height = scaled.max(glyph_height);
+
+    let extra = cell_height - glyph_height;
+    let pad_top = extra.div_ceil(2);
+
+    LineHeightLayout {
+        glyph_height,
+        cell_height,
+        pad_top,
+        pad_bottom: extra - pad_top,
+    }
+}
+
 /// Cell metrics for positioning glyphs correctly.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct CellMetrics {
     padded_width: u32,
-    padded_height: u32,
     /// How far above the baseline the glyph extends (for positioning with baseline "top")
     ascent: f64,
+    // ADDED BY PIRATE. The cell height comes from this layout. Upstream stored
+    // `padded_height` here, and `padded_height()` now derives it.
+    line_height: LineHeightLayout,
+}
+
+impl CellMetrics {
+    // ADDED BY PIRATE. Replaces the upstream `padded_height` field.
+    /// Returns the cell height with the padding, in device pixels.
+    fn padded_height(&self) -> u32 {
+        self.line_height.cell_height + 2 * PADDING
+    }
 }
 
 /// Re-export core's RasterizedGlyph for use within the renderer.
@@ -73,10 +132,13 @@ pub(crate) struct CanvasRasterizer {
 impl CanvasRasterizer {
     /// Creates a new canvas rasterizer with the specified cell dimensions.
     ///
+    /// `line_height` is a multiplier of the measured cell height. It clamps to
+    /// the range `LINE_HEIGHT_MIN` to `LINE_HEIGHT_MAX`.
+    ///
     /// # Returns
     ///
     /// A configured rasterizer context, or an error if canvas creation fails.
-    pub(crate) fn new(font_family: &str, font_size: f32) -> Result<Self, Error> {
+    pub(crate) fn new(font_family: &str, font_size: f32, line_height: f32) -> Result<Self, Error> {
         // Create canvas with minimal height for initial measurement
         let canvas = OffscreenCanvas::new(OFFSCREEN_CANVAS_WIDTH, 128)
             .map_err(|e| Error::rasterizer_canvas_creation_failed(js_error_string(&e)))?;
@@ -94,10 +156,10 @@ impl CanvasRasterizer {
         ctx.set_text_align("left");
         ctx.set_font(&font_string);
 
-        let cell_metrics = Self::measure_cell_metrics(&ctx)?;
+        let cell_metrics = Self::measure_cell_metrics(&ctx, line_height)?;
 
         // Resize canvas to fit GLYPH_BATCH_SIZE glyphs
-        let required_height = GLYPH_BATCH_SIZE as u32 * cell_metrics.padded_height;
+        let required_height = GLYPH_BATCH_SIZE as u32 * cell_metrics.padded_height();
         canvas.set_height(required_height);
 
         // Re-initialize context after resize (canvas resize clears context state)
@@ -145,7 +207,7 @@ impl CanvasRasterizer {
         self.render_ctx.set_font(&base_font);
 
         let cell_w = self.cell_metrics.padded_width;
-        let cell_h = self.cell_metrics.padded_height;
+        let cell_h = self.cell_metrics.padded_height();
 
         let num_glyphs = symbols.len() as u32;
 
@@ -161,7 +223,11 @@ impl CanvasRasterizer {
         );
 
         let mut current_style: Option<FontStyle> = Some(FontStyle::Normal);
-        let y_offset = PADDING as f64 + self.cell_metrics.ascent;
+        // ADDED BY PIRATE. `pad_top` centers the glyph in the taller cell.
+        // It is 0 at a line height of 1.0.
+        let y_offset = PADDING as f64
+            + self.cell_metrics.ascent
+            + self.cell_metrics.line_height.pad_top as f64;
 
         // draw each glyph on its own row with clipping to prevent bleed
         for (i, &(grapheme, style)) in symbols.iter().enumerate() {
@@ -231,10 +297,17 @@ impl CanvasRasterizer {
         &self.font_family
     }
 
+    // ADDED BY PIRATE. The line decorations need the glyph box inside the cell.
+    /// Returns the vertical layout of one cell.
+    pub(super) fn line_height_layout(&self) -> LineHeightLayout {
+        self.cell_metrics.line_height
+    }
+
     /// Measures cell size by rendering "█" and scanning actual pixel bounds.
     /// This is more accurate than text metrics which can have rounding issues.
     fn measure_cell_metrics(
         render_ctx: &OffscreenCanvasRenderingContext2d,
+        line_height: f32,
     ) -> Result<CellMetrics, Error> {
         let buffer_size = 128u32;
         let draw_offset = 16.0; // Draw with offset to capture any negative positioning
@@ -287,8 +360,9 @@ impl CanvasRasterizer {
 
         Ok(CellMetrics {
             padded_width: width + 2 * PADDING,
-            padded_height: height + 2 * PADDING,
             ascent,
+            // ADDED BY PIRATE. `height` is the ink height of the reference glyph.
+            line_height: line_height_layout(height, line_height),
         })
     }
 }
@@ -336,5 +410,121 @@ mod tests {
             build_font_string("'Hack'", 16.0, FontStyle::BoldItalic),
             "italic bold 16px 'Hack', monospace"
         );
+    }
+
+    // ADDED BY PIRATE. Tests for the line height multiplier.
+
+    #[test]
+    fn line_height_1_0_keeps_the_upstream_cell() {
+        for glyph_height in [1u32, 7, 16, 17, 32, 100] {
+            let layout = line_height_layout(glyph_height, 1.0);
+            assert_eq!(layout.cell_height, glyph_height);
+            assert_eq!(layout.pad_top, 0);
+            assert_eq!(layout.pad_bottom, 0);
+        }
+    }
+
+    #[test]
+    fn line_height_splits_an_even_extra_in_half() {
+        // 20 * 1.5 = 30. The extra height is 10 device pixels.
+        let layout = line_height_layout(20, 1.5);
+        assert_eq!(layout.cell_height, 30);
+        assert_eq!(layout.pad_top, 5);
+        assert_eq!(layout.pad_bottom, 5);
+    }
+
+    #[test]
+    fn line_height_gives_an_odd_extra_larger_half_to_the_top() {
+        // 10 * 1.5 = 15. The extra height is 5 device pixels.
+        let layout = line_height_layout(10, 1.5);
+        assert_eq!(layout.cell_height, 15);
+        assert_eq!(layout.pad_top, 3);
+        assert_eq!(layout.pad_bottom, 2);
+    }
+
+    #[test]
+    fn line_height_padding_always_sums_to_the_extra_height() {
+        for glyph_height in 1u32..64 {
+            for step in 0..=20 {
+                let layout = line_height_layout(glyph_height, 1.0 + step as f32 * 0.05);
+                assert_eq!(layout.glyph_height, glyph_height);
+                assert_eq!(
+                    layout.pad_top + layout.pad_bottom,
+                    layout.cell_height - glyph_height
+                );
+                assert!(layout.pad_top >= layout.pad_bottom);
+            }
+        }
+    }
+
+    /// Returns the offset of the glyph origin from the top of the cell.
+    /// This is the `y_offset` of `rasterize`.
+    fn glyph_origin_y(metrics: CellMetrics) -> f64 {
+        PADDING as f64 + metrics.ascent + metrics.line_height.pad_top as f64
+    }
+
+    #[test]
+    fn line_height_1_0_keeps_the_upstream_height_and_origin() {
+        // Upstream: `padded_height` is `ink_height + 2 * PADDING`, and the
+        // glyph origin is `PADDING + ascent`.
+        let ink_height = 19u32;
+        let ascent = 3.5f64;
+        let metrics = CellMetrics {
+            padded_width: 11 + 2 * PADDING,
+            ascent,
+            line_height: line_height_layout(ink_height, 1.0),
+        };
+
+        assert_eq!(metrics.padded_height(), ink_height + 2 * PADDING);
+        assert_eq!(glyph_origin_y(metrics), PADDING as f64 + ascent);
+    }
+
+    #[test]
+    fn a_taller_cell_moves_the_glyph_origin_down_by_pad_top() {
+        let ink_height = 19u32;
+        let ascent = 3.5f64;
+        let metrics = CellMetrics {
+            padded_width: 11 + 2 * PADDING,
+            ascent,
+            line_height: line_height_layout(ink_height, 1.5),
+        };
+
+        // 19 * 1.5 = 28.5, and that rounds to 29. The extra height is 10.
+        assert_eq!(metrics.line_height.cell_height, 29);
+        assert_eq!(metrics.line_height.pad_top, 5);
+        assert_eq!(metrics.padded_height(), 29 + 2 * PADDING);
+        assert_eq!(glyph_origin_y(metrics), PADDING as f64 + ascent + 5.0);
+
+        // `CanvasGlyphRasterizer::measure_cell_size` strips the padding back
+        // off. The reported cell then holds the extra height.
+        assert_eq!(
+            metrics.padded_height() - 2 * PADDING,
+            metrics.line_height.cell_height
+        );
+    }
+
+    #[test]
+    fn line_height_clamps_to_the_allowed_range() {
+        assert_eq!(
+            line_height_layout(20, 0.5),
+            line_height_layout(20, LINE_HEIGHT_MIN)
+        );
+        assert_eq!(
+            line_height_layout(20, -3.0),
+            line_height_layout(20, LINE_HEIGHT_MIN)
+        );
+        assert_eq!(
+            line_height_layout(20, 9.0),
+            line_height_layout(20, LINE_HEIGHT_MAX)
+        );
+        assert_eq!(
+            line_height_layout(20, f32::INFINITY),
+            line_height_layout(20, LINE_HEIGHT_MAX)
+        );
+        assert_eq!(
+            line_height_layout(20, f32::NAN),
+            line_height_layout(20, LINE_HEIGHT_MIN)
+        );
+        assert_eq!(line_height_layout(20, LINE_HEIGHT_MAX).cell_height, 40);
     }
 }
