@@ -1,8 +1,9 @@
 # Building pirate
 
-The build spans three toolchains. Zig builds libghostty-vt, Rust builds the server, and Vite
-builds the web client. `mise` installs all three from one file, and `crates/xtask` runs them
-in order.
+The build spans four toolchains. Zig builds libghostty-vt, Rust builds the server and the
+vendored beamterm renderer, and Vite builds the web client. wasm-bindgen writes the
+JavaScript side of that renderer. `mise` installs all four from one file, and `crates/xtask`
+runs them in order.
 
 ## Install mise
 
@@ -54,11 +55,28 @@ mise exec -- cargo xtask dist
 
 | Command | Result |
 |---|---|
-| `cargo xtask web` | Builds `web/dist` and writes `web/build-info.toml`. |
+| `cargo xtask wasm` | Builds `vendor/beamterm` for wasm32 and writes the local npm package into `vendor/beamterm/pkg`. |
+| `cargo xtask web` | Builds the wasm package first, then `web/dist`, and writes `web/build-info.toml`. |
 | `cargo xtask build [--release] [--target T]` | Builds the web assets, then the binary. |
 | `cargo xtask dist [--target T]...` | Builds each target, then writes the tarballs. |
 | `cargo xtask verify-pins` | Fails when any pin is not exact. |
 | `cargo xtask version <x.y.z>` | Writes one version to every manifest. |
+
+## The vendored beamterm renderer
+
+`vendor/beamterm/` holds vendored Rust source of the WebGL2 terminal renderer.
+`cargo xtask wasm` builds this source for `wasm32-unknown-unknown` and writes the local npm
+package into `vendor/beamterm/pkg`.
+
+The source comes from `https://github.com/junkdog/beamterm`, tag `beamterm-v1.0.0`, at commit
+`fd8066e840ebf4d7ad26dbfcc0ac5f4b7b34b7e3`. `vendor/beamterm/UPSTREAM.toml` records this pin.
+
+`web/package.json` resolves `@beamterm/renderer` to `vendor/beamterm/pkg`. The package no
+longer comes from the npm registry.
+
+pirate does not use `wasm-pack`. wasm-pack downloads `wasm-bindgen` and `wasm-opt` at build
+time, and no file of this repository pins those two downloads. mise pins both binaries
+instead.
 
 ## A plain `cargo build`
 
@@ -75,7 +93,7 @@ so activate mise in your shell, or write `mise exec -- cargo build`.
 
 | Input | File |
 |---|---|
-| zig, bun, rust, cargo-zigbuild, cargo-deny | `mise.toml` |
+| zig, bun, rust, cargo-zigbuild, cargo-deny, wasm-bindgen, binaryen | `mise.toml` |
 | The SHA-256 of every tool download, per platform | `mise.lock` |
 | The Ghostty commit | `toolchain/ghostty.toml` |
 | Rust dependencies | `Cargo.toml` and `Cargo.lock` |
