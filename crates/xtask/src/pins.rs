@@ -31,6 +31,19 @@ const NO_CHECKSUM_TOOLS: &[&str] = &["rust", "core:rust"];
 /// The variable that keeps the Zig cache inside the repository.
 const ZIG_CACHE_VAR: &str = "ZIG_GLOBAL_CACHE_DIR";
 
+/// The compile target of the vendored beamterm renderer. `cargo xtask wasm`
+/// needs it, and mise installs the rustup targets.
+const WASM_TARGET: &str = "wasm32-unknown-unknown";
+
+/// The mise tool that writes the JavaScript bindings of the wasm module.
+const BINDGEN_TOOL: &str = "github:rustwasm/wasm-bindgen";
+
+/// The npm package name of the vendored renderer.
+const BEAMTERM_PACKAGE: &str = "@beamterm/renderer";
+
+/// The prefix of an npm dependency that names a directory instead of a version.
+const LOCAL_PREFIX: &str = "file:";
+
 pub fn verify() -> Result<()> {
     let mut errors: Vec<String> = Vec::new();
 
@@ -43,6 +56,13 @@ pub fn verify() -> Result<()> {
     // toolchain/ghostty.toml against the crate source, when that source is here.
     match check_ghostty_pin() {
         Ok(commit) => eprintln!("xtask: ghostty pinned at {commit}"),
+        Err(e) => errors.push(e.to_string()),
+    }
+
+    // vendor/beamterm/UPSTREAM.toml against the vendored lock file, mise.toml,
+    // and web/package.json.
+    match check_beamterm_pin() {
+        Ok(commit) => eprintln!("xtask: beamterm pinned at {commit}"),
         Err(e) => errors.push(e.to_string()),
     }
 
@@ -62,6 +82,14 @@ pub fn verify() -> Result<()> {
     if package_json.is_file() {
         check_package_json(&package_json, &mut errors)?;
     }
+
+    // The wasm module of vendor/beamterm against the graph that cargo-deny and
+    // cargo-about read.
+    check_lock_containment(
+        &std::fs::read_to_string(root.join("Cargo.lock"))?,
+        &std::fs::read_to_string(root.join(crate::wasm::VENDOR_DIR).join("Cargo.lock"))?,
+        &mut errors,
+    );
 
     if errors.is_empty() {
         eprintln!("xtask: all pins are exact");
@@ -116,6 +144,7 @@ fn check_mise(errors: &mut Vec<String>) {
     };
 
     check_zig_cache_var(&config, errors);
+    check_rust_targets(&config, errors);
 
     let Some(tools) = config.get("tools").and_then(|t| t.as_table()) else {
         errors.push("mise.toml has no [tools] table".to_string());
@@ -179,6 +208,38 @@ fn check_zig_cache_var(config: &toml::Value, errors: &mut Vec<String>) {
             "mise.toml: [env] holds no `{ZIG_CACHE_VAR}`. Zig then writes its \
              cache to ~/.cache/zig, and the cache key of CI stops matching. \
              Write `{ZIG_CACHE_VAR} = \"{{{{config_root}}}}/.toolchain/zig-cache\"`."
+        ));
+    }
+}
+
+/// True when a comma-separated rustup target list holds one target.
+///
+/// The comparison is exact per element. A substring test lets
+/// `wasm32-unknown-unknown-foo` satisfy `wasm32-unknown-unknown`.
+fn has_target(targets: &str, wanted: &str) -> bool {
+    targets.split(',').any(|t| t.trim() == wanted)
+}
+
+/// The rustup target list of mise.toml against the wasm target.
+///
+/// `cargo xtask wasm` builds vendor/beamterm for wasm32-unknown-unknown. Without
+/// the target in this list, mise installs no wasm standard library, and the
+/// build stops with a message about a missing target.
+fn check_rust_targets(config: &toml::Value, errors: &mut Vec<String>) {
+    let targets = config
+        .get("tools")
+        .and_then(|t| t.get("rust"))
+        .and_then(|r| r.get("targets"))
+        .and_then(|t| t.as_str());
+    let Some(targets) = targets else {
+        errors.push("mise.toml: `rust` has no `targets`".to_string());
+        return;
+    };
+    if !has_target(targets, WASM_TARGET) {
+        errors.push(format!(
+            "mise.toml: the `targets` of `rust` hold no `{WASM_TARGET}`. \
+             `cargo xtask wasm` builds vendor/beamterm for that target. \
+             Add it to the list."
         ));
     }
 }
@@ -325,6 +386,185 @@ fn crate_commit(version: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// The version of one package in a Cargo.lock.
+///
+/// The file holds one `[[package]]` table for each package. The function reads
+/// the first table whose `name` matches.
+fn lock_version(lock: &str, name: &str) -> Option<String> {
+    let doc: toml::Value = toml::from_str(lock).ok()?;
+    let packages = doc.get("package")?.as_array()?;
+    packages
+        .iter()
+        .find(|p| p.get("name").and_then(|n| n.as_str()) == Some(name))
+        .and_then(|p| p.get("version"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Every package of a Cargo.lock, as name and version.
+fn lock_packages(lock: &str) -> Result<Vec<(String, String)>> {
+    let doc: toml::Value = toml::from_str(lock)?;
+    let Some(packages) = doc.get("package").and_then(|p| p.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(packages.len());
+    for package in packages {
+        let name = package.get("name").and_then(|n| n.as_str());
+        let version = package.get("version").and_then(|v| v.as_str());
+        if let (Some(name), Some(version)) = (name, version) {
+            out.push((name.to_string(), version.to_string()));
+        }
+    }
+    Ok(out)
+}
+
+/// Every package of the vendored lock file, at the same version, in the root
+/// lock file.
+///
+/// cargo-deny and cargo-about read the root workspace. The wasm build reads
+/// vendor/beamterm/Cargo.lock. The two resolvers run apart, so a package can
+/// carry one version in the license report and another version in the shipped
+/// wasm module. This rule keeps the report true: every package that the wasm
+/// module holds is a package that the root graph holds, at that same version.
+///
+/// To repair a difference, run `cargo update -p <name> --precise <version>` in
+/// vendor/beamterm, or in the repository root.
+fn check_lock_containment(root_lock: &str, vendor_lock: &str, errors: &mut Vec<String>) {
+    let root: std::collections::BTreeSet<(String, String)> = match lock_packages(root_lock) {
+        Ok(packages) => packages.into_iter().collect(),
+        Err(e) => {
+            errors.push(format!("Cargo.lock: {e}"));
+            return;
+        }
+    };
+    let vendor = match lock_packages(vendor_lock) {
+        Ok(packages) => packages,
+        Err(e) => {
+            errors.push(format!("vendor/beamterm/Cargo.lock: {e}"));
+            return;
+        }
+    };
+    for (name, version) in vendor {
+        if !root.contains(&(name.clone(), version.clone())) {
+            errors.push(format!(
+                "Cargo.lock holds no `{name} {version}`, and \
+                 vendor/beamterm/Cargo.lock does. `cargo deny check` then reads \
+                 a version that the wasm module does not hold. Run \
+                 `cargo update -p {name} --precise {version}` in the repository \
+                 root."
+            ));
+        }
+    }
+}
+
+/// The version of one tool in mise.toml.
+fn mise_tool_version(config: &toml::Value, tool: &str) -> Option<String> {
+    match config.get("tools")?.get(tool)? {
+        toml::Value::String(s) => Some(s.clone()),
+        toml::Value::Table(t) => t
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// The vendored beamterm tree against the three files that must agree with it.
+///
+/// 1. `UPSTREAM.toml` records the upstream commit. It must be a full commit,
+///    for the same reason as the Ghostty pin: a short commit or a tag can move.
+/// 2. The `wasm-bindgen` crate of `vendor/beamterm/Cargo.lock` and the
+///    `wasm-bindgen` binary of mise.toml write the two halves of one binding
+///    layer. A different version pair gives a module that fails at import time,
+///    and no compiler reports it.
+/// 3. `web/package.json` must resolve `@beamterm/renderer` to the directory that
+///    `cargo xtask wasm` writes. A registry version there takes the npm package
+///    again, and the vendored source then reaches no browser.
+fn check_beamterm_pin() -> Result<String> {
+    let root = repo_root();
+    let vendor = root.join(crate::wasm::VENDOR_DIR);
+    let path = vendor.join("UPSTREAM.toml");
+    let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&path)?)?;
+
+    let commit = doc
+        .get("commit")
+        .and_then(|v| v.as_str())
+        .ok_or("vendor/beamterm/UPSTREAM.toml has no `commit`")?;
+    if commit.len() != 40 || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "`{commit}` in vendor/beamterm/UPSTREAM.toml is not a full git commit"
+        )
+        .into());
+    }
+
+    let recorded = doc
+        .get("wasm_bindgen")
+        .and_then(|v| v.as_str())
+        .ok_or("vendor/beamterm/UPSTREAM.toml has no `wasm_bindgen`")?;
+
+    let lock = std::fs::read_to_string(vendor.join("Cargo.lock"))?;
+    let crate_version = lock_version(&lock, "wasm-bindgen")
+        .ok_or("vendor/beamterm/Cargo.lock holds no `wasm-bindgen` package")?;
+    if crate_version != recorded {
+        return Err(format!(
+            "vendor/beamterm/UPSTREAM.toml says wasm_bindgen {recorded}, and \
+             vendor/beamterm/Cargo.lock holds the crate at {crate_version}. \
+             Correct UPSTREAM.toml."
+        )
+        .into());
+    }
+
+    let mise: toml::Value = toml::from_str(&std::fs::read_to_string(root.join("mise.toml"))?)?;
+    let tool_version = mise_tool_version(&mise, BINDGEN_TOOL)
+        .ok_or_else(|| format!("mise.toml has no `{BINDGEN_TOOL}` under [tools]"))?;
+    if tool_version != crate_version {
+        return Err(format!(
+            "mise.toml installs wasm-bindgen {tool_version}, and \
+             vendor/beamterm/Cargo.lock holds the crate at {crate_version}. \
+             The tool writes the JavaScript side of the bindings, and the crate \
+             writes the wasm side. Set both to one version."
+        )
+        .into());
+    }
+
+    check_beamterm_specifier(&root)?;
+    Ok(commit.to_string())
+}
+
+/// The `@beamterm/renderer` entry of web/package.json against the directory that
+/// `cargo xtask wasm` writes.
+fn check_beamterm_specifier(root: &Path) -> Result<()> {
+    let path = root.join("web/package.json");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let spec = doc
+        .get("dependencies")
+        .and_then(|d| d.get(BEAMTERM_PACKAGE))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            format!("web/package.json has no `{BEAMTERM_PACKAGE}` under `dependencies`")
+        })?;
+
+    // bun resolves the path against the directory of web/package.json.
+    let wanted = format!(
+        "{LOCAL_PREFIX}../{}/{}",
+        crate::wasm::VENDOR_DIR,
+        crate::wasm::PKG_DIR
+    );
+    if spec != wanted {
+        return Err(format!(
+            "web/package.json: `{BEAMTERM_PACKAGE}` is \"{spec}\", and \
+             `cargo xtask wasm` writes \"{wanted}\". A registry version here \
+             takes the npm package, and the source of vendor/beamterm then \
+             reaches no browser."
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// The dependency tables of one Cargo manifest, with the name of each table.
 fn dependency_tables(doc: &toml::Value) -> Vec<(String, &toml::Value)> {
     const KINDS: &[&str] = &["dependencies", "dev-dependencies", "build-dependencies"];
@@ -407,6 +647,21 @@ fn check_package_json(path: &Path, errors: &mut Vec<String>) -> Result<()> {
             let Some(version) = spec.as_str() else {
                 continue;
             };
+
+            // A `file:` specifier names a directory of this repository, not a
+            // version. It carries no range, and the bytes come from the build of
+            // this repository. The path must be relative, because an absolute
+            // path resolves to a different directory on another machine.
+            if let Some(path) = version.strip_prefix(LOCAL_PREFIX) {
+                if Path::new(path).is_absolute() {
+                    errors.push(format!(
+                        "web/package.json: `{dep}`: \"{version}\" is an absolute path. \
+                         Write a path that is relative to web/."
+                    ));
+                }
+                continue;
+            }
+
             let exact = version.chars().next().is_some_and(|c| c.is_ascii_digit())
                 && !version.contains('*')
                 && !version.contains(" - ")
@@ -472,4 +727,131 @@ pub fn write_version(version: &str) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Write one package.json into a new temporary directory and check it.
+    ///
+    /// The tests of one binary run at the same time in one process, so the
+    /// directory name carries the name of the test.
+    fn check_json(name: &str, body: &str) -> Vec<String> {
+        let dir = std::env::temp_dir().join(format!("xtask-pins-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("package.json");
+        std::fs::write(&path, body).unwrap();
+        let mut errors = Vec::new();
+        let result = check_package_json(&path, &mut errors);
+        std::fs::remove_dir_all(&dir).unwrap();
+        result.unwrap();
+        errors
+    }
+
+    #[test]
+    fn a_local_directory_dependency_is_not_a_range() {
+        let errors = check_json(
+            "local",
+            r#"{"dependencies": {"@beamterm/renderer": "file:../vendor/beamterm/pkg"}}"#,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn an_absolute_local_dependency_fails() {
+        let errors = check_json("absolute", r#"{"dependencies": {"a": "file:/opt/pkg"}}"#);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("absolute path"), "{errors:?}");
+    }
+
+    #[test]
+    fn a_registry_range_still_fails() {
+        let errors = check_json("range", r#"{"dependencies": {"a": "^1.2.3"}}"#);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("is a range"), "{errors:?}");
+    }
+
+    #[test]
+    fn a_target_list_matches_one_element_at_a_time() {
+        assert!(has_target(
+            "a,wasm32-unknown-unknown,b",
+            "wasm32-unknown-unknown"
+        ));
+        assert!(has_target(
+            "a, wasm32-unknown-unknown",
+            "wasm32-unknown-unknown"
+        ));
+        assert!(!has_target(
+            "wasm32-unknown-unknown-x",
+            "wasm32-unknown-unknown"
+        ));
+        assert!(!has_target(
+            "aarch64-apple-darwin",
+            "wasm32-unknown-unknown"
+        ));
+    }
+
+    #[test]
+    fn the_rust_target_list_needs_the_wasm_target() {
+        let config: toml::Value = toml::from_str(
+            "[tools]\nrust = { version = \"1.0.0\", targets = \"x86_64-apple-darwin\" }",
+        )
+        .unwrap();
+        let mut errors = Vec::new();
+        check_rust_targets(&config, &mut errors);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains(WASM_TARGET), "{errors:?}");
+    }
+
+    #[test]
+    fn a_lock_file_gives_the_version_of_one_package() {
+        let lock = "\
+[[package]]\n\
+name = \"js-sys\"\n\
+version = \"0.3.81\"\n\
+\n\
+[[package]]\n\
+name = \"wasm-bindgen\"\n\
+version = \"0.2.115\"\n";
+        assert_eq!(
+            lock_version(lock, "wasm-bindgen").as_deref(),
+            Some("0.2.115")
+        );
+        assert_eq!(lock_version(lock, "glow"), None);
+    }
+
+    /// The three files that hold the wasm-bindgen version must agree.
+    #[test]
+    fn the_beamterm_pin_holds() {
+        check_beamterm_pin().unwrap();
+    }
+
+    #[test]
+    fn a_vendored_package_outside_the_root_graph_fails() {
+        let root = "[[package]]\nname = \"glow\"\nversion = \"0.17.0\"\n";
+        let vendor = "[[package]]\nname = \"glow\"\nversion = \"0.18.0\"\n";
+        let mut errors = Vec::new();
+        check_lock_containment(root, vendor, &mut errors);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("glow 0.18.0"), "{errors:?}");
+
+        let mut errors = Vec::new();
+        check_lock_containment(root, root, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// The two lock files of this repository must agree today.
+    #[test]
+    fn the_two_lock_files_agree() {
+        let root = repo_root();
+        let mut errors = Vec::new();
+        check_lock_containment(
+            &std::fs::read_to_string(root.join("Cargo.lock")).unwrap(),
+            &std::fs::read_to_string(root.join(crate::wasm::VENDOR_DIR).join("Cargo.lock"))
+                .unwrap(),
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
 }

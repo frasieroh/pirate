@@ -35,6 +35,14 @@ rust = { version = "1.97.1", profile = "minimal", components = "rustfmt,clippy",
 # The license allowlist and the RustSec advisory database. See deny.toml.
 "aqua:EmbarkStudios/cargo-deny" = "0.20.2"
 
+# The wasm optimizer. wasm-pack runs `wasm-opt -O` on the output of
+# wasm-bindgen, and `cargo xtask wasm` runs the same pass. Without it the wasm
+# module grows by about 13 percent, and the paint budget of web/bench fails.
+#
+# The aqua backend takes the prebuilt binary from the GitHub release, so no
+# machine compiles it.
+"aqua:WebAssembly/binaryen" = "131.0.0"
+
 # The wasm binding generator for vendor/beamterm. The github backend takes the
 # prebuilt binary from the GitHub release, so no machine compiles it, and
 # mise.lock holds a SHA-256 for each of the four platforms.

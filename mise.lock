@@ -49,6 +49,10 @@ checksum = "sha256:248da7f581724e470071990c088ffc55c811981715f4cbdb258621fb79f8b
 url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-apple-darwin.tar.gz"
 url_api = "https://api.github.com/repos/EmbarkStudios/cargo-deny/releases/assets/471598357"
 
+[[tools."aqua:WebAssembly/binaryen"]]
+version = "131.0.0"
+backend = "aqua:WebAssembly/binaryen"
+
 [[tools."aqua:rust-cross/cargo-zigbuild"]]
 version = "0.23.0"
 backend = "aqua:rust-cross/cargo-zigbuild"
