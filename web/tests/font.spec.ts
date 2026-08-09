@@ -8,8 +8,10 @@
  */
 
 import { beforeEach, expect, test } from "bun:test";
+import type { Page } from "playwright";
 import {
   clientState,
+  countFits,
   framesWithTag,
   hex,
   idle,
@@ -252,5 +254,203 @@ test("the font size survives a page reload", async () => {
     const state = await clientState(page);
     expect(state.fontSize).toBe(16);
     expect(((await page.textContent("#font-value")) ?? "").trim()).toBe("16");
+  });
+});
+
+/*
+ * The line height control.
+ *
+ * The line height is a multiplier of the cell height of the font metric.
+ * This wave writes no renderer option, so the cell count of the grid holds
+ * and the client sends no resize frame. The debounced pass is therefore the
+ * measurable property, and `countFits` counts it: `src/main.ts` calls
+ * `grid.fit()` one time in each pass.
+ */
+
+/** The text of the line height label. */
+async function lineValue(page: Page): Promise<string> {
+  return ((await page.textContent("#line-height-value")) ?? "").trim();
+}
+
+/** The active element of the page, and whether it sits inside `#terminal`. */
+function focusInTerminal(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const active = document.activeElement;
+    const terminal = document.getElementById("terminal");
+    return active !== null && terminal !== null && terminal.contains(active);
+  });
+}
+
+/** Click one button `count` times, inside one debounce window. */
+function clickMany(page: Page, id: string, count: number): Promise<void> {
+  return page.evaluate(
+    ({ id: name, count: times }: { id: string; count: number }) => {
+      const button = document.getElementById(name) as HTMLButtonElement;
+      for (let i = 0; i < times; i += 1) {
+        button.click();
+      }
+    },
+    { id, count },
+  );
+}
+
+test("the line height starts at 1.0, and the decrease button is disabled there", async () => {
+  await withClient(async (page) => {
+    const state = await clientState(page);
+    expect(state.lineHeight).toBe(1.0);
+    expect(await lineValue(page)).toBe("1.0");
+    expect(await page.getAttribute("#line-height-decrease", "disabled")).not.toBe(null);
+    expect(await page.getAttribute("#line-height-increase", "disabled")).toBe(null);
+  });
+});
+
+test("one line height change asks for exactly one fit, and sends no resize frame", async () => {
+  const stub = server();
+
+  await withClient(async (page) => {
+    const debounce = (await clientState(page)).resizeDebounceMs;
+    await idle(debounce + 400);
+    const before = resizeFrames(stub.received).length;
+    const beforeSize = await size(page);
+
+    // The quiet control. A page that fits on its own would make the count
+    // below true for the wrong reason.
+    expect(await countFits(page, debounce + 400)).toBe(0);
+
+    const counting = countFits(page, debounce + 400);
+    await idle(100);
+    await page.click("#line-height-increase");
+    const fits = await counting;
+
+    const state = await clientState(page);
+    const after = resizeFrames(stub.received).length;
+    const afterSize = await size(page);
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `  line height ${state.lineHeight}: fits ${fits}, ` +
+        `resize frames ${after - before}, grid ${afterSize.cols}x${afterSize.rows}`,
+    );
+
+    expect(fits).toBe(1);
+    expect(state.lineHeight).toBe(1.1);
+    expect(await lineValue(page)).toBe("1.1");
+    // The renderer takes no line height in this wave, so the cell count holds
+    // and the client sends no frame for it.
+    expect(after - before).toBe(0);
+    expect(afterSize).toEqual(beforeSize);
+  });
+});
+
+test("three rapid line height changes ask for exactly one fit", async () => {
+  await withClient(async (page) => {
+    const debounce = (await clientState(page)).resizeDebounceMs;
+    await idle(debounce + 400);
+
+    const counting = countFits(page, debounce + 400);
+    await idle(100);
+    await clickMany(page, "line-height-increase", 3);
+    const fits = await counting;
+
+    const state = await clientState(page);
+    // eslint-disable-next-line no-console
+    console.log(`  three presses: lineHeight ${state.lineHeight}, fits ${fits}`);
+
+    expect(fits).toBe(1);
+    // The step arithmetic holds one decimal. A plain sum of three steps gives
+    // 1.3000000000000003.
+    expect(state.lineHeight).toBe(1.3);
+    expect(await lineValue(page)).toBe("1.3");
+  });
+});
+
+test("each step of the line height holds one decimal, over the whole range", async () => {
+  await withClient(async (page) => {
+    const seen: number[] = [];
+    for (let i = 0; i < 10; i += 1) {
+      await page.click("#line-height-increase");
+      seen.push((await clientState(page)).lineHeight);
+    }
+    // eslint-disable-next-line no-console
+    console.log(`  steps: ${seen.join(" ")}`);
+    expect(seen).toEqual([1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0]);
+  });
+});
+
+test("the line height clamps at 2.0, and the increase button is disabled there", async () => {
+  await withClient(async (page) => {
+    await clickMany(page, "line-height-increase", 20);
+    await waitFor(
+      async () => (await clientState(page)).lineHeight,
+      (value) => value === 2.0,
+      "the line height at the high limit",
+    );
+    expect(await page.getAttribute("#line-height-increase", "disabled")).not.toBe(null);
+    expect(await page.getAttribute("#line-height-decrease", "disabled")).toBe(null);
+    expect(await lineValue(page)).toBe("2.0");
+  });
+});
+
+test("the line height clamps at 1.0, and the decrease button is disabled there", async () => {
+  await withClient(async (page) => {
+    await clickMany(page, "line-height-increase", 5);
+    await waitFor(
+      async () => (await clientState(page)).lineHeight,
+      (value) => value === 1.5,
+      "the line height before the decrease",
+    );
+    await clickMany(page, "line-height-decrease", 20);
+    await waitFor(
+      async () => (await clientState(page)).lineHeight,
+      (value) => value === 1.0,
+      "the line height at the low limit",
+    );
+    expect(await page.getAttribute("#line-height-decrease", "disabled")).not.toBe(null);
+    expect(await lineValue(page)).toBe("1.0");
+  });
+});
+
+test("a line height equal to the current value writes nothing and asks for no fit", async () => {
+  await withClient(async (page) => {
+    const debounce = (await clientState(page)).resizeDebounceMs;
+    await idle(debounce + 400);
+    const cookieBefore = (await page.context().cookies())[0]?.value ?? "";
+
+    // The value is 1.0 and the decrease button is disabled, so each press
+    // reaches no handler. The state, the store, and the fit path all hold.
+    const counting = countFits(page, debounce + 400);
+    await idle(100);
+    await clickMany(page, "line-height-decrease", 5);
+    const fits = await counting;
+
+    expect(fits).toBe(0);
+    expect((await clientState(page)).lineHeight).toBe(1.0);
+    expect((await page.context().cookies())[0]?.value ?? "").toBe(cookieBefore);
+  });
+});
+
+test("a line height button gives the focus back to the terminal", async () => {
+  await withClient(async (page) => {
+    await page.click("#line-height-increase");
+    expect(await focusInTerminal(page)).toBe(true);
+    await page.click("#line-height-decrease");
+    expect(await focusInTerminal(page)).toBe(true);
+  });
+});
+
+test("the line height survives a page reload", async () => {
+  await withClient(async (page) => {
+    await clickMany(page, "line-height-increase", 5);
+    await waitFor(
+      async () => (await clientState(page)).lineHeight,
+      (value) => value === 1.5,
+      "the line height before the reload",
+    );
+
+    await page.reload();
+    await waitForConnected(page);
+
+    expect((await clientState(page)).lineHeight).toBe(1.5);
+    expect(await lineValue(page)).toBe("1.5");
   });
 });

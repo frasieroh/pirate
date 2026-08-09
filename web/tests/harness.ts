@@ -38,7 +38,10 @@ interface PirateGlobal {
           | undefined;
       };
     };
-    renderer: { render(...args: unknown[]): void };
+    renderer: {
+      render(...args: unknown[]): void;
+      fit(...args: unknown[]): unknown;
+    };
   };
   state: {
     connections: number;
@@ -46,6 +49,7 @@ interface PirateGlobal {
     exitStatus: number | null;
     resizeDebounceMs: number;
     fontSize: number;
+    lineHeight: number;
     repeatRate: number;
     repeatDelayMs: number;
     mode: "dark" | "light";
@@ -434,6 +438,34 @@ export async function countRenders(page: Page, ms: number): Promise<number> {
     };
     await new Promise((resolve) => setTimeout(resolve, duration));
     delete (renderer as unknown as Record<string, unknown>).render;
+    return calls;
+  }, ms);
+}
+
+/**
+ * Count the calls to `fit` of the renderer over a quiet period.
+ *
+ * `src/main.ts` calls `grid.fit()` one time in each debounced pass, so this
+ * count is the count of passes. A control that changes the size of a cell
+ * but not the cell count sends no resize frame, and this count is then the
+ * only measurement of the debounce.
+ *
+ * The wrapper is an own property of the renderer, and `delete` removes it.
+ * `fit` of `GridRenderer` is a method of the prototype, so it comes back
+ * after that `delete`. The wrapper returns the result of the original call,
+ * because `applyFit` reads the cols and the rows from it.
+ */
+export async function countFits(page: Page, ms: number): Promise<number> {
+  return page.evaluate(async (duration: number) => {
+    const renderer = (globalThis as unknown as PirateWindow).__pirate.term.renderer;
+    const original = renderer.fit.bind(renderer);
+    let calls = 0;
+    renderer.fit = (...args: unknown[]): unknown => {
+      calls += 1;
+      return original(...args);
+    };
+    await new Promise((resolve) => setTimeout(resolve, duration));
+    delete (renderer as unknown as Record<string, unknown>).fit;
     return calls;
   }, ms);
 }

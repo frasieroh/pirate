@@ -112,3 +112,86 @@ test("if a write to the cookie is still rejected, the menu shows the line", asyn
     expect(await noteText(page)).toContain("cookie");
   });
 });
+
+/*
+ * The line height field of the record.
+ *
+ * The field holds a multiplier of 1.0 to 2.0, on a step of 0.1. A cookie
+ * that carries no value, a faulty value, or a value out of the range must
+ * restore 1.0. Each test writes one cookie, reloads, and reads the state.
+ */
+
+/** Write `record` to the one cookie, reload, and wait for the socket. */
+async function reloadWithRecord(page: Page, record: Record<string, unknown>): Promise<void> {
+  await page.evaluate((text: string) => {
+    document.cookie = `pirate.prefs=${text}; path=/; max-age=31536000; samesite=lax`;
+  }, encodeURIComponent(JSON.stringify(record)));
+  await page.reload();
+  await waitForConnected(page);
+}
+
+/*
+ * `fontSize` 16 is the control of each test below. The default is 14, so a
+ * state that holds 16 proves that the client read this cookie. Without that
+ * control, a `lineHeight` of 1.0 can also come from a cookie that the client
+ * ignored.
+ */
+
+test("a stored line height on the step loads as it is", async () => {
+  await withClient(async (page) => {
+    await reloadWithRecord(page, { fontSize: 16, lineHeight: 1.5 });
+    const state = await clientState(page);
+    expect(state.fontSize).toBe(16);
+    expect(state.lineHeight).toBe(1.5);
+    expect(((await page.textContent("#line-height-value")) ?? "").trim()).toBe("1.5");
+  });
+});
+
+test("a cookie with no line height restores 1.0", async () => {
+  await withClient(async (page) => {
+    await reloadWithRecord(page, { fontSize: 16 });
+    const state = await clientState(page);
+    expect(state.fontSize).toBe(16);
+    expect(state.lineHeight).toBe(1.0);
+  });
+});
+
+test("a faulty line height restores 1.0", async () => {
+  await withClient(async (page) => {
+    for (const faulty of ["1.5", null, {}, Number.NaN]) {
+      await reloadWithRecord(page, { fontSize: 16, lineHeight: faulty });
+      const state = await clientState(page);
+      expect(state.fontSize).toBe(16);
+      expect(state.lineHeight).toBe(1.0);
+    }
+  });
+});
+
+test("a line height out of the range restores 1.0", async () => {
+  await withClient(async (page) => {
+    for (const value of [0.9, 0, -1, 2.1, 5, 1e9]) {
+      await reloadWithRecord(page, { fontSize: 16, lineHeight: value });
+      const state = await clientState(page);
+      expect(state.fontSize).toBe(16);
+      expect(state.lineHeight).toBe(1.0);
+      expect(((await page.textContent("#line-height-value")) ?? "").trim()).toBe("1.0");
+    }
+  });
+});
+
+test("the line height goes to the one cookie, and the menu shows no fault", async () => {
+  await withClient(async (page) => {
+    await page.click("#line-height-increase");
+    await waitFor(
+      () => clientState(page).then((s) => s.lineHeight),
+      (value) => value === 1.1,
+      "the line height after one press",
+    );
+
+    const cookies = await page.context().cookies();
+    expect(cookies.map((cookie) => cookie.name)).toEqual(["pirate.prefs"]);
+    const record = JSON.parse(decodeURIComponent(cookies[0].value)) as { lineHeight: number };
+    expect(record.lineHeight).toBe(1.1);
+    expect(await noteText(page)).toBe("");
+  });
+});

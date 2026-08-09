@@ -1,5 +1,5 @@
 import "./style.css";
-import { installFont } from "./font";
+import { installFont, installLineHeight } from "./font";
 import { attachKeyCorrection, installInput } from "./input";
 import { chords, setAction, startKeys } from "./keys";
 import { requireSession, sessionLost } from "./login";
@@ -82,6 +82,8 @@ interface ClientState {
   resizeDebounceMs: number;
   /** The font size of the terminal, in pixels. */
   fontSize: number;
+  /** The line height, as a multiplier of the cell height of the font metric. */
+  lineHeight: number;
   /** The key repeat rate, in keys per second. */
   repeatRate: number;
   /** The wait before the first repeat, in milliseconds. */
@@ -121,6 +123,7 @@ async function main(): Promise<void> {
     exitStatus: null,
     resizeDebounceMs: RESIZE_DEBOUNCE_MS,
     fontSize: stored.fontSize,
+    lineHeight: stored.lineHeight,
     repeatRate: stored.repeatRate,
     repeatDelayMs: REPEAT_DELAY_MS,
     mode: stored.mode,
@@ -367,6 +370,7 @@ async function main(): Promise<void> {
 
   installTheme(runtime);
   installFont(runtime);
+  installLineHeight(runtime);
   installInput(runtime, selection);
 
   // ── frames ──────────────────────────────────────────────────────────────

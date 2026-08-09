@@ -60,6 +60,12 @@ export interface Prefs {
   light: ThemeRecord;
   /** The font size in pixels, 8 to 32. */
   fontSize: number;
+  /**
+   * The line height, as a multiplier of the cell height of the font metric.
+   *
+   * The range is 1.0 to 2.0. 1.0 gives the cell height of the font metric.
+   */
+  lineHeight: number;
   /** The key repeat rate in keys per second, 2 to 30. */
   repeatRate: number;
   /** The normalized chord of each binding. */
@@ -83,6 +89,12 @@ const COOKIE_LIMIT_BYTES = 3800;
 const FONT_MIN = 8;
 /** The largest font size in pixels. */
 const FONT_MAX = 32;
+/** The smallest line height, as a multiplier. */
+const LINE_MIN = 1.0;
+/** The largest line height, as a multiplier. */
+const LINE_MAX = 2.0;
+/** The quantum of the line height. The stored value is a multiple of it. */
+const LINE_STEP = 0.1;
 /** The smallest repeat rate in keys per second. */
 const RATE_MIN = 2;
 /** The largest repeat rate in keys per second. */
@@ -163,6 +175,7 @@ export function defaultPrefs(): Prefs {
     dark: { ...DARK },
     light: { ...LIGHT },
     fontSize: 14,
+    lineHeight: 1.0,
     repeatRate: 10,
     keys: { ...DEFAULT_KEYS },
     menu: "open",
@@ -215,12 +228,30 @@ function readTheme(value: unknown): ThemeRecord | null {
   return out as unknown as ThemeRecord;
 }
 
-/** `value` when it is a whole number in the range, and `fallback` when not. */
-function readNumber(value: unknown, min: number, max: number, fallback: number): number {
+/**
+ * `value` on the step and in the range, and `fallback` when it is neither.
+ *
+ * `step` is the quantum of the field, and 1 gives a whole number. The result
+ * is the nearest multiple of the step. A field with a fractional step needs
+ * this argument: `fontSize` holds 14 with the default step, and `lineHeight`
+ * holds 1.5 with a step of 0.1. A round to a whole number would store 2.0
+ * there, and the stored value would not survive one reload.
+ *
+ * `toPrecision` removes the error of the binary float that the division and
+ * the multiplication leave. 1.3 then stays 1.3 and does not become
+ * 1.3000000000000003.
+ */
+function readNumber(
+  value: unknown,
+  min: number,
+  max: number,
+  fallback: number,
+  step = 1,
+): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return fallback;
   }
-  const rounded = Math.round(value);
+  const rounded = Number((Math.round(value / step) * step).toPrecision(12));
   if (rounded < min || rounded > max) {
     return fallback;
   }
@@ -267,6 +298,7 @@ function validate(value: unknown): Prefs {
     dark: readTheme(source.dark) ?? base.dark,
     light: readTheme(source.light) ?? base.light,
     fontSize: readNumber(source.fontSize, FONT_MIN, FONT_MAX, base.fontSize),
+    lineHeight: readNumber(source.lineHeight, LINE_MIN, LINE_MAX, base.lineHeight, LINE_STEP),
     repeatRate: readNumber(source.repeatRate, RATE_MIN, RATE_MAX, base.repeatRate),
     keys: readKeys(source.keys),
     menu:

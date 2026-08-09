@@ -12,6 +12,8 @@ import type { PirateTerminal } from "./terminal";
 /** The mutable values that the browser tests read on `__pirate.state`. */
 export interface RuntimeState {
   fontSize: number;
+  /** The line height, as a multiplier of the cell height of the font metric. */
+  lineHeight: number;
   repeatRate: number;
   repeatDelayMs: number;
   mode: Mode;

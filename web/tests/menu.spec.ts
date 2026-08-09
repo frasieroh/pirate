@@ -119,7 +119,7 @@ test("every row sits under the heading that governs it", async () => {
 
     expect(groups).toEqual([
       { heading: "theme", rows: ["mode", "import"] },
-      { heading: "terminal", rows: ["font size", "key repeat rate"] },
+      { heading: "terminal", rows: ["font size", "line height", "key repeat rate"] },
       {
         heading: "keys",
         rows: ["show or hide the menu", "increase the font size", "decrease the font size"],
