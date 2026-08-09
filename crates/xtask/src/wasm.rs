@@ -9,9 +9,9 @@
 //!
 //! pirate does not use wasm-pack. wasm-pack downloads `wasm-bindgen` and
 //! `wasm-opt` at build time, and no file of this repository pins those two
-//! downloads. mise pins both binaries instead, and `cargo xtask verify-pins`
-//! compares the `wasm-bindgen` pin against `vendor/beamterm/Cargo.lock`. The
-//! pass order matches wasm-pack: cargo, then wasm-bindgen, then wasm-opt.
+//! downloads. mise pins the `wasm-bindgen` binary instead, and
+//! `cargo xtask verify-pins` compares that pin against
+//! `vendor/beamterm/Cargo.lock`.
 
 use crate::{repo_root, run_with_env, Result};
 use std::path::{Path, PathBuf};
@@ -40,12 +40,6 @@ const BINDGEN_TARGETS: &[&str] = &["bundler", "web"];
 /// The name that wasm-bindgen gives to every generated file.
 const OUT_NAME: &str = "beamterm_renderer";
 
-/// The optimizer pass of wasm-opt.
-///
-/// wasm-pack runs `wasm-opt -O` on a release build. Without the pass the module
-/// grows by about 13 percent, and the paint budget of `web/bench` fails.
-const OPT_LEVEL: &str = "-O";
-
 /// The generated package directory, relative to `VENDOR_DIR`.
 pub const PKG_DIR: &str = "pkg";
 
@@ -62,8 +56,8 @@ pub fn pkg_root() -> PathBuf {
 /// Compile the vendored renderer and write the local npm package.
 ///
 /// CAUTION: Run this command with the build environment of mise. mise puts the
-/// pinned `wasm-bindgen` and the pinned `wasm-opt` on PATH. A `wasm-bindgen`
-/// from the machine writes bindings that do not match the wasm module.
+/// pinned `wasm-bindgen` on PATH. A `wasm-bindgen` from the machine writes
+/// bindings that do not match the wasm module.
 pub fn build(env: &[(String, String)]) -> Result<()> {
     let vendor = vendor_root();
     if !vendor.join("Cargo.toml").is_file() {
@@ -129,23 +123,6 @@ pub fn build(env: &[(String, String)]) -> Result<()> {
                 return Err(format!("wasm-bindgen wrote no {}", file.display()).into());
             }
         }
-
-        // wasm-opt writes no file in place, so the output goes to a new name and
-        // then replaces the input.
-        let module = out_dir.join(format!("{OUT_NAME}_bg.wasm"));
-        let optimized = out_dir.join(format!("{OUT_NAME}_bg.opt.wasm"));
-        run_with_env(
-            "wasm-opt",
-            &[
-                OPT_LEVEL,
-                &module.to_string_lossy(),
-                "--output",
-                &optimized.to_string_lossy(),
-            ],
-            &vendor,
-            env,
-        )?;
-        std::fs::rename(&optimized, &module)?;
     }
 
     write_package_json(&pkg, &read_version(&vendor)?)?;

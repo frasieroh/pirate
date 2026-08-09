@@ -68,9 +68,8 @@ mise exec -- cargo xtask dist
 `cargo xtask wasm` builds this source for `wasm32-unknown-unknown` and writes the local npm
 package into `vendor/beamterm/pkg`.
 
-CAUTION: Run `cargo xtask wasm` under mise. mise puts the pinned `wasm-bindgen` and the
-pinned `wasm-opt` on PATH. A `wasm-bindgen` from your machine writes bindings that do not
-match the wasm module.
+CAUTION: Run `cargo xtask wasm` under mise. mise puts the pinned `wasm-bindgen` on PATH. A
+`wasm-bindgen` from your machine writes bindings that do not match the wasm module.
 
 The source comes from `https://github.com/junkdog/beamterm`, tag `beamterm-v1.0.0`, at commit
 `fd8066e840ebf4d7ad26dbfcc0ac5f4b7b34b7e3`. `vendor/beamterm/UPSTREAM.toml` records this pin.
@@ -79,8 +78,11 @@ The source comes from `https://github.com/junkdog/beamterm`, tag `beamterm-v1.0.
 longer comes from the npm registry.
 
 pirate does not use `wasm-pack`. wasm-pack downloads `wasm-bindgen` and `wasm-opt` at build
-time, and no file of this repository pins those two downloads. mise pins both binaries
+time, and no file of this repository pins those two downloads. mise pins `wasm-bindgen`
 instead.
+
+The build runs no `wasm-opt` pass. The local module is 1.58 MB, against 1.39 MB for the
+module of the npm package.
 
 ## A plain `cargo build`
 
@@ -97,7 +99,7 @@ so activate mise in your shell, or write `mise exec -- cargo build`.
 
 | Input | File |
 |---|---|
-| zig, bun, rust, cargo-zigbuild, cargo-deny, wasm-bindgen, binaryen | `mise.toml` |
+| zig, bun, rust, cargo-zigbuild, cargo-deny, wasm-bindgen | `mise.toml` |
 | The SHA-256 of every tool download, per platform | `mise.lock` |
 | The Ghostty commit | `toolchain/ghostty.toml` |
 | The beamterm commit and the wasm-bindgen version of the vendored tree | `vendor/beamterm/UPSTREAM.toml` |
