@@ -160,6 +160,13 @@ jobs:
           key: node-modules-Linux-${{ hashFiles('web/bun.lock') }}
           restore-keys: node-modules-Linux-
 
+      # web/package.json resolves `@beamterm/renderer` to vendor/beamterm/pkg,
+      # and that directory holds build output. `bun install` fails without it.
+      # The other three jobs run `cargo xtask build`, which builds the same
+      # package before it runs bun.
+      - name: Build the wasm package
+        run: cargo xtask wasm
+
       - name: Install the dependencies
         working-directory: web
         run: bun install --frozen-lockfile

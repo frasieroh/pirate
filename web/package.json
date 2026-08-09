@@ -1,6 +1,6 @@
 {
   "dependencies": {
-    "@beamterm/renderer": "1.0.0",
+    "@beamterm/renderer": "file:../vendor/beamterm/pkg",
     "ghostty-web": "0.4.0"
   },
   "devDependencies": {

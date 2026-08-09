@@ -11,3 +11,19 @@ publish = false
 toml = "=0.9.8"
 serde_json = "=1.0.151"
 sha2 = "=0.10.9"
+
+# The vendored beamterm renderer, in the crate graph of the root workspace.
+#
+# cargo-deny and cargo-about read one workspace. vendor/beamterm is a workspace
+# of its own, so `cargo deny check` at the repository root would see none of its
+# dependencies. This entry puts them in the graph. deny.toml and about.toml list
+# wasm32-unknown-unknown, so both tools read this branch.
+#
+# CAUTION: Keep the `cfg` predicate. No host build matches it, so no host
+# command compiles these crates, and the build time of xtask does not change.
+# The predicate is the only thing that keeps the wasm-only crates out of
+# `cargo clippy --workspace --all-targets`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+beamterm-renderer = { path = "../../vendor/beamterm/beamterm-renderer", features = [
+    "js-api",
+] }

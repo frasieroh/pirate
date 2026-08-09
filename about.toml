@@ -20,8 +20,13 @@ accepted = [
     "Zlib",
 ]
 
-# The same six targets that the release builds. A dependency can be
-# platform-specific, so one target hides the licenses of the others.
+# The six targets that the release builds, and the target of the wasm module.
+# A dependency can be platform-specific, so one target hides the licenses of the
+# others.
+#
+# CAUTION: Keep wasm32-unknown-unknown in this list, for the same reason as in
+# deny.toml. It is the one path from this workspace into the crates of
+# vendor/beamterm.
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -29,6 +34,7 @@ targets = [
     "aarch64-unknown-linux-gnu",
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
+    "wasm32-unknown-unknown",
 ]
 
 # A build dependency and a dev dependency do not put code in the binary.

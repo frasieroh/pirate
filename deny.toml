@@ -7,12 +7,19 @@
 #   cargo deny check
 #
 # pirate is MIT. Ghostty is MIT. libghostty-vt-sys is MIT. ghostty-web is MIT.
-# The binary contains ghostty-web code, so the repository also ships
-# THIRD-PARTY-LICENSES.md. cargo-about writes that file.
+# beamterm is MIT, and vendor/beamterm holds its source. The binary contains
+# ghostty-web code and the wasm module of beamterm, so the repository also
+# ships THIRD-PARTY-LICENSES.md. cargo-about writes that file.
 
 [graph]
 # Check every target that the release builds. A dependency can be
 # platform-specific, so one target list hides the licenses of the others.
+#
+# CAUTION: Keep wasm32-unknown-unknown in this list. crates/xtask declares the
+# vendored beamterm renderer under `cfg(target_arch = "wasm32")`, and that is
+# the one path from this workspace into the crates of vendor/beamterm. Without
+# the target here, cargo-deny drops that branch, and the wasm dependencies
+# reach no check.
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -20,6 +27,7 @@ targets = [
     "aarch64-unknown-linux-gnu",
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
+    "wasm32-unknown-unknown",
 ]
 all-features = false
 
