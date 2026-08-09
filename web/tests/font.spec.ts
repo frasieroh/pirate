@@ -313,8 +313,8 @@ test("one line height change asks for exactly one fit, and sends no resize frame
     const before = resizeFrames(stub.received).length;
     const beforeSize = await size(page);
 
-    // The quiet control. A page that fits on its own would make the count
-    // below true for the wrong reason.
+    // The quiet control. A page that fits on its own makes the next count
+    // true for the wrong reason.
     expect(await countFits(page, debounce + 400)).toBe(0);
 
     const counting = countFits(page, debounce + 400);

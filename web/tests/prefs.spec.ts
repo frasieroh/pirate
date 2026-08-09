@@ -195,3 +195,39 @@ test("the line height goes to the one cookie, and the menu shows no fault", asyn
     expect(await noteText(page)).toBe("");
   });
 });
+
+/*
+ * The whole-number fields, against the step argument of `readNumber`.
+ *
+ * `fontSize` and `repeatRate` call `readNumber` with four arguments, so both
+ * take the default step of 1. This test pins the rounding of both fields at
+ * the half, at the two limits, and outside the range. It passes at the
+ * parent commit and at this commit, because the step argument changes the
+ * behavior of neither caller.
+ */
+test("the font size and the repeat rate keep their whole-number rounding", async () => {
+  const cases: { stored: Record<string, number>; fontSize: number; repeatRate: number }[] = [
+    // A half rounds up.
+    { stored: { fontSize: 15.5, repeatRate: 11.5 }, fontSize: 16, repeatRate: 12 },
+    // Less than a half rounds down.
+    { stored: { fontSize: 15.4, repeatRate: 11.4 }, fontSize: 15, repeatRate: 11 },
+    // A value under the low limit rounds into the range.
+    { stored: { fontSize: 7.6, repeatRate: 1.6 }, fontSize: 8, repeatRate: 2 },
+    // A value over the high limit rounds into the range.
+    { stored: { fontSize: 32.4, repeatRate: 30.4 }, fontSize: 32, repeatRate: 30 },
+    // A rounded value outside the range takes the default: 14 and 10.
+    { stored: { fontSize: 32.6, repeatRate: 30.6 }, fontSize: 14, repeatRate: 10 },
+    { stored: { fontSize: 7.4, repeatRate: 1.4 }, fontSize: 14, repeatRate: 10 },
+  ];
+
+  await withClient(async (page) => {
+    for (const item of cases) {
+      await reloadWithRecord(page, item.stored);
+      const state = await clientState(page);
+      expect({ fontSize: state.fontSize, repeatRate: state.repeatRate }).toEqual({
+        fontSize: item.fontSize,
+        repeatRate: item.repeatRate,
+      });
+    }
+  });
+});

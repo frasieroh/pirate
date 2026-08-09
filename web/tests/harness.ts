@@ -451,9 +451,9 @@ export async function countRenders(page: Page, ms: number): Promise<number> {
  * only measurement of the debounce.
  *
  * The wrapper is an own property of the renderer, and `delete` removes it.
- * `fit` of `GridRenderer` is a method of the prototype, so it comes back
- * after that `delete`. The wrapper returns the result of the original call,
- * because `applyFit` reads the cols and the rows from it.
+ * `fit` of `GridRenderer` is a method of the prototype, so that `delete`
+ * makes the prototype method active again. The wrapper gives the result of
+ * the original call, because `applyFit` reads the cols and the rows from it.
  */
 export async function countFits(page: Page, ms: number): Promise<number> {
   return page.evaluate(async (duration: number) => {

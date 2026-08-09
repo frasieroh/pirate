@@ -234,8 +234,8 @@ function readTheme(value: unknown): ThemeRecord | null {
  * `step` is the quantum of the field, and 1 gives a whole number. The result
  * is the nearest multiple of the step. A field with a fractional step needs
  * this argument: `fontSize` holds 14 with the default step, and `lineHeight`
- * holds 1.5 with a step of 0.1. A round to a whole number would store 2.0
- * there, and the stored value would not survive one reload.
+ * holds 1.5 with a step of 0.1. A round to a whole number stores 2.0 there,
+ * and that value does not survive one reload.
  *
  * `toPrecision` removes the error of the binary float that the division and
  * the multiplication leave. 1.3 then stays 1.3 and does not become
