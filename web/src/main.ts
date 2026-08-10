@@ -117,13 +117,35 @@ async function main(): Promise<void> {
 
   const container = document.getElementById("terminal")!;
 
+  /**
+   * The line height of the moment, behind the accessor pair of `state`.
+   *
+   * `src/font.ts` writes `state.lineHeight` and calls no renderer method, so
+   * the setter below carries the value to the renderer. The font size takes
+   * another path: it goes through `term.options.fontSize` of
+   * `src/terminal.ts`, which the facade owns.
+   */
+  let lineHeight = stored.lineHeight;
+
   const state: ClientState = {
     connections: 0,
     connected: false,
     exitStatus: null,
     resizeDebounceMs: RESIZE_DEBOUNCE_MS,
     fontSize: stored.fontSize,
-    lineHeight: stored.lineHeight,
+    // A write reaches the renderer at once. The record keeps the value, so a
+    // reader gets back what it wrote. A write of the value that the record
+    // already holds rasterizes no atlas.
+    get lineHeight() {
+      return lineHeight;
+    },
+    set lineHeight(next: number) {
+      if (next === lineHeight) {
+        return;
+      }
+      lineHeight = next;
+      grid.setLineHeight(next);
+    },
     repeatRate: stored.repeatRate,
     repeatDelayMs: REPEAT_DELAY_MS,
     mode: stored.mode,
@@ -175,6 +197,7 @@ async function main(): Promise<void> {
   const vt = await loadVt();
   const grid = await GridRenderer.create(container, {
     fontSize: stored.fontSize,
+    lineHeight: stored.lineHeight,
     theme: stored[stored.mode],
   });
   const firstFit = grid.fit();

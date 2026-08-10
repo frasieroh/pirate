@@ -103,7 +103,7 @@ export class GridRenderer {
    */
   static async create(
     container: HTMLElement,
-    options: { fontSize: number; theme: Theme },
+    options: { fontSize: number; lineHeight?: number; theme: Theme },
   ): Promise<GridRenderer> {
     await loadWasm();
 
@@ -135,15 +135,18 @@ export class GridRenderer {
     // only for a frame that paints, for the reason that `draw` states.
     canvas.getContext("webgl2", { preserveDrawingBuffer: true });
 
-    // `auto_resize_canvas_css` is false, so this module owns the CSS size of
-    // the canvas. With true, `resize` writes the pixel count of the backing
-    // store into the CSS size, and the canvas then covers `devicePixelRatio`
-    // times the intended box.
+    // The fourth argument is the line height multiplier. An absent value asks
+    // the atlas for its own default, which is 1.0.
+    //
+    // `auto_resize_canvas_css` is the fifth argument, and it is false, so this
+    // module owns the CSS size of the canvas. With true, `resize` writes the
+    // pixel count of the backing store into the CSS size, and the canvas then
+    // covers `devicePixelRatio` times the intended box.
     const beam = BeamtermRenderer.withDynamicAtlas(
       `#${canvas.id}`,
       FONT_FAMILIES,
       options.fontSize,
-      null,
+      options.lineHeight,
       false,
     );
 
@@ -158,6 +161,13 @@ export class GridRenderer {
   private readonly beam: BeamtermRenderer;
   private palette: Palette;
   private fontSize: number;
+  /**
+   * The line height, as a multiplier of the cell height of the font metric.
+   *
+   * `undefined` gives the default of the atlas. The atlas clamps the value to
+   * the range 1.0 to 2.0.
+   */
+  private lineHeight: number | undefined;
   private gridCols = 1;
   private gridRows = 1;
   private ratio = deviceRatio();
@@ -172,12 +182,13 @@ export class GridRenderer {
     container: HTMLElement,
     canvas: HTMLCanvasElement,
     beam: BeamtermRenderer,
-    options: { fontSize: number; theme: Theme },
+    options: { fontSize: number; lineHeight?: number; theme: Theme },
   ) {
     this.container = container;
     this.canvas = canvas;
     this.beam = beam;
     this.fontSize = options.fontSize;
+    this.lineHeight = options.lineHeight;
     this.palette = new Palette(options.theme);
   }
 
@@ -261,6 +272,9 @@ export class GridRenderer {
    * is `devicePixelRatio` times the CSS size. Measurement: at a device pixel
    * ratio of 1 the static atlas reports 10 by 18, and at a ratio of 2 it
    * reports 20 by 36 for the same grid of 40 columns.
+   *
+   * The height carries the line height multiplier, because the atlas builds
+   * the cell with it. `fit` therefore gives fewer rows at a larger multiplier.
    */
   cellSize(): { width: number; height: number } {
     const size = this.beam.cellSize();
@@ -304,6 +318,28 @@ export class GridRenderer {
       return;
     }
     this.fontSize = px;
+    this.rasterize();
+  }
+
+  /**
+   * Set the line height, as a multiplier of the cell height of the font
+   * metric.
+   *
+   * This call takes the path of `setFontSize`: the atlas rasterizes again, and
+   * the canvas takes the size of the grid at the new cell. The grid keeps its
+   * column count and its row count, so the caller reads `fit` after this call
+   * and resizes the grid.
+   *
+   * The multiplier changes the height of a cell and not its width. The atlas
+   * clamps it to the range 1.0 to 2.0. Measurement, in Chromium with
+   * `--enable-unsafe-swiftshader`, at a device pixel ratio of 1 and a font size
+   * of 16: 1.0 gives a cell of 10 by 17 device pixels, and 2.0 gives 10 by 34.
+   */
+  setLineHeight(multiplier: number): void {
+    if (this.disposed) {
+      return;
+    }
+    this.lineHeight = multiplier;
     this.rasterize();
   }
 
@@ -465,11 +501,15 @@ export class GridRenderer {
    *
    * The atlas rasterizes at the device pixel ratio of the moment. It does not
    * rasterize again on its own, so a change of the ratio needs this call.
-   * Measurement: at a ratio of 1 a font size of 16 gives a cell of 11 by 17
+   * Measurement: at a ratio of 1 a font size of 16 gives a cell of 10 by 17
    * device pixels, and at a ratio of 2 the same font size gives 21 by 33.
+   *
+   * The call carries the line height, because the atlas holds no multiplier
+   * between two atlases. Without it, a change of the font size or of the ratio
+   * would take the cell back to the height of the font metric.
    */
   private rasterize(): void {
-    this.beam.replaceWithDynamicAtlas(FONT_FAMILIES, this.fontSize);
+    this.beam.replaceWithDynamicAtlas(FONT_FAMILIES, this.fontSize, this.lineHeight);
     this.applyGrid();
   }
 

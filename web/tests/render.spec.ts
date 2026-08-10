@@ -79,7 +79,13 @@ interface Sample {
 
 /** The page-side API that `install` puts on `globalThis`. */
 interface GridApi {
-  make(options: { cols: number; rows: number; fontSize: number; theme: unknown }): void;
+  make(options: {
+    cols: number;
+    rows: number;
+    fontSize: number;
+    lineHeight?: number;
+    theme: unknown;
+  }): void;
   write(data: string): void;
   draw(): void;
   drawAndSample(samples: Sample[]): number[];
@@ -191,6 +197,7 @@ async function install(where: Page): Promise<void> {
         cols: number;
         rows: number;
         fontSize: number;
+        lineHeight?: number;
         theme: unknown;
       }): Promise<void> => {
         box.reset();
@@ -200,8 +207,11 @@ async function install(where: Page): Promise<void> {
           "position:absolute;left:0;top:0;width:600px;height:400px;overflow:hidden";
         document.body.append(container);
         box.container = container;
+        // `lineHeight` stays absent when the caller gives none. The module
+        // then takes the default of the atlas, which is 1.0.
         box.grid = await mod.GridRenderer.create(container, {
           fontSize: options.fontSize,
+          ...(options.lineHeight === undefined ? {} : { lineHeight: options.lineHeight }),
           theme: options.theme,
         });
         box.canvas = container.querySelector("canvas");
@@ -348,10 +358,16 @@ async function install(where: Page): Promise<void> {
 async function make(
   cols: number,
   rows: number,
-  options?: { fontSize?: number; theme?: unknown },
+  options?: { fontSize?: number; lineHeight?: number; theme?: unknown },
 ): Promise<void> {
   await page.evaluate(
-    async (args: { cols: number; rows: number; fontSize: number; theme: unknown }) => {
+    async (args: {
+      cols: number;
+      rows: number;
+      fontSize: number;
+      lineHeight?: number;
+      theme: unknown;
+    }) => {
       await (
         globalThis as unknown as { __grid: { make(o: unknown): Promise<void> } }
       ).__grid.make(args);
@@ -360,6 +376,7 @@ async function make(
       cols,
       rows,
       fontSize: options?.fontSize ?? 16,
+      lineHeight: options?.lineHeight,
       theme: options?.theme ?? THEME,
     },
   );
@@ -1056,6 +1073,105 @@ describe("the fit", () => {
 });
 
 // ============================================================================
+// The line height
+// ============================================================================
+
+/**
+ * Build a grid at `lineHeight`, write one word, and report the measurement.
+ *
+ * `lineHeight` of undefined gives no line height to `create`. The module then
+ * takes the default of the atlas, which is 1.0.
+ *
+ * The baseline of criterion 15 is the shipped client. That client called
+ * `withDynamicAtlas` with four arguments, and the fourth argument was
+ * `auto_resize_canvas_css`. The atlas took its own line height, and that is
+ * the default here. The parent commit is not the baseline: it still gives
+ * `false` in the fourth place, which now holds the line height, so the atlas
+ * gets 0.0 and clamps it to 1.0, and `auto_resize_canvas_css` falls back to
+ * true.
+ *
+ * The signature is the hash of every pixel of the cell at column 0, row 0. The
+ * word is the same in each call, so a difference of the signature is a
+ * difference of the paint.
+ */
+async function lineHeightProbe(lineHeight?: number): Promise<{
+  cellWidth: number;
+  cellHeight: number;
+  canvasWidth: number;
+  canvasHeight: number;
+  cssWidth: string;
+  cssHeight: string;
+  fitCols: number;
+  fitRows: number;
+  signature: number;
+}> {
+  await make(20, 6, { fontSize: 16, lineHeight });
+  const s = await state();
+  const signature = await page.evaluate(() => {
+    const grid = (globalThis as unknown as { __grid: GridApi }).__grid;
+    grid.write("pirate");
+    return grid.cellSignature(0, 0);
+  });
+  return {
+    cellWidth: s.cellWidth,
+    cellHeight: s.cellHeight,
+    canvasWidth: s.canvasWidth,
+    canvasHeight: s.canvasHeight,
+    cssWidth: s.cssWidth,
+    cssHeight: s.cssHeight,
+    fitCols: s.fitCols,
+    fitRows: s.fitRows,
+    signature,
+  };
+}
+
+describe("the line height", () => {
+  test("a line height of 1.0 gives the cell and the pixels of the default", async () => {
+    const base = await lineHeightProbe();
+    const one = await lineHeightProbe(1.0);
+    const two = await lineHeightProbe(2.0);
+
+    expect(one).toEqual(base);
+    // The multiplier reaches the atlas. Without this check, a `create` that
+    // dropped the argument would still pass the equality above.
+    expect(two.cellHeight).toBeGreaterThan(base.cellHeight);
+    expect(two.signature).not.toBe(base.signature);
+  });
+
+  test("setLineHeight makes the cell taller and gives fewer rows", async () => {
+    await make(20, 6, { fontSize: 16, lineHeight: 1.0 });
+    const before = await state();
+    await page.evaluate(() => {
+      (globalThis as unknown as { __grid: GridApi }).__grid.call("setLineHeight", [2.0]);
+    });
+    const after = await state();
+
+    expect(after.cellHeight).toBeGreaterThan(before.cellHeight);
+    expect(after.fitRows).toBeLessThan(before.fitRows);
+    // The multiplier changes the height of a cell and not its width.
+    expect(after.cellWidth).toBe(before.cellWidth);
+    expect(after.fitCols).toBe(before.fitCols);
+    // The grid keeps its column count and its row count, so the canvas grows.
+    expect(after.cols).toBe(before.cols);
+    expect(after.rows).toBe(before.rows);
+    expect(after.canvasHeight).toBeGreaterThan(before.canvasHeight);
+    expect(after.cssHeight).toBe(`${after.rows * after.cellHeight}px`);
+  });
+
+  test("setFontSize keeps the line height of the atlas", async () => {
+    await make(20, 6, { fontSize: 16, lineHeight: 2.0 });
+    const tall = await state();
+    await page.evaluate(() => {
+      const grid = (globalThis as unknown as { __grid: GridApi }).__grid;
+      grid.call("setFontSize", [24]);
+      grid.call("setFontSize", [16]);
+    });
+    const after = await state();
+    expect(after.cellHeight).toBe(tall.cellHeight);
+  });
+});
+
+// ============================================================================
 // The theme
 // ============================================================================
 
@@ -1258,5 +1374,110 @@ describe("the source", () => {
     const code = text.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
     const banned = ["loadAddon", "proposeDimensions", "FitAddon", "buffer"];
     expect(banned.filter((name) => code.includes(name))).toEqual([]);
+  });
+});
+
+// ============================================================================
+// The client
+// ============================================================================
+
+/** The measurement of the renderer of the client. */
+interface ClientProbe {
+  lineHeight: number;
+  cellWidth: number;
+  cellHeight: number;
+  canvasWidth: number;
+  canvasHeight: number;
+  fitRows: number;
+  signature: number;
+}
+
+/** The shape that `src/main.ts` exposes, for the members that this file reads. */
+interface PirateGrid {
+  state: { lineHeight: number };
+  term: {
+    write(data: string): void;
+    renderer: {
+      cellSize(): { width: number; height: number };
+      fit(): { cols: number; rows: number };
+    };
+  };
+}
+
+describe("the client", () => {
+  /**
+   * Read the cell, the canvas, and the pixels of the client.
+   *
+   * The read clears the screen and writes one word at the home position, so
+   * the hash covers glyph pixels and not the background alone. The word is the
+   * same in each call. Measurement: the hash of the empty screen and the hash
+   * of this screen differ at one canvas size, so a change of the paint reaches
+   * the hash.
+   *
+   * The read waits for two animation frames, so the frame loop of the facade
+   * paints the canvas at its new size before the hash. The context of the
+   * renderer holds `preserveDrawingBuffer`, so a read outside the paint task
+   * gives the pixels of the last frame.
+   */
+  async function probe(client: Page): Promise<ClientProbe> {
+    return client.evaluate(async () => {
+      const pirate = (globalThis as unknown as { __pirate: PirateGrid }).__pirate;
+      pirate.term.write("\u001b[2J\u001b[Hpirate");
+      await new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)));
+      const canvas = document.querySelector("#terminal canvas") as HTMLCanvasElement;
+      const gl = canvas.getContext("webgl2") as WebGL2RenderingContext;
+      const data = new Uint8Array(canvas.width * canvas.height * 4);
+      gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, data);
+      let hash = 2166136261;
+      for (let i = 0; i < data.length; i += 1) {
+        hash = Math.imul(hash ^ data[i], 16777619);
+      }
+      const cell = pirate.term.renderer.cellSize();
+      return {
+        lineHeight: pirate.state.lineHeight,
+        cellWidth: cell.width,
+        cellHeight: cell.height,
+        canvasWidth: canvas.width,
+        canvasHeight: canvas.height,
+        fitRows: pirate.term.renderer.fit().rows,
+        signature: hash >>> 0,
+      };
+    });
+  }
+
+  /** Write the line height on the state record of the client. */
+  async function set(client: Page, value: number): Promise<void> {
+    await client.evaluate((next: number) => {
+      (globalThis as unknown as { __pirate: PirateGrid }).__pirate.state.lineHeight = next;
+    }, value);
+  }
+
+  test("a write of state.lineHeight reaches the renderer, and 1.0 comes back", async () => {
+    // Criteria 14 and 15. `src/font.ts` writes `state.lineHeight` and calls no
+    // renderer method, so this write takes the path of the menu control.
+    const client = await openClient({ waitForConnection: false });
+    try {
+      await client.waitForFunction(
+        () => (globalThis as unknown as { __pirate?: unknown }).__pirate !== undefined,
+      );
+      const first = await probe(client);
+      // The store holds 1.0 by default, and `main.ts` gives that value to
+      // `create`. This measurement is the appearance of the client today.
+      expect(first.lineHeight).toBe(1);
+
+      await set(client, 2);
+      const tall = await probe(client);
+      expect(tall.lineHeight).toBe(2);
+      expect(tall.cellHeight).toBeGreaterThan(first.cellHeight);
+      expect(tall.fitRows).toBeLessThan(first.fitRows);
+      expect(tall.cellWidth).toBe(first.cellWidth);
+
+      // A line height of 1.0 reproduces the cell, the canvas, and every pixel.
+      await set(client, 1);
+      const back = await probe(client);
+      expect(back).toEqual(first);
+    } finally {
+      await client.context().close();
+    }
   });
 });
