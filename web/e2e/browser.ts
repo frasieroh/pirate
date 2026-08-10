@@ -23,6 +23,7 @@ import {
   type Browser,
   type BrowserContext,
   type ConsoleMessage,
+  type LaunchOptions,
   type Page,
 } from "playwright";
 import type { Pirate } from "./server";
@@ -91,12 +92,46 @@ const POLL_MS = 25;
  */
 const WEBGL_ARGS = ["--enable-unsafe-swiftshader"];
 
+/**
+ * The environment variable that selects the real GPU of the machine.
+ *
+ * With the variable unset, the launch options hold `WEBGL_ARGS` and nothing
+ * else, and the browser is headless. That is the path of CI.
+ *
+ * With `PIRATE_GPU` set to a value, the browser starts headed and without
+ * `WEBGL_ARGS`. A headed Chromium takes the hardware graphics stack of the
+ * machine. Headless Chromium reaches no GPU, so `WEBGL_ARGS` is the only way
+ * to a WebGL2 context there.
+ *
+ * This path is for local measurement. It needs a window server, and the window
+ * of the browser opens on the desktop of the operator.
+ *
+ * `web/tests/harness.ts` and `web/bench/whole-path.ts` hold a copy of this
+ * switch, under the same name.
+ */
+const GPU_ENV = "PIRATE_GPU";
+
+/** The launch options of the browser. `PIRATE_GPU` selects the GPU path. */
+function launchOptions(): LaunchOptions {
+  if (!process.env[GPU_ENV]) {
+    return { args: WEBGL_ARGS };
+  }
+  // `ignoreDefaultArgs` removes the copy of the flag that Playwright adds on
+  // macOS. Without that removal, a machine with no usable GPU falls back to
+  // SwiftShader and the run reports software numbers as GPU numbers.
+  return {
+    args: [],
+    headless: false,
+    ignoreDefaultArgs: WEBGL_ARGS,
+  };
+}
+
 let browser: Browser | undefined;
 
 /** The one browser of this file. It launches on the first call. */
 async function getBrowser(): Promise<Browser> {
   if (browser === undefined) {
-    browser = await chromium.launch({ args: WEBGL_ARGS });
+    browser = await chromium.launch(launchOptions());
   }
   return browser;
 }

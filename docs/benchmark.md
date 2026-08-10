@@ -35,6 +35,24 @@ Every time in this file is a median over 5 runs at least. A `p95` column is the
 value at the nearest rank of the same samples. Both columns are here where the
 spread governs a verdict.
 
+## The rasterizer
+
+The default browser harness runs Chromium with a software rasterizer, the flag
+`--enable-unsafe-swiftshader`. This is the default path, and it is headless.
+
+The switch to a real GPU lives in `web/tests/harness.ts`, `web/e2e/browser.ts`
+and `web/bench/whole-path.ts`. Set `PIRATE_GPU=1` to select the real GPU, and
+run headed. Leave it unset for the default path. The default launch arguments
+stay the same, byte for byte, so CI does not move.
+
+```text
+cd web && PIRATE_E2E=1 PIRATE_GPU=1 bun test ./bench/whole-path.e2e.ts --timeout 600000
+```
+
+Every table in this file that came from the browser holds a software number,
+not a GPU number, unless the table says GPU. Each browser table carries the
+label **Software** or **GPU**, so a reader never has to guess.
+
 ## The toolchain
 
 Run `cargo xtask build` first. That command installs the tools of `mise.toml`,
@@ -127,6 +145,9 @@ last column names the source of each cell.
 | the stage that holds the time | 1045 to 1055 ms, the gap between two server frames | 105 ms debounce, plus 47 to 58 ms in one browser task | `whole-path.e2e.ts` |
 | TOTAL | 1013 to 1065 ms | 159 to 175 ms | `whole-path.e2e.ts` |
 
+**Software.** The `whole-path.e2e.ts` cells came from the default rasterizer.
+The `bench_symptoms` cells hold no browser and no rasterizer.
+
 CAUTION: the two `TOTAL` cells are ranges of the median across three
 independent runs of this track. They are not settled numbers. Read the shape,
 which is one stage that holds almost the whole event.
@@ -158,6 +179,8 @@ Real browser, real pirate server, real child. 7 runs per row.
 | `pager`, `less` | 2 | 42 | 0 | 13.3 ms | 17.3 ms |
 | `editor`, nvim 0.12.4 | 4 | 255 | 0 | 1013 to 1065 ms | 1056 to 1077 ms |
 
+**Software.**
+
 The editor row measured 1013 ms, 1054 ms and 1065 ms as the median in three
 independent runs of the track. The p95 stayed between 1056 ms and 1077 ms. Read
 this row as a range and not as a settled number. The DA1 timeout of the editor
@@ -176,6 +199,8 @@ The editor row, split into the stages of `whole-path.ts`.
 | of that, the gap between two frames | 1045 to 1055 ms | 1050 to 1072 ms |
 | paint | 1.7 to 2.0 ms | 5.9 to 7.3 ms |
 | TOTAL | 1013 to 1065 ms | 1056 to 1077 ms |
+
+**Software.**
 
 One gap between two server frames holds the whole event. Every other stage is
 under 8 ms.
@@ -205,6 +230,8 @@ engine does produce travel it and reach the socket. The query table of
 | OSC 11, the background color | no answer | |
 | DECRQM, `ESC [ ? 2026 $ p` | no answer | |
 
+**Software.**
+
 The single-variable proof runs on a bare PTY with no pirate in the path, with
 the same editor. The command argument sets the run count, and row 1 above is
 7 runs.
@@ -231,6 +258,8 @@ answers DA1 costs 5 ms. A responder that does not costs about 1 second.
 | H1, bytes or parse | refuted | the whole event is 255 bytes in 4 frames, 0 dumps, wasm parse 0.0 ms |
 | H2, the resize path | not involved | no resize takes part in this event |
 | H3, the alternate screen | supported | the query handshake around the buffer holds 1045 to 1055 ms of a 1013 to 1065 ms total |
+
+**Software.**
 
 The symptom is program-dependent. `less` and the shell control ask no query,
 and both are under 14 ms through the same browser.
@@ -265,13 +294,15 @@ Child `pager`, 12 size changes per storm, 7 runs.
 | paint | 2.5 to 7.8 ms | 6.0 to 8.6 ms |
 | TOTAL | 159 to 175 ms | 167 to 182 ms |
 
+**Software.**
+
 The settle measured 158.6 ms, 166.8 ms and 175.1 ms as the median across three
 runs of the track. The debounce is the stable part of it. The browser task and
 the paint carry the spread.
 
 ### The two holders
 
-**The debounce holds 104 to 107 ms.** `RESIZE_DEBOUNCE_MS` is 100 at
+**The debounce holds 104 to 107 ms.** `RESIZE_DEBOUNCE_MS` is 50 at
 `web/src/main.ts:33`, and `scheduleFit` at `web/src/main.ts:302` applies it.
 
 **One browser main-thread task holds 47 to 62 ms.** This task is outside
@@ -293,8 +324,44 @@ the long task at one canvas size alone. No benchmark sweeps the canvas area.
 This table is a record of one past experiment. Rebuild the sweep before anyone
 sizes the work from it.
 
-CAUTION: this table comes from software WebGL2. Nobody has measured this task
-on a real GPU. The magnitude needs a GPU number too.
+CAUTION: this table comes from software WebGL2. No sweep of the canvas area
+has run on a real GPU yet. Read "The GPU path" below for the first GPU number
+of this task, at one canvas size.
+
+**Software.**
+
+### The GPU path
+
+Command:
+`cd web && PIRATE_E2E=1 PIRATE_GPU=1 bun test ./bench/whole-path.e2e.ts --timeout 600000`.
+Child `pager`, 12 size changes per storm, 7 runs. Both runs sat within one
+minute of each other, at a 1-minute load average of 2.3 to 2.6.
+
+| Stage | Default path, headless | GPU path, headed |
+|---|---|---|
+| renderer | ANGLE (Google, Vulkan 1.3.0 SwiftShader Device) | ANGLE (Apple, ANGLE Metal Renderer: Apple M5) |
+| debounce | 54.1 ms | 51.8 ms |
+| child + wire | 59.9 ms | 11.0 ms |
+| of that, browser long task | 55.0 ms | 0.0 ms |
+| of that, main-thread stall | 55.4 ms | 6.6 ms |
+| stream | 0.1 ms | 0.1 ms |
+| paint | 3.0 ms | 4.0 ms |
+| TOTAL | 116.8 ms, p95 125.1 ms | 66.9 ms, p95 75.4 ms |
+
+**Software** for the first column, **GPU** for the second.
+
+The browser long task is a property of the software rasterizer. It falls from
+55.0 ms to 0.0 ms on the GPU. About 55 ms of every headless figure in this
+document is an artifact of the rasterizer, and not a cost that the operator
+pays.
+
+The main thread still stalls 6.6 ms on the GPU. The long task is 0 ms there,
+and the stall is not. The long task observer reports nothing under a 50 ms
+task. Read the main-stall row, and not the long-task row alone, when a stall
+sits near 50 ms.
+
+On the GPU the largest single stage is the debounce, 51.8 ms of a 66.9 ms
+total.
 
 ### The flicker
 
@@ -309,6 +376,8 @@ The flicker has two shapes.
 | faster than the debounce | 12 | 1 | 1 | 4145 | 0 | 2 |
 | a 160 ms step | 12 | 11 to 12 | 11 to 12 | 60000 to 66217 | 0 to 1 | 19 to 21 |
 
+**Software.**
+
 A drag faster than the debounce paints zero times during the drag. The canvas
 holds the old grid and it mis-scales. A drag at a 160 ms step lets every step
 through, and every step gives a full redraw.
@@ -320,6 +389,8 @@ through, and every step gives a full redraw.
 | H1, bytes or parse | refuted | a 56-byte redraw and a 4145-byte redraw give the same client settle, `local` 120.9 to 122.6 ms and 116.3 to 122.5 ms. Parse is 0.1 ms |
 | H2, the resize path | supported | the debounce holds 105 ms and the canvas-area task holds 47 to 58 ms of a 159 to 175 ms total |
 | H3, the alternate screen | refuted | alternate minus normal was +0.2, +0.6, -0.8, +2.4, -4.7, -2.5, -3.6 and -0.5 ms, so the sign changes and it is noise |
+
+**Software.**
 
 The server is not slow here. The tail from the last resize frame to the last
 byte stays between 0.25 ms and 6.4 ms.
@@ -479,6 +550,8 @@ stub sends the fixture, so no pirate process runs here.
 | vim exits | 123 | 0.10 ms | 4.9 ms | 0.4 ms | 5.2 ms |
 | dump of one screen | 2003 | 0.10 ms | 4.4 ms | 0.6 ms | 5.1 ms |
 
+**Software.**
+
 This track superseded the earlier figures of 10.8 ms to 15.3 ms in this table.
 
 The exit of vim here is 5.2 ms, because the stub sends the leave sequence at
@@ -495,6 +568,8 @@ that ran while the bytes were still arriving.
 | 26 | 22.2 ms | 11 | 576.6 ms |
 | 1 | 35.9 ms | 0 | 39.3 ms |
 
+**Software.**
+
 The parse holds 4 to 7 percent of each split total. The rest is the event loop
 and the repaints between the messages.
 
@@ -505,6 +580,8 @@ Draw cost by grid size:
 | 69x25 | 1725 | 0.4 ms | 0.232 us |
 | 109x38 | 4142 | 0.4 ms | 0.097 us |
 | 176x58 | 10208 | 0.7 ms | 0.069 us |
+
+**Software.**
 
 ### The client, from `bench/altscreen.spec.ts`
 
@@ -517,6 +594,8 @@ Draw cost by grid size:
 | dump in 12 messages | 12032 | 12 | 5.9 to 9.1 ms | 10.2 to 12.3 ms |
 | dump of 8 screens | 45219 | 1 | 10.6 to 10.9 ms | 11.6 to 11.8 ms |
 | the same in 45 messages | 45219 | 45 | 6.1 to 10.9 ms | 13.2 to 60.3 ms |
+
+**Software.**
 
 A dump is 98 times the bytes of the plain output leave. The parse takes one
 extra millisecond per 54 KB to 81 KB. That figure is the difference of two

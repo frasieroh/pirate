@@ -31,6 +31,20 @@
  * cd web && PIRATE_E2E=1 bun test ./bench/whole-path.e2e.ts --timeout 600000
  * ```
  *
+ * # The graphics stack
+ *
+ * The command above starts a headless browser on the software rasterizer.
+ * `PIRATE_GPU=1` starts a headed browser on the hardware graphics stack of the
+ * machine instead:
+ *
+ * ```text
+ * cd web && PIRATE_E2E=1 PIRATE_GPU=1 bun test ./bench/whole-path.e2e.ts --timeout 600000
+ * ```
+ *
+ * The `long task` row holds the compositor, so the two paths give different
+ * numbers there. Each report prints the renderer string of the run. Read that
+ * string before you read the numbers.
+ *
  * # The stages
  *
  * | Stage | What it holds |
@@ -65,6 +79,7 @@ import {
   counts,
   join,
   quantile,
+  renderer,
   reset,
   stages,
   table,
@@ -307,7 +322,12 @@ describe("the whole path, a real browser on a real pirate server", () => {
       }
       expect(samples.length).toBe(RUNS);
       const rows = stageRows(samples, "debounce", "TOTAL last resize to paint");
-      table("symptom 1, a resize storm, child `pager`", samples.length, rows);
+      const stack = await renderer(session.page);
+      table(
+        `symptom 1, a resize storm, child \`pager\`, renderer \`${stack}\``,
+        samples.length,
+        rows,
+      );
       counts("frames", samples.map((s) => s.frames));
       counts("bytes", samples.map((s) => s.bytes));
       verdict("symptom 1, a resize storm", samples, rows, REPORTED_SYMPTOM_1_MS);

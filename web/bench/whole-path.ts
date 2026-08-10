@@ -30,7 +30,13 @@
  */
 
 import path from "node:path";
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import {
+  chromium,
+  type Browser,
+  type BrowserContext,
+  type LaunchOptions,
+  type Page,
+} from "playwright";
 import { login, waitFor, viewportText } from "../e2e/browser";
 import { startPirate, type Pirate } from "../e2e/server";
 
@@ -48,6 +54,66 @@ const VIEWPORT = { width: 1000, height: 600 };
  * `--use-gl=angle`. The paint then arrives after the read.
  */
 const WEBGL_ARGS = ["--enable-unsafe-swiftshader"];
+
+/**
+ * The environment variable that selects the real GPU of the machine.
+ *
+ * With the variable unset, the launch options hold `WEBGL_ARGS` and nothing
+ * else, and the browser is headless. That is the path of CI.
+ *
+ * With `PIRATE_GPU` set to a value, the browser starts headed and without
+ * `WEBGL_ARGS`. A headed Chromium takes the hardware graphics stack of the
+ * machine. Headless Chromium reaches no GPU, so `WEBGL_ARGS` is the only way
+ * to a WebGL2 context there.
+ *
+ * The GPU path answers one question of this benchmark: how much of `long task`
+ * is the software rasterizer. Use `renderer` below to read which stack ran.
+ *
+ * ```text
+ * cd web && PIRATE_E2E=1 PIRATE_GPU=1 bun test ./bench/whole-path.e2e.ts --timeout 600000
+ * ```
+ *
+ * `web/tests/harness.ts` and `web/e2e/browser.ts` hold a copy of this switch,
+ * under the same name.
+ */
+const GPU_ENV = "PIRATE_GPU";
+
+/** The launch options of the browser. `PIRATE_GPU` selects the GPU path. */
+function launchOptions(): LaunchOptions {
+  if (!process.env[GPU_ENV]) {
+    return { args: WEBGL_ARGS };
+  }
+  // `ignoreDefaultArgs` removes the copy of the flag that Playwright adds on
+  // macOS. Without that removal, a machine with no usable GPU falls back to
+  // SwiftShader and the run reports software numbers as GPU numbers.
+  return {
+    args: [],
+    headless: false,
+    ignoreDefaultArgs: WEBGL_ARGS,
+  };
+}
+
+/**
+ * The unmasked renderer string of the WebGL2 context of the page.
+ *
+ * The reader of a report needs this string. A run with `PIRATE_GPU` set that
+ * gives a SwiftShader string ran on the software rasterizer, and its numbers
+ * are software numbers.
+ */
+export async function renderer(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const canvas = document.createElement("canvas");
+    const gl = canvas.getContext("webgl2");
+    if (gl === null) {
+      return "no webgl2 context";
+    }
+    const info = gl.getExtension("WEBGL_debug_renderer_info");
+    if (info === null) {
+      return gl.getParameter(gl.RENDERER) as string;
+    }
+    return gl.getParameter(info.UNMASKED_RENDERER_WEBGL) as string;
+  });
+}
 
 /** The three full-screen children of `crates/pirate-bench/children`. */
 export type Child = "editor" | "pager" | "minimal";
@@ -140,13 +206,21 @@ export async function closeBrowser(): Promise<void> {
 export async function join(shell: string): Promise<Join> {
   const server = await startPirate({ shell });
   if (browser === undefined) {
-    browser = await chromium.launch({ args: WEBGL_ARGS });
+    browser = await chromium.launch(launchOptions());
   }
   const context = await browser.newContext({
     ignoreHTTPSErrors: true,
     viewport: VIEWPORT,
   });
   await context.addInitScript(installWire);
+  // A headed browser asks for `/favicon.ico`, and the server answers 404. The
+  // page then logs a console error, and the page has no icon to log it about.
+  // `chrome-headless-shell` sends no such request, so the two paths differ
+  // here and only here. This route makes them equal. It matches one URL, so
+  // no other request goes through the interceptor.
+  await context.route("**/favicon.ico", (route) =>
+    route.fulfill({ status: 200, contentType: "image/x-icon", body: "" }),
+  );
   const page = await context.newPage();
   const errors: string[] = [];
   page.on("console", (message) => {
