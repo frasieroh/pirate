@@ -41,17 +41,25 @@
  * cd web && PIRATE_E2E=1 PIRATE_GPU=1 bun test ./bench/whole-path.e2e.ts --timeout 600000
  * ```
  *
- * Read `child + wire` and `main stall` to compare the two paths. The software
- * rasterizer adds its time there.
+ * `child + wire` and the total carry this comparison. Read those two rows.
+ * Measured on an idle machine: `child + wire` 51.4 ms on the default path
+ * against 9.0 ms on the GPU, and the total 108.5 ms against 66.8 ms.
  *
- * Do not read `long task` for this comparison. The browser reports a long task
- * only above 50 ms, so the row is a step and not a measurement. It reads
- * 0.0 ms on both paths on an idle machine, and it jumps to about 55 ms on a
- * busy one. The rasterizer runs off the main thread, and a long task counts
- * main thread time alone.
+ * Do not read `long task` for this comparison. The row counts main thread time
+ * above a 50 ms threshold, so it is a step and not a measurement. It reads
+ * 0.0 ms on both paths on an idle machine. On a busy machine the same row
+ * gives a p95 near 55 ms on the default path, because the load pushes tasks
+ * over the threshold. The software rasterizer runs on the raster and
+ * compositor threads, and a long task counts main thread time alone.
+ *
+ * Read `main stall` beside `child + wire`, and not alone. `widestGap` puts the
+ * window edges in its list of beats, so `main stall` is never larger than
+ * `child + wire`. A small stall on the GPU path is in part the smaller window.
+ * The row supports the comparison. It is not independent evidence.
  *
  * Each report prints the renderer string of the run. Read that string before
- * you read the numbers.
+ * you read the numbers. A run with `PIRATE_GPU=1` that prints a SwiftShader
+ * string ran on the software rasterizer.
  *
  * # The stages
  *

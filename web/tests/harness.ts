@@ -108,10 +108,11 @@ const WEBGL_ARGS = ["--enable-unsafe-swiftshader"];
  * With the variable unset, the launch options hold `WEBGL_ARGS` and nothing
  * else, and the browser is headless. That is the path of CI.
  *
- * With `PIRATE_GPU` set to a value, the browser starts headed and without
- * `WEBGL_ARGS`. A headed Chromium takes the hardware graphics stack of the
- * machine. Headless Chromium reaches no GPU, so `WEBGL_ARGS` is the only way
- * to a WebGL2 context there.
+ * With `PIRATE_GPU` set to `1`, the browser starts headed and without
+ * `WEBGL_ARGS`. Only the exact value `1` selects that path. Every other value
+ * keeps the default, so `PIRATE_GPU=0` gives the software rasterizer. A headed
+ * Chromium takes the hardware graphics stack of the machine. Headless Chromium
+ * reaches no GPU, so `WEBGL_ARGS` is the only way to a WebGL2 context there.
  *
  * This path is for local measurement. It needs a window server, and the window
  * of the browser opens on the desktop of the operator.
@@ -123,7 +124,7 @@ const GPU_ENV = "PIRATE_GPU";
 
 /** The launch options of the browser. `PIRATE_GPU` selects the GPU path. */
 function launchOptions(): LaunchOptions {
-  if (!process.env[GPU_ENV]) {
+  if (process.env[GPU_ENV] !== "1") {
     return { args: WEBGL_ARGS };
   }
   // `ignoreDefaultArgs` removes the copy of the flag that Playwright adds on
