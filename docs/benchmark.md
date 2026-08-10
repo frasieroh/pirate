@@ -92,26 +92,23 @@ and the built client. Its name ends in `.e2e.ts`, which the file pattern of
 
 ## What the benchmarks assert
 
-Most assertions cover correctness alone. The client paints. The size that it
-sent is the size of the viewport. The screen holds the expected rows.
+Every assertion of these benchmarks covers correctness. The client paints. The
+size that it sent is the size of the viewport. The screen holds the expected
+rows.
 
-Three assertions read a duration. All three are in `bench/latency.spec.ts`, and
-all three run in CI.
+No benchmark asserts a threshold on a duration. CI never fails on a latency
+number. A threshold on a latency number fails on a loaded machine and passes
+on an idle one. It reports the load and not the code. The numbers are the
+product of these files, and a human reads them.
 
-| File and line | The assertion |
-|---|---|
-| `bench/latency.spec.ts:170` | the median total of `vim exits` is less than 1000 ms |
-| `bench/latency.spec.ts:171` | the median total of `clear` is less than 1000 ms |
-| `bench/latency.spec.ts:203` | the flood in 1 message beats the flood in 1455 messages |
+Four assertions compare a duration. Each one is an invariant of the
+instrument, not a threshold. `bench/latency.spec.ts` holds the median paint at
+more than 0 ms. `bench/whole-path.e2e.ts` holds the median round trip at more
+than 0 ms.
 
-CAUTION: The two 1000 ms bounds hold against the stub alone. The stub sends the
-leave sequence at once, at 5.2 ms. The whole path with a real editor is above
-1000 ms. A benchmark that puts a real editor behind that bound fails.
-
-No other test in this repository asserts on a duration. A threshold on a
-latency number fails on a loaded machine and passes on an idle one. It reports
-the load and not the code. The numbers are the product of these files, and a
-human reads them.
+`bench/resize-storm.spec.ts` holds each stage of a settle at 0 ms or more. It
+also holds the parse inside the output. A load on the machine makes each of
+these four values larger, so no load can fail them.
 
 ## The whole-path stage profile
 
