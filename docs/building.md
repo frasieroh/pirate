@@ -109,8 +109,13 @@ so activate mise in your shell, or write `mise exec -- cargo build`.
 | GitHub Actions | a full commit SHA in each `uses:` line |
 | Container base images | a `sha256:` digest in the `Dockerfile` |
 
-Renovate opens a pull request for each of these. `cargo xtask verify-pins` fails when a pin
-is a range, and it fails when `mise.lock` does not match `mise.toml`.
+Renovate opens a pull request for each of these, with one exception.
+`vendor/beamterm/UPSTREAM.toml` has no Renovate manager and no rule in
+`.github/renovate.json5`, so that pin gets no pull request. A person raises the beamterm
+commit by hand, with the steps in `vendor/beamterm/UPSTREAM.toml`.
+
+`cargo xtask verify-pins` fails when a pin is a range, and it fails when `mise.lock` does
+not match `mise.toml`.
 
 After you change a version in `mise.toml`, write the lock file again. Then commit it:
 

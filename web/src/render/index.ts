@@ -143,6 +143,7 @@ export class GridRenderer {
       `#${canvas.id}`,
       FONT_FAMILIES,
       options.fontSize,
+      null,
       false,
     );
 
