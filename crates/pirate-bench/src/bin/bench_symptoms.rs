@@ -8,8 +8,8 @@
 //!    buffer of `session.rs`.
 //! 2. **parse** — `ScreenTerminal::write`, which is the replica VT.
 //! 3. **encode** — `ServerFrame::encode`, which is the tag byte and the copy.
-//! 4. **transport** — the WebSocket, from the send on the server to the receipt
-//!    on the client.
+//! 4. **transport** — a WebSocket between two tasks of this process, from the
+//!    send to the receipt. See [`Loopback`].
 //!
 //! Run it:
 //!
@@ -36,11 +36,56 @@
 //! not the cost of the `read` call alone. Read it as the upper bound of that
 //! stage. `parse`, `encode`, and `transport` hold no wait for a producer.
 //!
+//! CAUTION: The `pty read` row and the `transport` row are models, and not
+//! measurements of pirate. The writer of [`pty_read`] is a thread that writes
+//! [`READ_CHUNK`] bytes per call, so the read sizes of that row belong to that
+//! writer and not to the child of the scenario. [`Loopback`] is a second
+//! WebSocket server, so the `transport` row is the cost of the wire for the
+//! measured message sizes and not the cost of the send path of pirate. The
+//! `bytes`, `msgs`, and `dumps` columns of the two symptom tables are the only
+//! numbers that come from a real pirate server.
+//!
 //! Every stage row is the total for the whole scenario, so the four rows add up
 //! and compare directly.
 //!
 //! NOTE: This binary prints numbers and asserts nothing about a duration. The
 //! unit tests below check byte counts and message counts only.
+//!
+//! # Verdicts
+//!
+//! The numbers below come from four runs of 2026-08-09 on an Apple M-series
+//! laptop. Run the command again for the numbers of another machine.
+//!
+//! **Symptom 1, the slow resize.** H1 is not supported. The server turns 40
+//! resize frames into 204280 bytes, and the tail from the last resize frame to
+//! the last byte stays between 0.25 ms and 4.7 ms. H2 is not supported on the
+//! server. A flood of 40 resize frames with no gap gives 1 to 15 messages, 2
+//! repaints, and no dump, so the queue never overflows under a flood. H3 is
+//! weakly supported and it is not the cause. One resync dump fired in one of
+//! the four drag rows, and none fired in the other 15 rows, so a drag can
+//! overflow `CLIENT_QUEUE` but it rarely does. The bytes come from the child:
+//! one `SIGWINCH` gives one full repaint of 5107 bytes, and a drag of 40 steps
+//! gives 40 of them. The message count of a drag varies by a factor of 2
+//! between runs, because the scheduler governs how much output the join finds
+//! in the queue. The `msgs` column is a median over [`RUNS`] runs, and the
+//! `tail p95` column beside it gives the spread.
+//!
+//! **Symptom 2, the slow return from a full-screen program.** H1 is not
+//! supported. The leave sequence is 123 bytes in one message, and the parse,
+//! the encode, and the wire hold about 0.03 ms of it. H2 does not apply: the
+//! scenario sends no resize frame. H3 holds a fault, but not one that costs
+//! time on the server: `dump()` carries the active screen only, so a client
+//! that resyncs after the leave gets 9674 bytes of the primary screen, and it
+//! gets them in 0.2 ms to 0.6 ms.
+//!
+//! **Does the wire protocol hold a meaningful part of the 300 ms of symptom
+//! 2?** No. The program prints the share of [`REPORTED_SYMPTOM_TWO`] that the
+//! measured stages hold. That share stayed under 0.1 percent in every run.
+//!
+//! CAUTION: The server evidence excludes the server. It does not exclude the
+//! child process, the `exec` of the shell, the redraw of the prompt, or the
+//! time before the child writes the leave sequence at all. This binary starts
+//! its clock when the leave sequence reaches the PTY.
 
 use std::io::Write as _;
 use std::net::SocketAddr;
@@ -103,6 +148,13 @@ const CLEAR: &[u8] = b"\x1b[H\x1b[2J";
 
 /// The characters of one painted row of the test child.
 const PAINT_WIDTH: usize = 100;
+
+/// The time that the user reports for symptom 2.
+///
+/// This value is the report of the user. It is not a measurement, and no test
+/// of this crate asserts against it. The report prints the share of it that the
+/// measured stages hold.
+const REPORTED_SYMPTOM_TWO: Duration = Duration::from_millis(300);
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), BoxError> {
@@ -180,7 +232,7 @@ async fn symptom_one(dir: &Path, loopback: &Loopback) -> Result<(), BoxError> {
 
     // The stage table follows the drag, because a drag is what the user does.
     // Both drags carry the same bytes, so one table holds both.
-    let reads = stage_table(
+    let stages = stage_table(
         "symptom 1 stages, for the byte stream of one drag",
         loopback,
         &stream,
@@ -189,7 +241,7 @@ async fn symptom_one(dir: &Path, loopback: &Loopback) -> Result<(), BoxError> {
     )
     .await?;
     for (name, sizes) in &drags {
-        print_coalescing(name, reads, sizes);
+        print_coalescing(name, stages.read_size, sizes);
     }
     Ok(())
 }
@@ -294,9 +346,13 @@ fn print_storm(name: &str, runs: &[Storm]) {
     );
 }
 
-/// The run whose tail is the median of the list.
+/// The run whose message count is the median of the list.
+///
+/// [`print_storm`] prints the median message count, and [`stage_table`] prints
+/// the message count of this run. The same key therefore selects both, and the
+/// two tables hold the same number.
 fn pick_median(mut runs: Vec<Storm>) -> Storm {
-    runs.sort_by_key(|r| r.tail);
+    runs.sort_by_key(|r| r.messages);
     runs.swap_remove(runs.len() / 2)
 }
 
@@ -457,7 +513,7 @@ async fn symptom_two(dir: &Path, loopback: &Loopback) -> Result<(), BoxError> {
     let profiles = vec![("the leave".to_string(), pick_sizes(&runs))];
     let mut preload = primary.clone();
     preload.extend_from_slice(&open);
-    let reads = stage_table(
+    let stages = stage_table(
         "symptom 2 stages, for the leave sequence only",
         loopback,
         &exit,
@@ -466,8 +522,32 @@ async fn symptom_two(dir: &Path, loopback: &Loopback) -> Result<(), BoxError> {
     )
     .await?;
     for (name, sizes) in &profiles {
-        print_coalescing(name, reads, sizes);
+        print_coalescing(name, stages.read_size, sizes);
     }
+
+    // Criterion: a plain answer on the wire protocol. The share is arithmetic
+    // over the medians above. It is not a threshold, and nothing asserts it.
+    let held = stages.parse + stages.encode + stages.transport;
+    let with_resync = held + median(&trips);
+    println!(
+        "\n  the user reports about {} for symptom 2",
+        ms3(REPORTED_SYMPTOM_TWO)
+    );
+    println!(
+        "  parse + encode + wire:             {} = {} of that report",
+        ms3(held),
+        share(held, REPORTED_SYMPTOM_TWO)
+    );
+    println!(
+        "  the same, plus one resync dump:    {} = {} of that report",
+        ms3(with_resync),
+        share(with_resync, REPORTED_SYMPTOM_TWO)
+    );
+    println!("  the wire protocol holds no meaningful part of that report.");
+    println!(
+        "  CAUTION: this clock starts when the leave sequence reaches the PTY. \
+         It excludes the child,\n  the exec, and the redraw of the prompt."
+    );
     Ok(())
 }
 
@@ -572,14 +652,26 @@ fn pick_sizes(runs: &[AltExit]) -> Vec<usize> {
 
 // --- The four stages --- //
 
-/// Print one stage table, and give back the count of PTY reads.
+/// The medians of one stage table.
+struct Stages {
+    /// Bytes per read that the PTY gave for this byte stream.
+    read_size: usize,
+    /// The median of the parse stage.
+    parse: Duration,
+    /// The median of the encode stage.
+    encode: Duration,
+    /// The median of the transport stage of the first profile.
+    transport: Duration,
+}
+
+/// Print one stage table, and give back its medians.
 async fn stage_table(
     title: &str,
     loopback: &Loopback,
     stream: &[u8],
     profiles: &[(String, Vec<usize>)],
     preload: &[u8],
-) -> Result<usize, BoxError> {
+) -> Result<Stages, BoxError> {
     let mut reads = Vec::with_capacity(RUNS);
     let mut chunks: Vec<usize> = Vec::new();
     for _ in 0..RUNS {
@@ -639,7 +731,14 @@ async fn stage_table(
         );
     }
     println!("  the PTY gave {mean} bytes per read");
-    Ok(chunks.len())
+    Ok(Stages {
+        read_size: mean,
+        parse: median(&parse),
+        encode: median(&encode),
+        transport: transports
+            .first()
+            .map_or(Duration::ZERO, |(_, _, samples)| median(samples)),
+    })
 }
 
 fn row(name: &str, bytes: usize, calls: usize, values: &[Duration]) {
@@ -653,22 +752,58 @@ fn row(name: &str, bytes: usize, calls: usize, values: &[Duration]) {
     );
 }
 
-/// State whether the two joins made fewer messages than the PTY made reads.
-fn print_coalescing(name: &str, reads: usize, sizes: &[usize]) {
+/// State whether the two joins fired, and whether they reached their limit.
+///
+/// The join at `session.rs:480` and the join at `ws.rs:146` both collect until
+/// the frame holds [`OUTPUT_BATCH`] bytes. One PTY read is the smallest frame
+/// that either join can emit, so a message that is larger than one read proves
+/// that a join fired. A message that reaches [`OUTPUT_BATCH`] proves that a
+/// join ran to its limit.
+///
+/// `read_size` is the bytes per read of the same byte stream, from
+/// [`pty_read`]. `sizes` are the message sizes of a real pirate server.
+fn print_coalescing(name: &str, read_size: usize, sizes: &[usize]) {
     let messages = sizes.len();
     let bytes: usize = sizes.iter().sum();
-    let verdict = if reads < 2 {
-        "one read, so there is nothing to join"
-    } else if messages < reads {
-        "yes"
-    } else {
-        "no"
-    };
+    let largest = sizes.iter().copied().max().unwrap_or(0);
+    let (fired, at_limit) = coalescing_verdict(read_size, sizes);
     println!(
-        "  coalescing, {name}: {reads} pty reads -> {messages} messages \
-         of {} bytes each: {verdict}",
+        "  coalescing, {name}: {messages} messages, {} bytes each, largest {largest} bytes, \
+         one pty read is {read_size} bytes",
         bytes / messages.max(1)
     );
+    println!(
+        "  coalescing, {name}: the join fires: {fired}; \
+         the join reaches its {OUTPUT_BATCH}-byte limit: {at_limit}"
+    );
+}
+
+/// Whether a join fired, and whether a join reached [`OUTPUT_BATCH`].
+///
+/// The verdict is a function of the message sizes of the server run and of the
+/// size of one PTY read. It uses no count from another scenario.
+fn coalescing_verdict(read_size: usize, sizes: &[usize]) -> (&'static str, &'static str) {
+    let largest = sizes.iter().copied().max().unwrap_or(0);
+    let fired = if sizes.is_empty() {
+        "unknown, because no message arrived"
+    } else if read_size == 0 {
+        "unknown, because no pty read was measured"
+    } else if largest > read_size {
+        "yes"
+    } else {
+        "no, because no message is larger than one pty read"
+    };
+    let at_limit = if largest >= OUTPUT_BATCH { "yes" } else { "no" };
+    (fired, at_limit)
+}
+
+/// The share of `whole` that `part` holds, as a percentage.
+fn share(part: Duration, whole: Duration) -> String {
+    if whole.is_zero() {
+        return "n/a".to_string();
+    }
+    let percent = part.as_secs_f64() / whole.as_secs_f64() * 100.0;
+    format!("{percent:.3} percent")
 }
 
 /// The time inside the `read` calls of a PTY master, for one byte stream.
@@ -855,9 +990,62 @@ fn count_marks(stream: &[u8], mark: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        count_marks, paint_bytes, primary_fill, split, winch_script, CLEAR, COLS, PAINT_WIDTH, ROWS,
+        coalescing_verdict, count_marks, paint_bytes, primary_fill, share, split, winch_script,
+        CLEAR, COLS, PAINT_WIDTH, REPORTED_SYMPTOM_TWO, ROWS,
     };
+    use pirate::session::OUTPUT_BATCH;
     use pirate_bench::harness::fixture_dir;
+    use std::time::Duration;
+
+    #[test]
+    fn the_coalescing_verdict_reads_the_message_sizes_and_not_a_foreign_count() {
+        // The screen writer of symptom 1: 189 messages of about 1080 bytes,
+        // against a pty read of 1021 bytes. The join fires, and it stays far
+        // from its limit.
+        let sizes = vec![1080_usize; 189];
+        assert_eq!(coalescing_verdict(1021, &sizes), ("yes", "no"));
+
+        // The same server behavior, judged against a larger read. The join
+        // did not gather more than one read, so the verdict must say no.
+        assert_eq!(
+            coalescing_verdict(2048, &sizes).0,
+            "no, because no message is larger than one pty read"
+        );
+
+        // The line writer: every message is smaller than one pty read.
+        assert_eq!(
+            coalescing_verdict(1021, &vec![264_usize; 773]).0,
+            "no, because no message is larger than one pty read"
+        );
+    }
+
+    #[test]
+    fn the_coalescing_verdict_holds_at_the_edges() {
+        assert_eq!(
+            coalescing_verdict(1021, &[]).0,
+            "unknown, because no message arrived"
+        );
+        assert_eq!(
+            coalescing_verdict(0, &[10]).0,
+            "unknown, because no pty read was measured"
+        );
+        // A message that reaches the batch limit ran the join to its end.
+        assert_eq!(coalescing_verdict(1021, &[OUTPUT_BATCH]), ("yes", "yes"));
+        assert_eq!(coalescing_verdict(1021, &[OUTPUT_BATCH - 1]), ("yes", "no"));
+    }
+
+    #[test]
+    fn the_share_of_the_reported_time_is_a_percentage() {
+        assert_eq!(
+            share(Duration::from_millis(3), REPORTED_SYMPTOM_TWO),
+            "1.000 percent"
+        );
+        assert_eq!(
+            share(Duration::from_micros(50), REPORTED_SYMPTOM_TWO),
+            "0.017 percent"
+        );
+        assert_eq!(share(Duration::from_millis(1), Duration::ZERO), "n/a");
+    }
 
     #[test]
     fn the_marker_count_finds_every_repaint() {
