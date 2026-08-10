@@ -860,7 +860,7 @@ mod tests {
                 .expect("no frame arrived")
                 .expect("the session ended");
             if let Ok(ServerFrame::Dump(bytes)) = ServerFrame::decode(&frame) {
-                entered = bytes.starts_with(b"\x1b[?1049h");
+                entered = bytes.windows(8).any(|w| w == b"\x1b[?1049h");
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

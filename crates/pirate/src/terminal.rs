@@ -66,9 +66,94 @@ const ENTER_ALTERNATE: &[u8] = b"\x1b[?1049h\x1b[H\x1b[2J";
 /// alternate screen keeps its content, so this sequence is safe in both cases.
 const LEAVE_ALTERNATE: &[u8] = b"\x1b[?1049l\x1b[H\x1b[2J";
 
+/// The start of a private mode sequence: `CSI ?`.
+///
+/// Only a private mode sequence puts the terminal on the alternate screen.
+const PRIVATE_MODE: &[u8] = b"\x1b[?";
+
+/// The private modes that switch the screen.
+///
+/// 1049 is the mode of tmux, vim, and less. 47 and 1047 are the older modes,
+/// and terminfo entries still carry them.
+const SCREEN_MODES: [&[u8]; 3] = [b"47", b"1047", b"1049"];
+
+/// A private mode sequence that can put the terminal on the alternate screen.
+struct ScreenSwitch {
+    /// The index of the ESC byte.
+    start: usize,
+    /// The index after the sequence. It is the length of the chunk when the
+    /// chunk cuts the sequence short.
+    end: usize,
+    /// False when the chunk ends inside the sequence.
+    complete: bool,
+}
+
+/// Find the first sequence that can put the terminal on the alternate screen.
+///
+/// The sequence is `CSI ? Pm h`, which sets a mode, or `CSI ? Pm r`, which
+/// restores one. A parameter of 47, 1047, or 1049 switches the screen. A
+/// sequence that the chunk cuts short counts also, because the rest of it
+/// arrives in the next chunk and the capture must come before it.
+fn next_screen_switch(bytes: &[u8]) -> Option<ScreenSwitch> {
+    let mut at = 0;
+    while let Some(offset) = find(&bytes[at..], PRIVATE_MODE) {
+        let start = at + offset;
+        let params_at = start + PRIVATE_MODE.len();
+        // A parameter byte is 0x30 to 0x3f. The first byte outside that range
+        // is the final byte of the sequence.
+        let final_at = bytes[params_at..]
+            .iter()
+            .position(|b| !(0x30..=0x3f).contains(b))
+            .map(|i| params_at + i);
+        let Some(final_at) = final_at else {
+            return Some(ScreenSwitch {
+                start,
+                end: bytes.len(),
+                complete: false,
+            });
+        };
+        let switches = matches!(bytes[final_at], b'h' | b'r')
+            && bytes[params_at..final_at]
+                .split(|b| *b == b';')
+                .any(|param| SCREEN_MODES.contains(&param));
+        if switches {
+            return Some(ScreenSwitch {
+                start,
+                end: final_at + 1,
+                complete: true,
+            });
+        }
+        at = params_at;
+    }
+    None
+}
+
+/// The index of the first `needle` in `haystack`.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// The authoritative screen state of one session.
 pub struct ScreenTerminal {
     inner: Terminal<'static, 'static>,
+    /// The screen that the last write left active.
+    ///
+    /// The state dump needs the screen transition, and not the screen alone.
+    /// This field holds the value from before the current write.
+    alternate: bool,
+    /// The dump of the primary screen that the terminal took when it entered
+    /// the alternate screen.
+    ///
+    /// The formatter of libghostty-vt 0.2.1 reads the active screen only, so
+    /// this capture is the one record of the screen behind the program. It is
+    /// `None` when the primary screen held no text, and again after the
+    /// terminal leaves the alternate screen.
+    primary: Option<Vec<u8>>,
+    /// A capture that waits for the switch that follows it.
+    ///
+    /// It becomes [`Self::primary`] when the terminal reaches the alternate
+    /// screen, and it is dropped when the terminal stays on the primary screen.
+    pending: Option<Vec<u8>>,
 }
 
 impl ScreenTerminal {
@@ -81,15 +166,77 @@ impl ScreenTerminal {
             rows: rows.clamp(1, MAX_ROWS),
             max_scrollback: SCROLLBACK,
         })?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            alternate: false,
+            primary: None,
+            pending: None,
+        })
     }
 
     /// Feed PTY output into the parser.
     ///
     /// This never fails. libghostty-vt treats the input as untrusted and logs
     /// a malformed sequence instead of stopping.
+    ///
+    /// The write stops at each sequence that can enter the alternate screen,
+    /// and it captures the primary screen there. See [`Self::dump`].
     pub fn write(&mut self, bytes: &[u8]) {
-        self.inner.vt_write(bytes);
+        let mut rest = bytes;
+        let mut cut_short = false;
+        while let Some(switch) = next_screen_switch(rest) {
+            // The bytes before the switch belong to the screen that is active
+            // now, so they go in first.
+            self.inner.vt_write(&rest[..switch.start]);
+            self.observe();
+            self.pending = self.capture_primary();
+            self.inner.vt_write(&rest[switch.start..switch.end]);
+            cut_short = !switch.complete;
+            rest = &rest[switch.end..];
+        }
+        self.inner.vt_write(rest);
+        self.observe();
+        // A capture that no switch claimed is stale. Keep it only while the
+        // sequence that needs it is still incomplete.
+        if !cut_short && !self.alternate {
+            self.pending = None;
+        }
+    }
+
+    /// Read the active screen, then hold or drop the capture of the primary
+    /// screen.
+    fn observe(&mut self) {
+        let alternate = self.on_alternate_screen().unwrap_or(self.alternate);
+        if alternate && !self.alternate {
+            self.primary = self.pending.take();
+        } else if !alternate {
+            self.primary = None;
+        }
+        self.alternate = alternate;
+    }
+
+    /// A dump of the primary screen, for [`Self::dump`] to send before the
+    /// alternate screen.
+    ///
+    /// The result is `None` when the alternate screen is already active, or
+    /// when the primary screen holds no text. An empty capture carries nothing
+    /// and it clears the primary screen of a client that holds content there.
+    fn capture_primary(&self) -> Option<Vec<u8>> {
+        if self.alternate || self.is_blank().unwrap_or(true) {
+            return None;
+        }
+        self.dump().ok()
+    }
+
+    /// True when the active screen holds no text.
+    fn is_blank(&self) -> Result<bool, libghostty_vt::Error> {
+        let options = FormatterOptions::new()
+            .with_format(Format::Plain)
+            .with_unwrap(false)
+            .with_trim(true);
+        let mut formatter = Formatter::new(&self.inner, options)?;
+        let text = formatter.format_alloc(None)?;
+        Ok(text.iter().all(u8::is_ascii_whitespace))
     }
 
     /// Apply a new window size.
@@ -139,14 +286,26 @@ impl ScreenTerminal {
     /// that the client is leaving. That screen is the one that this dump does
     /// not carry, and its content must survive.
     ///
-    /// # Limit
+    /// # The screen behind the alternate screen
     ///
-    /// The formatter carries the active screen only. A dump of the alternate
-    /// screen therefore does not carry the primary screen behind it. This is
-    /// correct for pirate: a client of this session already had those bytes
-    /// before it fell behind, and the sequences above leave that screen alone.
-    /// A client that connects while a program holds the alternate screen gets
-    /// an empty primary screen, and it sees that screen when the program ends.
+    /// The formatter carries the active screen only, and libghostty-vt 0.2.1
+    /// gives no way to read the other one. A client that connected while a
+    /// program held the alternate screen therefore got an empty primary
+    /// screen, and it saw that empty screen when the program ended.
+    ///
+    /// [`Self::write`] captures the primary screen at the moment that the
+    /// terminal enters the alternate screen. A dump of the alternate screen
+    /// sends that capture first. The order is the primary screen, the switch,
+    /// the alternate screen, and the cursor.
+    ///
+    /// The capture is absent when the primary screen held no text. A blank
+    /// capture carries nothing, and its clear would erase the shell history of
+    /// a client that already has it.
+    ///
+    /// The capture holds the width and the height of the screen at the moment
+    /// of the switch. A resize after that moment reflows the primary screen of
+    /// this terminal, and a line that is longer than the new width therefore
+    /// wraps at a different column on a client that replays the capture.
     pub fn dump(&self) -> Result<Vec<u8>, libghostty_vt::Error> {
         // Every extra that the formatter offers is on. A dump that omits the
         // modes or the palette gives the browser a screen that differs from
@@ -172,17 +331,28 @@ impl ScreenTerminal {
 
         // Put the client on the screen that this terminal is on, and only then
         // clear. See fault 2 above.
-        let prefix = if self.on_alternate_screen()? {
+        let alternate = self.on_alternate_screen()?;
+        let prefix = if alternate {
             ENTER_ALTERNATE
         } else {
             LEAVE_ALTERNATE
+        };
+
+        // The screen behind the alternate screen goes first. It carries its
+        // own leave and clear, so it lands on the primary screen of a client
+        // that is on either screen.
+        let primary: &[u8] = if alternate {
+            self.primary.as_deref().unwrap_or(&[])
+        } else {
+            &[]
         };
 
         // CUP is one-based, and the terminal reports a zero-based position.
         let (x, y) = self.cursor()?;
         let cursor = format!("\x1b[{};{}H", u32::from(y) + 1, u32::from(x) + 1);
 
-        let mut out = Vec::with_capacity(prefix.len() + bytes.len() + cursor.len());
+        let mut out = Vec::with_capacity(primary.len() + prefix.len() + bytes.len() + cursor.len());
+        out.extend_from_slice(primary);
         out.extend_from_slice(prefix);
         out.extend_from_slice(&bytes);
         out.extend_from_slice(cursor.as_bytes());
@@ -613,5 +783,160 @@ mod tests {
         assert!(replica.on_alternate_screen().unwrap());
         assert_eq!(replica.row(0).unwrap(), "inside vim");
         assert_eq!(replica.size().unwrap(), (60, 12));
+    }
+
+    // --- The screen behind the alternate screen --- //
+
+    /// Rows of the active area that hold text.
+    fn rows_of_text(term: &ScreenTerminal) -> usize {
+        let (_, rows) = term.size().unwrap();
+        (0..rows)
+            .filter(|y| !term.row(*y).unwrap().is_empty())
+            .count()
+    }
+
+    /// A terminal with `lines` rows of primary content, inside a program that
+    /// holds the alternate screen.
+    fn source_inside_a_program(cols: u16, rows: u16, lines: u16) -> ScreenTerminal {
+        let mut source = ScreenTerminal::new(cols, rows).unwrap();
+        for line in 0..lines {
+            source.write(format!("primary line {line}\r\n").as_bytes());
+        }
+        source.write(b"\x1b[?1049h\x1b[2J\x1b[Hstatus one\r\nstatus two");
+        assert!(source.on_alternate_screen().unwrap());
+        source
+    }
+
+    #[test]
+    fn a_client_that_joins_inside_the_alternate_screen_gets_the_whole_screen() {
+        // The web suite reports "rows of text after the exit of a joined
+        // client". That count was 2 before the capture: the client had the
+        // alternate screen, and an empty primary screen behind it.
+        let mut source = source_inside_a_program(80, 40, 38);
+
+        let mut client = ScreenTerminal::new(80, 40).unwrap();
+        client.write(&source.dump().unwrap());
+
+        // The program ends on both terminals.
+        source.write(b"\x1b[?1049l");
+        client.write(b"\x1b[?1049l");
+
+        assert_eq!(rows_of_text(&source), 38);
+        assert_eq!(
+            rows_of_text(&client),
+            rows_of_text(&source),
+            "the joined client lost the primary screen behind the program"
+        );
+    }
+
+    #[test]
+    fn a_joined_client_gets_the_primary_screen_that_stood_behind_the_program() {
+        let mut source = source_inside_a_program(40, 8, 5);
+
+        let mut client = ScreenTerminal::new(40, 8).unwrap();
+        client.write(&source.dump().unwrap());
+        // The dump lands the client inside the program first.
+        assert!(client.on_alternate_screen().unwrap());
+        assert_same_screen(&client, &source, 8);
+
+        source.write(b"\x1b[?1049l");
+        client.write(b"\x1b[?1049l");
+
+        assert!(!client.on_alternate_screen().unwrap());
+        assert_same_screen(&client, &source, 8);
+        assert_eq!(client.row(0).unwrap(), "primary line 0");
+        assert_eq!(client.row(4).unwrap(), "primary line 4");
+    }
+
+    #[test]
+    fn a_resize_inside_the_alternate_screen_keeps_the_primary_capture() {
+        // tmux resizes its panes on every window change. The capture holds the
+        // size of the screen at the switch, so this test keeps every primary
+        // line shorter than both widths.
+        let mut source = source_inside_a_program(40, 8, 5);
+        source.resize(60, 12).unwrap();
+        assert!(source.on_alternate_screen().unwrap());
+
+        let mut client = ScreenTerminal::new(60, 12).unwrap();
+        client.write(&source.dump().unwrap());
+
+        source.write(b"\x1b[?1049l");
+        client.write(b"\x1b[?1049l");
+
+        assert_eq!(rows_of_text(&client), 5);
+        for y in 0..12 {
+            assert_eq!(
+                client.row(y).unwrap(),
+                source.row(y).unwrap(),
+                "row {y} differs after the resize"
+            );
+        }
+    }
+
+    #[test]
+    fn a_switch_that_two_chunks_cut_apart_still_captures_the_primary_screen() {
+        // The PTY gives the server 8192 bytes at a time, so a sequence can
+        // straddle two reads.
+        let mut source = ScreenTerminal::new(40, 8).unwrap();
+        source.write(b"primary one\r\nprimary two\r\n");
+        source.write(b"\x1b[?10");
+        source.write(b"49h\x1b[2J\x1b[Hinside the program");
+        assert!(source.on_alternate_screen().unwrap());
+
+        let mut client = ScreenTerminal::new(40, 8).unwrap();
+        client.write(&source.dump().unwrap());
+        client.write(b"\x1b[?1049l");
+
+        assert_eq!(client.row(0).unwrap(), "primary one");
+        assert_eq!(client.row(1).unwrap(), "primary two");
+    }
+
+    #[test]
+    fn the_capture_goes_away_when_the_program_ends() {
+        // A dump taken after the program ends carries the primary screen once,
+        // and the terminal holds no capture behind it.
+        let mut source = source_inside_a_program(40, 8, 3);
+        source.write(b"\x1b[?1049l");
+        assert!(source.primary.is_none());
+
+        let dump = source.dump().unwrap();
+        assert!(dump.starts_with(LEAVE_ALTERNATE));
+    }
+
+    #[test]
+    fn a_program_over_an_empty_primary_screen_stores_no_capture() {
+        // The capture would clear the primary screen of a client that holds
+        // its own shell history. See `capture_primary`.
+        let mut source = ScreenTerminal::new(40, 8).unwrap();
+        source.write(b"\x1b[?1049h\x1b[2J\x1b[Hvim is running");
+
+        assert!(source.primary.is_none());
+        assert!(source.dump().unwrap().starts_with(ENTER_ALTERNATE));
+    }
+
+    #[test]
+    fn the_scanner_finds_the_sequences_that_switch_the_screen() {
+        // A mode that is not a screen mode must not cost a capture, and a
+        // sequence that a chunk cuts short must count.
+        assert!(next_screen_switch(b"plain text").is_none());
+        assert!(next_screen_switch(b"\x1b[?25l").is_none());
+        assert!(next_screen_switch(b"\x1b[?1049l").is_none());
+        assert!(next_screen_switch(b"\x1b[?104h").is_none());
+
+        let switch = next_screen_switch(b"ab\x1b[?1049h").unwrap();
+        assert_eq!((switch.start, switch.end, switch.complete), (2, 10, true));
+
+        let switch = next_screen_switch(b"\x1b[?25l\x1b[?47h").unwrap();
+        assert_eq!((switch.start, switch.end, switch.complete), (6, 12, true));
+
+        let switch = next_screen_switch(b"\x1b[?25;1049h").unwrap();
+        assert_eq!((switch.start, switch.end, switch.complete), (0, 11, true));
+
+        let switch = next_screen_switch(b"\x1b[?10").unwrap();
+        assert_eq!((switch.start, switch.end, switch.complete), (0, 5, false));
+
+        // A restore of a saved mode enters the alternate screen also.
+        let switch = next_screen_switch(b"\x1b[?1049r").unwrap();
+        assert_eq!((switch.start, switch.end, switch.complete), (0, 8, true));
     }
 }
