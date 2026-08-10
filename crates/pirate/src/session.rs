@@ -37,9 +37,9 @@
 //! ```
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -79,6 +79,25 @@ pub const CLIENT_QUEUE: usize = CLIENT_BACKLOG / OUTPUT_BATCH;
 /// Bytes per read from the PTY master.
 const READ_CHUNK: usize = 8192;
 
+/// Time that one output frame waits for more output.
+///
+/// A join of the queued output alone joins nothing when the writer is slower
+/// than the server. A program that writes one line at a time is such a writer,
+/// and each line then becomes one frame and one WebSocket message. This window
+/// holds the output that arrives close together in one frame.
+///
+/// The window starts at the last output frame that went out, so output that
+/// follows a quiet period waits for nothing. The delay that this window adds is
+/// therefore [`OUTPUT_WINDOW`] at the most, and it falls on a stream only.
+///
+/// The value comes from two measurements on the browser side. One message costs
+/// about 2 ms of parse and paint, so a window under 2 ms cannot pay for the
+/// message that it saves. A display frame at 60 Hz is 16.7 ms, and output that
+/// waits longer than one display frame is late. This value is half of a display
+/// frame, so a frame that the window holds still reaches the paint that follows
+/// it. `crates/pirate/tests/integration.rs` measures the count that it gives.
+const OUTPUT_WINDOW: Duration = Duration::from_millis(8);
+
 /// Time that the process group gets after SIGHUP, and again after SIGKILL.
 const HANGUP_GRACE: Duration = Duration::from_millis(500);
 
@@ -111,6 +130,11 @@ enum Command {
 pub struct Session {
     commands: Option<std::sync::mpsc::Sender<Command>>,
     pty: Option<pty_process::OwnedWritePty>,
+    /// The count of writes to the PTY master.
+    ///
+    /// The terminal thread reads this count to find the output that answers a
+    /// keystroke. That output leaves the batch window at once.
+    input_seq: Arc<AtomicU64>,
     /// The process group of the child. The child is a session leader, so this
     /// value is the process identifier of the child.
     pgid: Option<Pid>,
@@ -170,12 +194,14 @@ impl Session {
         let (commands, command_rx) = std::sync::mpsc::channel::<Command>();
         let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(CLIENT_QUEUE);
         let resync = Arc::new(AtomicBool::new(false));
+        let input_seq = Arc::new(AtomicU64::new(0));
 
         let terminal_thread = std::thread::Builder::new()
             .name("pirate-terminal".to_string())
             .spawn({
                 let resync = Arc::clone(&resync);
-                move || run_terminal(&command_rx, frame_tx, &resync, cols, rows)
+                let input_seq = Arc::clone(&input_seq);
+                move || run_terminal(&command_rx, frame_tx, &resync, &input_seq, cols, rows)
             })?;
 
         let (status_tx, status) = watch::channel(None);
@@ -190,6 +216,7 @@ impl Session {
         let session = Self {
             commands: Some(commands),
             pty: Some(write_pty),
+            input_seq,
             pgid,
             status,
             terminal_thread: Some(terminal_thread),
@@ -204,6 +231,9 @@ impl Session {
         let Some(pty) = self.pty.as_mut() else {
             return Err(std::io::Error::other("the session is closed"));
         };
+        // The count goes up before the write, so the terminal thread cannot
+        // see the echo of these bytes before it sees the count.
+        self.input_seq.fetch_add(1, Ordering::Relaxed);
         let mut rest = bytes;
         while !rest.is_empty() {
             match pty.write(rest).await {
@@ -443,6 +473,7 @@ fn run_terminal(
     commands: &std::sync::mpsc::Receiver<Command>,
     tx: mpsc::Sender<Vec<u8>>,
     resync: &Arc<AtomicBool>,
+    input_seq: &Arc<AtomicU64>,
     cols: u16,
     rows: u16,
 ) {
@@ -467,6 +498,15 @@ fn run_terminal(
     // next pass, so the order of the commands holds.
     let mut pending: Option<Command> = None;
 
+    // The end of the window of the last output frame. A frame that starts after
+    // this instant goes out with no wait.
+    let mut window_end = Instant::now();
+
+    // The count of input writes that the last output frame answered. The echo
+    // of a keystroke is the output that follows a new count, and it waits for
+    // nothing.
+    let mut seen_input = input_seq.load(Ordering::Relaxed);
+
     loop {
         let command = match pending.take() {
             Some(command) => command,
@@ -478,20 +518,16 @@ fn run_terminal(
 
         match command {
             Command::Output(bytes) => {
-                // Join the output that is already in the queue. One parse and
-                // one frame of N bytes cost less than N/1024 of each, and the
-                // PTY gives about 1024 bytes per read.
-                let mut batch = bytes;
-                while batch.len() < OUTPUT_BATCH {
-                    match commands.try_recv() {
-                        Ok(Command::Output(more)) => batch.extend_from_slice(&more),
-                        Ok(other) => {
-                            pending = Some(other);
-                            break;
-                        }
-                        Err(_) => break,
-                    }
-                }
+                // Join the output that is already in the queue, and then the
+                // output that arrives inside the window. One parse and one
+                // frame of N bytes cost less than N/1024 of each, and the PTY
+                // gives about 1024 bytes per read.
+                let batch;
+                (batch, pending) = collect_output(commands, bytes, window_end, || {
+                    input_seq.load(Ordering::Relaxed) != seen_input
+                });
+                seen_input = input_seq.load(Ordering::Relaxed);
+                window_end = Instant::now() + OUTPUT_WINDOW;
                 terminal.write(&batch);
                 client.send(ServerFrame::Output(&batch).encode());
             }
@@ -524,6 +560,50 @@ fn run_terminal(
             Command::Stop => break,
         }
     }
+}
+
+/// Join the output of one frame.
+///
+/// The output that is already in the queue joins with no wait. Further output
+/// joins until `window_end`, until the frame is full, or until a command that
+/// is not output arrives.
+///
+/// `input_arrived` reports a keystroke that the last frame did not answer. The
+/// wait ends there, because the echo of a keystroke is the one output that an
+/// operator times.
+///
+/// The second value is the command that ended the collection. That command runs
+/// on the next pass of the loop, so the order of the commands holds.
+fn collect_output(
+    commands: &std::sync::mpsc::Receiver<Command>,
+    first: Vec<u8>,
+    window_end: Instant,
+    input_arrived: impl Fn() -> bool,
+) -> (Vec<u8>, Option<Command>) {
+    let mut batch = first;
+    while batch.len() < OUTPUT_BATCH {
+        match commands.try_recv() {
+            Ok(Command::Output(more)) => {
+                batch.extend_from_slice(&more);
+                continue;
+            }
+            Ok(other) => return (batch, Some(other)),
+            Err(_) => {}
+        }
+
+        let now = Instant::now();
+        if now >= window_end || input_arrived() {
+            break;
+        }
+        match commands.recv_timeout(window_end - now) {
+            Ok(Command::Output(more)) => batch.extend_from_slice(&more),
+            Ok(other) => return (batch, Some(other)),
+            // The window ended, or the writers are gone. The next receive of
+            // the loop reports the second one.
+            Err(_) => break,
+        }
+    }
+    (batch, None)
 }
 
 /// Read the PTY master until the output ends, then report the exit status.

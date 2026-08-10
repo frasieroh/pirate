@@ -655,6 +655,77 @@ async fn a_burst_arrives_whole_and_in_far_fewer_messages_than_reads() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_line_at_a_time_writer_arrives_whole_and_in_far_fewer_messages_than_lines() {
+    // A writer that is slower than the server leaves the command queue empty on
+    // every pass. A join of the queued output alone therefore joins nothing,
+    // and each line becomes one frame and one WebSocket message. The batch
+    // window holds the lines that arrive close together in one message.
+    //
+    // The script writes 2000 lines of about 102 bytes, which is about 204 KB.
+    // Each line names its own place in the order, so a lost line, a duplicated
+    // line, or a swapped pair fails the byte assertion.
+    //
+    // The inner loop paces the writer at about 1 ms per line, which is the rate
+    // of a program that does work between two lines. Without it, this machine
+    // writes faster than the server sends, the queue then holds several lines
+    // at each pass, and the test measures the old join and not the window.
+    //
+    // The carriage returns come from ONLCR, as in the burst test above.
+    let lines = 2_000_usize;
+    let pace = 400_usize;
+    let pad = "x".repeat(99);
+    let dir = temp_dir("line-at-a-time");
+    let script = write_script(
+        &dir,
+        "lines.sh",
+        &format!(
+            "#!/bin/sh\nstty -echo\ni=1\nwhile [ $i -le {lines} ]; do\n\
+             j=0\nwhile [ $j -lt {pace} ]; do\nj=$((j+1))\ndone\n\
+             printf '%s %s\\n' \"$i\" '{pad}'\ni=$((i+1))\ndone\n"
+        ),
+    );
+    let addr = start(script).await;
+    let mut socket = connect(addr).await;
+
+    let last = format!("\n{lines} ");
+    let mut text = String::new();
+    let mut messages = 0_usize;
+    let mut bytes_in = 0_usize;
+    let deadline = Instant::now() + WAIT;
+    while Instant::now() < deadline && !text.contains(&last) {
+        let frame = next_binary(&mut socket).await;
+        if let Ok(ServerFrame::Output(bytes)) = ServerFrame::decode(&frame) {
+            messages += 1;
+            bytes_in += bytes.len();
+            text.push_str(&String::from_utf8_lossy(bytes));
+        }
+    }
+    println!("line-at-a-time: {bytes_in} bytes in {messages} messages");
+
+    // Every line, in order, and none missing.
+    let got: Vec<&str> = text
+        .trim_end()
+        .split('\n')
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    let expected: Vec<String> = (1..=lines).map(|n| format!("{n} {pad}")).collect();
+    assert_eq!(got.len(), expected.len(), "the stream lost or added a line");
+    for (got, want) in got.iter().zip(&expected) {
+        assert_eq!(got, want, "the stream arrived out of order");
+    }
+
+    // The count follows the time that the writer takes, divided by the window.
+    // Without the window this machine gave 1380 messages, and with it 206. The
+    // bound is loose, because the rate of the writer belongs to the machine:
+    // it is four times the count that this machine gives, and one message per
+    // line still breaks it.
+    assert!(
+        messages <= 800,
+        "the stream arrived in {messages} messages, so the window did not hold it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resize_frame_reaches_the_pty() {
     // `stty size` reads the window size from the PTY itself, so this test
     // proves that the resize frame arrived at the kernel and not only at the

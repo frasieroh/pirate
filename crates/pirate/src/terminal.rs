@@ -66,71 +66,136 @@ const ENTER_ALTERNATE: &[u8] = b"\x1b[?1049h\x1b[H\x1b[2J";
 /// alternate screen keeps its content, so this sequence is safe in both cases.
 const LEAVE_ALTERNATE: &[u8] = b"\x1b[?1049l\x1b[H\x1b[2J";
 
-/// The start of a private mode sequence: `CSI ?`.
-///
-/// Only a private mode sequence puts the terminal on the alternate screen.
-const PRIVATE_MODE: &[u8] = b"\x1b[?";
-
 /// The private modes that switch the screen.
 ///
 /// 1049 is the mode of tmux, vim, and less. 47 and 1047 are the older modes,
 /// and terminfo entries still carry them.
 const SCREEN_MODES: [&[u8]; 3] = [b"47", b"1047", b"1049"];
 
-/// A private mode sequence that can put the terminal on the alternate screen.
-struct ScreenSwitch {
-    /// The index of the ESC byte.
-    start: usize,
-    /// The index after the sequence. It is the length of the chunk when the
-    /// chunk cuts the sequence short.
-    end: usize,
-    /// False when the chunk ends inside the sequence.
-    complete: bool,
+/// The longest parameter of [`SCREEN_MODES`].
+const MODE_LEN: usize = 4;
+
+/// The step of [`ScreenScanner`].
+#[derive(Clone, Copy)]
+enum ScanStep {
+    /// Outside an escape sequence.
+    Ground,
+    /// After ESC.
+    Escape,
+    /// After `CSI`, before the private mode marker.
+    Csi,
+    /// Inside the parameters of `CSI ? Pm`.
+    Params,
+    /// Inside a sequence that cannot switch the screen.
+    Ignore,
 }
 
-/// Find the first sequence that can put the terminal on the alternate screen.
+/// A scanner that finds the byte that switches the screen.
 ///
-/// The sequence is `CSI ? Pm h`, which sets a mode, or `CSI ? Pm r`, which
-/// restores one. A parameter of 47, 1047, or 1049 switches the screen. A
-/// sequence that the chunk cuts short counts also, because the rest of it
-/// arrives in the next chunk and the capture must come before it.
-fn next_screen_switch(bytes: &[u8]) -> Option<ScreenSwitch> {
-    let mut at = 0;
-    while let Some(offset) = find(&bytes[at..], PRIVATE_MODE) {
-        let start = at + offset;
-        let params_at = start + PRIVATE_MODE.len();
-        // A parameter byte is 0x30 to 0x3f. The first byte outside that range
-        // is the final byte of the sequence.
-        let final_at = bytes[params_at..]
-            .iter()
-            .position(|b| !(0x30..=0x3f).contains(b))
-            .map(|i| params_at + i);
-        let Some(final_at) = final_at else {
-            return Some(ScreenSwitch {
-                start,
-                end: bytes.len(),
-                complete: false,
-            });
-        };
-        let switches = matches!(bytes[final_at], b'h' | b'r')
-            && bytes[params_at..final_at]
-                .split(|b| *b == b';')
-                .any(|param| SCREEN_MODES.contains(&param));
-        if switches {
-            return Some(ScreenSwitch {
-                start,
-                end: final_at + 1,
-                complete: true,
-            });
-        }
-        at = params_at;
-    }
-    None
+/// The sequence is `CSI ? Pm h`, which sets a private mode, or `CSI ? Pm r`,
+/// which restores one. A parameter of 47, 1047, or 1049 switches the screen.
+///
+/// The scanner holds its step between calls, because the PTY cuts a chunk at
+/// any byte. A sequence that starts in one chunk and ends in the next one
+/// therefore counts the same as a sequence inside one chunk.
+struct ScreenScanner {
+    step: ScanStep,
+    /// The parameter that the scanner reads now.
+    param: [u8; MODE_LEN],
+    /// The length of `param`. A value of more than `MODE_LEN` marks a
+    /// parameter that is too long to be a screen mode.
+    param_len: usize,
+    /// True when a parameter of the current sequence is a screen mode.
+    hit: bool,
+    /// True when the current sequence holds an intermediate byte, such as the
+    /// `$` of `CSI ? Pm $ p`. Such a sequence reports a mode. It sets none.
+    intermediate: bool,
 }
 
-/// The index of the first `needle` in `haystack`.
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+impl ScreenScanner {
+    fn new() -> Self {
+        Self {
+            step: ScanStep::Ground,
+            param: [0; MODE_LEN],
+            param_len: 0,
+            hit: false,
+            intermediate: false,
+        }
+    }
+
+    /// Start a new `CSI ? Pm` sequence.
+    fn start_params(&mut self) {
+        self.step = ScanStep::Params;
+        self.param_len = 0;
+        self.hit = false;
+        self.intermediate = false;
+    }
+
+    /// Close the parameter that the scanner reads now.
+    fn end_param(&mut self) {
+        if self.param_len <= MODE_LEN && SCREEN_MODES.contains(&&self.param[..self.param_len]) {
+            self.hit = true;
+        }
+        self.param_len = 0;
+    }
+
+    /// The index of the byte of `bytes` that switches the screen.
+    ///
+    /// The scanner consumes every byte up to and including that one. Call this
+    /// function again on the rest of the chunk to find the next switch.
+    fn next_switch(&mut self, bytes: &[u8]) -> Option<usize> {
+        for (i, byte) in bytes.iter().enumerate() {
+            // ESC cancels the sequence that came before it, at every step.
+            if *byte == 0x1b {
+                self.step = ScanStep::Escape;
+                continue;
+            }
+            match self.step {
+                ScanStep::Ground => {}
+                ScanStep::Escape => {
+                    self.step = if *byte == b'[' {
+                        ScanStep::Csi
+                    } else {
+                        ScanStep::Ground
+                    };
+                }
+                ScanStep::Csi => {
+                    if *byte == b'?' {
+                        self.start_params();
+                    } else {
+                        self.step = ScanStep::Ignore;
+                    }
+                }
+                ScanStep::Params => match byte {
+                    // A C0 control byte runs and leaves the sequence intact.
+                    0x00..=0x1f => {}
+                    b';' => self.end_param(),
+                    0x30..=0x3f => {
+                        if self.param_len < MODE_LEN {
+                            self.param[self.param_len] = *byte;
+                        }
+                        self.param_len += 1;
+                    }
+                    // An intermediate byte, such as the `$` of a mode report.
+                    0x20..=0x2f => self.intermediate = true,
+                    // The final byte.
+                    _ => {
+                        self.end_param();
+                        self.step = ScanStep::Ground;
+                        if !self.intermediate && matches!(byte, b'h' | b'r') && self.hit {
+                            return Some(i);
+                        }
+                    }
+                },
+                ScanStep::Ignore => {
+                    if (0x40..=0x7e).contains(byte) {
+                        self.step = ScanStep::Ground;
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 /// The authoritative screen state of one session.
@@ -149,11 +214,8 @@ pub struct ScreenTerminal {
     /// `None` when the primary screen held no text, and again after the
     /// terminal leaves the alternate screen.
     primary: Option<Vec<u8>>,
-    /// A capture that waits for the switch that follows it.
-    ///
-    /// It becomes [`Self::primary`] when the terminal reaches the alternate
-    /// screen, and it is dropped when the terminal stays on the primary screen.
-    pending: Option<Vec<u8>>,
+    /// The scanner that finds the switch inside the stream of the PTY.
+    scanner: ScreenScanner,
 }
 
 impl ScreenTerminal {
@@ -170,7 +232,7 @@ impl ScreenTerminal {
             inner,
             alternate: false,
             primary: None,
-            pending: None,
+            scanner: ScreenScanner::new(),
         })
     }
 
@@ -179,36 +241,35 @@ impl ScreenTerminal {
     /// This never fails. libghostty-vt treats the input as untrusted and logs
     /// a malformed sequence instead of stopping.
     ///
-    /// The write stops at each sequence that can enter the alternate screen,
-    /// and it captures the primary screen there. See [`Self::dump`].
+    /// The write stops before the byte that switches the screen, and it
+    /// captures the primary screen there. See [`Self::dump`].
     pub fn write(&mut self, bytes: &[u8]) {
         let mut rest = bytes;
-        let mut cut_short = false;
-        while let Some(switch) = next_screen_switch(rest) {
-            // The bytes before the switch belong to the screen that is active
-            // now, so they go in first.
-            self.inner.vt_write(&rest[..switch.start]);
-            self.observe();
-            self.pending = self.capture_primary();
-            self.inner.vt_write(&rest[switch.start..switch.end]);
-            cut_short = !switch.complete;
-            rest = &rest[switch.end..];
+        while let Some(at) = self.scanner.next_switch(rest) {
+            // Every byte up to the final byte of the sequence belongs to the
+            // screen that is active now, so those bytes go in first. The
+            // partial sequence among them changes no cell.
+            self.inner.vt_write(&rest[..at]);
+            self.observe(None);
+            let capture = self.capture_primary();
+            self.inner.vt_write(&rest[at..=at]);
+            self.observe(capture);
+            rest = &rest[at + 1..];
         }
         self.inner.vt_write(rest);
-        self.observe();
-        // A capture that no switch claimed is stale. Keep it only while the
-        // sequence that needs it is still incomplete.
-        if !cut_short && !self.alternate {
-            self.pending = None;
-        }
+        self.observe(None);
     }
 
     /// Read the active screen, then hold or drop the capture of the primary
     /// screen.
-    fn observe(&mut self) {
+    ///
+    /// `capture` is the primary screen from before the byte that the caller
+    /// wrote last. It becomes [`Self::primary`] when that byte reached the
+    /// alternate screen.
+    fn observe(&mut self, capture: Option<Vec<u8>>) {
         let alternate = self.on_alternate_screen().unwrap_or(self.alternate);
         if alternate && !self.alternate {
-            self.primary = self.pending.take();
+            self.primary = capture;
         } else if !alternate {
             self.primary = None;
         }
@@ -914,29 +975,167 @@ mod tests {
         assert!(source.dump().unwrap().starts_with(ENTER_ALTERNATE));
     }
 
+    /// The index of the switch inside one chunk, from a new scanner.
+    fn switch_at(bytes: &[u8]) -> Option<usize> {
+        ScreenScanner::new().next_switch(bytes)
+    }
+
     #[test]
     fn the_scanner_finds_the_sequences_that_switch_the_screen() {
-        // A mode that is not a screen mode must not cost a capture, and a
-        // sequence that a chunk cuts short must count.
-        assert!(next_screen_switch(b"plain text").is_none());
-        assert!(next_screen_switch(b"\x1b[?25l").is_none());
-        assert!(next_screen_switch(b"\x1b[?1049l").is_none());
-        assert!(next_screen_switch(b"\x1b[?104h").is_none());
+        // A mode that is not a screen mode must not cost a capture.
+        assert!(switch_at(b"plain text").is_none());
+        assert!(switch_at(b"\x1b[?25l").is_none());
+        assert!(switch_at(b"\x1b[?1049l").is_none());
+        assert!(switch_at(b"\x1b[?104h").is_none());
 
-        let switch = next_screen_switch(b"ab\x1b[?1049h").unwrap();
-        assert_eq!((switch.start, switch.end, switch.complete), (2, 10, true));
+        // The index is the index of the final byte of the sequence.
+        assert_eq!(switch_at(b"ab\x1b[?1049h"), Some(9));
+        assert_eq!(switch_at(b"\x1b[?25l\x1b[?47h"), Some(11));
+        assert_eq!(switch_at(b"\x1b[?25;1049h"), Some(10));
+        assert_eq!(switch_at(b"\x1b[?1047h"), Some(7));
 
-        let switch = next_screen_switch(b"\x1b[?25l\x1b[?47h").unwrap();
-        assert_eq!((switch.start, switch.end, switch.complete), (6, 12, true));
-
-        let switch = next_screen_switch(b"\x1b[?25;1049h").unwrap();
-        assert_eq!((switch.start, switch.end, switch.complete), (0, 11, true));
-
-        let switch = next_screen_switch(b"\x1b[?10").unwrap();
-        assert_eq!((switch.start, switch.end, switch.complete), (0, 5, false));
+        // A sequence that the chunk cuts short holds the scanner.
+        assert!(switch_at(b"\x1b[?10").is_none());
 
         // A restore of a saved mode enters the alternate screen also.
-        let switch = next_screen_switch(b"\x1b[?1049r").unwrap();
-        assert_eq!((switch.start, switch.end, switch.complete), (0, 8, true));
+        assert_eq!(switch_at(b"\x1b[?1049r"), Some(7));
+    }
+
+    #[test]
+    fn a_parameter_that_only_contains_a_screen_mode_does_not_switch() {
+        // 10490 and 447 hold the digits of 1049 and 47. Neither is a screen
+        // mode, and a scanner that compares a substring switches on both.
+        assert!(switch_at(b"\x1b[?10490h").is_none());
+        assert!(switch_at(b"\x1b[?447h").is_none());
+        assert!(switch_at(b"\x1b[?4700h").is_none());
+        assert!(switch_at(b"\x1b[?110471h").is_none());
+        assert!(switch_at(b"\x1b[?1;10490;2h").is_none());
+    }
+
+    #[test]
+    fn a_sequence_that_reports_or_saves_a_mode_does_not_switch() {
+        // `CSI ? Pm $ p` asks for the value of a mode. `CSI ? Pm s` saves it.
+        // Neither one moves the terminal to the alternate screen.
+        assert!(switch_at(b"\x1b[?1049$p").is_none());
+        assert!(switch_at(b"\x1b[?1049s").is_none());
+        assert!(switch_at(b"\x1b[?47$p").is_none());
+    }
+
+    #[test]
+    fn the_digits_of_a_screen_mode_inside_a_string_do_not_switch() {
+        // A payload of an OSC or an APC string is data. A CSI parameter of a
+        // sequence that is not private is data also.
+        let mut term = ScreenTerminal::new(40, 8).unwrap();
+        term.write(b"\x1b]0;1049h\x07\x1b_G1049h\x1b\\\x1b[1049;47htext");
+        assert!(!term.on_alternate_screen().unwrap());
+        assert!(term.primary.is_none());
+    }
+
+    /// True when the primary screen reaches a client that joins after the
+    /// chunks arrive.
+    fn primary_reaches_a_client(chunks: &[&[u8]]) -> bool {
+        let mut source = ScreenTerminal::new(40, 8).unwrap();
+        source.write(b"primary one\r\nprimary two\r\n");
+        for chunk in chunks {
+            source.write(chunk);
+        }
+        source.write(b"\x1b[2J\x1b[Hinside the program");
+        assert!(
+            source.on_alternate_screen().unwrap(),
+            "not on the alternate"
+        );
+
+        let mut client = ScreenTerminal::new(40, 8).unwrap();
+        client.write(&source.dump().unwrap());
+        client.write(b"\x1b[?1049l");
+        client.row(0).unwrap() == "primary one" && client.row(1).unwrap() == "primary two"
+    }
+
+    #[test]
+    fn a_switch_that_any_split_cuts_apart_still_captures_the_primary_screen() {
+        // The PTY cuts a chunk at any byte, and a split before the `[` leaves
+        // no `ESC [ ?` in either chunk.
+        let sequence: &[u8] = b"\x1b[?1049h";
+        for i in 0..=sequence.len() {
+            let (head, tail) = sequence.split_at(i);
+            assert!(primary_reaches_a_client(&[head, tail]), "split at {i}");
+        }
+        for i in 0..=sequence.len() {
+            for j in i..=sequence.len() {
+                let (head, rest) = sequence.split_at(i);
+                let (middle, tail) = rest.split_at(j - i);
+                assert!(
+                    primary_reaches_a_client(&[head, middle, tail]),
+                    "split at {i} and {j}"
+                );
+            }
+        }
+        let single: Vec<&[u8]> = sequence.chunks(1).collect();
+        assert!(primary_reaches_a_client(&single), "one byte at a time");
+    }
+
+    #[test]
+    fn an_enter_inside_the_alternate_screen_keeps_the_capture() {
+        // vim sets 1049 again after a suspend, and tmux sets 47 and 1047 too.
+        let mut source = source_inside_a_program(40, 8, 3);
+        source.write(b"\x1b[?1049h");
+        assert!(
+            source.primary.is_some(),
+            "the second enter lost the capture"
+        );
+        source.write(b"\x1b[?47h\x1b[?1047h");
+        assert!(source.primary.is_some(), "47 or 1047 lost the capture");
+
+        let mut client = ScreenTerminal::new(40, 8).unwrap();
+        client.write(&source.dump().unwrap());
+        client.write(b"\x1b[?1049l");
+        assert_eq!(client.row(0).unwrap(), "primary line 0");
+    }
+
+    #[test]
+    fn a_leave_on_the_primary_screen_keeps_the_screen() {
+        let mut source = ScreenTerminal::new(40, 8).unwrap();
+        source.write(b"shell history\r\n");
+        source.write(b"\x1b[?1049l\x1b[?1049l");
+        assert!(source.primary.is_none());
+        assert_eq!(source.row(0).unwrap(), "shell history");
+    }
+
+    #[test]
+    fn a_long_parameter_run_neither_panics_nor_switches() {
+        let mut source = ScreenTerminal::new(40, 8).unwrap();
+        let mut sequence = b"\x1b[?".to_vec();
+        sequence.extend(std::iter::repeat_n(b'9', 100_000));
+        sequence.extend_from_slice(b"h");
+        source.write(&sequence);
+        assert!(!source.on_alternate_screen().unwrap());
+
+        // The run ends with a real screen mode, which switches.
+        let mut sequence = b"\x1b[?".to_vec();
+        sequence.extend(std::iter::repeat_n(b'9', 100_000));
+        sequence.extend_from_slice(b";1049h");
+        source.write(&sequence);
+        assert!(source.on_alternate_screen().unwrap());
+    }
+
+    #[test]
+    fn many_switches_leave_one_capture_at_most() {
+        // A program that enters and leaves the alternate screen must not make
+        // the terminal hold more than the one capture behind it. A measurement
+        // over 10000 cycles gave a flat cost per cycle and a capture of 5632
+        // bytes throughout. The loop below is short, because each capture is a
+        // full dump and the debug build takes about 20 ms for one cycle.
+        let mut source = ScreenTerminal::new(80, 24).unwrap();
+        source.write(b"shell history\r\n");
+        for _ in 0..200 {
+            source.write(b"\x1b[?1049h\x1b[2J\x1b[Hthe program");
+            source.write(b"\x1b[?1049l");
+        }
+        assert!(source.primary.is_none());
+        assert_eq!(source.row(0).unwrap(), "shell history");
+
+        source.write(b"\x1b[?1049h");
+        let capture = source.primary.as_ref().expect("no capture").len();
+        assert!(capture < 1 << 20, "the capture grew to {capture} bytes");
     }
 }
