@@ -9,8 +9,18 @@
  */
 
 import { beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import type { Page } from "playwright";
 import { loadVt, type Vt, type VtTerminal } from "../src/vt";
-import { clientState, hex, idle, server, size, waitFor, withClient } from "./harness";
+import {
+  clientState,
+  hex,
+  idle,
+  server,
+  size,
+  viewportText,
+  waitFor,
+  withClient,
+} from "./harness";
 
 beforeEach(() => {
   server().reset();
@@ -19,6 +29,75 @@ beforeEach(() => {
 /** Every resize frame that the client sent. */
 function resizeFrames(frames: Uint8Array[]): Uint8Array[] {
   return frames.filter((frame) => frame.length === 5 && frame[0] === 0x01);
+}
+
+/**
+ * The pause inside a drag, in milliseconds.
+ *
+ * The value is more than the debounce of `src/main.ts` and less than the
+ * 100 ms of the client before the measurement of the resize latency.
+ */
+const PAUSE_MS = 70;
+
+/** The viewport that a storm of these tests starts from. */
+const FLOOD_START = { width: 1000, height: 600 };
+
+/** Size changes in one storm. */
+const STORM_STEPS = 12;
+
+/** Milliseconds between two steps of a storm. */
+const STORM_STEP_MS = 40;
+
+/** Lines that one step of the flood sends. */
+const FLOOD_BATCH = 25;
+
+/** One line of the flood. It is short, so no size change wraps it. */
+function floodLine(number: number): string {
+  return `line ${String(number).padStart(4, "0")}`;
+}
+
+/** A size in cells. */
+interface CellSize {
+  cols: number;
+  rows: number;
+}
+
+/** The size that each layer of the client holds. */
+interface LayerSizes {
+  /** The cells that the container holds now, from the renderer. */
+  container: CellSize;
+  /** The grid of the renderer. */
+  grid: CellSize;
+  /** The VT terminal. */
+  vt: CellSize;
+}
+
+/**
+ * Read the size of each layer of the client.
+ *
+ * `fit` of the renderer measures the container and it writes nothing, so this
+ * read changes no size.
+ */
+function layerSizes(page: Page): Promise<LayerSizes> {
+  return page.evaluate(() => {
+    const term = (
+      globalThis as unknown as {
+        __pirate: {
+          term: {
+            cols: number;
+            rows: number;
+            renderer: { cols: number; rows: number; fit(): CellSize };
+          };
+        };
+      }
+    ).__pirate.term;
+    const fitted = term.renderer.fit();
+    return {
+      container: { cols: fitted.cols, rows: fitted.rows },
+      grid: { cols: term.renderer.cols, rows: term.renderer.rows },
+      vt: { cols: term.cols, rows: term.rows },
+    };
+  });
 }
 
 test("the first resize frame carries the size of the terminal, big-endian", async () => {
@@ -104,6 +183,145 @@ test("a burst of size changes gives one resize frame", async () => {
     console.log(`  debounce ${debounce} ms: 10 size changes gave ${after - before} resize frame(s)`);
     expect(after - before).toBe(1);
   });
+});
+
+test("a drag that pauses for 70 ms sends the size of the pause", async () => {
+  // The debounce holds one drag together. A pause inside the drag is the end
+  // of a drag for the operator, and the size of that pause must reach the
+  // server. This test therefore pins the debounce under the length of the
+  // pause. It counts frames and it measures no duration.
+  const stub = server();
+
+  await withClient(
+    async (page) => {
+      const first = await waitFor(
+        async () => resizeFrames(stub.received),
+        (list) => list.length >= 1,
+        "the first resize frame",
+      );
+      const before = first.length;
+
+      await page.setViewportSize({ width: 900, height: 560 });
+      await idle(PAUSE_MS);
+      await page.setViewportSize({ width: 760, height: 480 });
+
+      const frames = await waitFor(
+        async () => resizeFrames(stub.received),
+        (list) => list.length >= before + 2,
+        "one resize frame for each half of the drag",
+      );
+      const after = await size(page);
+      const last = frames[frames.length - 1];
+
+      // eslint-disable-next-line no-console
+      console.log(
+        `  a pause of ${PAUSE_MS} ms gave ${frames.length - before} resize frame(s)`,
+      );
+      expect(last[1] * 256 + last[2]).toBe(after.cols);
+      expect(last[3] * 256 + last[4]).toBe(after.rows);
+    },
+    { viewport: { width: 1000, height: 600 } },
+  );
+});
+
+test("a flood of output during a resize storm loses no line and corrupts none", async () => {
+  const stub = server();
+
+  await withClient(
+    async (page) => {
+      await waitFor(
+        async () => resizeFrames(stub.received),
+        (list) => list.length >= 1,
+        "the first resize frame",
+      );
+      const debounce = (await clientState(page)).resizeDebounceMs;
+
+      // Each step shrinks the viewport and sends a batch of lines. The drag
+      // only shrinks, so no row comes back out of the scrollback. The block
+      // `VtTerminal.resize` holds the reason: ghostty-vt.wasm 0.4.0 fills such
+      // a row with the bytes that the allocator left there.
+      let sent = 0;
+      for (let step = 1; step <= STORM_STEPS; step += 1) {
+        await page.setViewportSize({
+          width: FLOOD_START.width - step * 24,
+          height: FLOOD_START.height - step * 16,
+        });
+        let batch = "";
+        for (let line = 0; line < FLOOD_BATCH; line += 1) {
+          sent += 1;
+          batch += `${floodLine(sent)}\r\n`;
+        }
+        stub.send([{ tag: 0x00, text: batch }]);
+        await idle(STORM_STEP_MS);
+      }
+      await idle(debounce + 600);
+
+      const rows = (await viewportText(page)).filter((row) => row.length > 0);
+
+      // eslint-disable-next-line no-console
+      console.log(
+        `  ${sent} lines through ${STORM_STEPS} size changes: ` +
+          `${rows.length} rows, first ${rows[0]}, last ${rows[rows.length - 1]}`,
+      );
+
+      // Every row is one whole line of the flood. A row that holds a part of
+      // two lines, or a byte that no write sent, fails this pattern.
+      for (const row of rows) {
+        expect(row).toMatch(/^line \d{4}$/);
+      }
+      // The lines are consecutive, so no line of the flood is missing.
+      const numbers = rows.map((row) => Number(row.slice(5)));
+      for (let index = 1; index < numbers.length; index += 1) {
+        expect(numbers[index]).toBe(numbers[index - 1] + 1);
+      }
+      // The last line of the flood is on the screen.
+      expect(numbers[numbers.length - 1]).toBe(sent);
+      expect(numbers.length).toBeGreaterThan(1);
+    },
+    { viewport: FLOOD_START },
+  );
+});
+
+test("after a resize storm the grid, the VT, and the PTY hold one size", async () => {
+  const stub = server();
+
+  await withClient(
+    async (page) => {
+      await waitFor(
+        async () => resizeFrames(stub.received),
+        (list) => list.length >= 1,
+        "the first resize frame",
+      );
+      const debounce = (await clientState(page)).resizeDebounceMs;
+
+      for (let step = 1; step <= STORM_STEPS; step += 1) {
+        await page.setViewportSize({
+          width: FLOOD_START.width - step * 24,
+          height: FLOOD_START.height - step * 16,
+        });
+        await idle(STORM_STEP_MS);
+      }
+      await idle(debounce + 600);
+
+      const layers = await layerSizes(page);
+      const frames = resizeFrames(stub.received);
+      const last = frames[frames.length - 1];
+      const pty = { cols: last[1] * 256 + last[2], rows: last[3] * 256 + last[4] };
+
+      // eslint-disable-next-line no-console
+      console.log(
+        `  container ${layers.container.cols}x${layers.container.rows}  ` +
+          `grid ${layers.grid.cols}x${layers.grid.rows}  ` +
+          `vt ${layers.vt.cols}x${layers.vt.rows}  ` +
+          `pty ${pty.cols}x${pty.rows}`,
+      );
+
+      expect(layers.grid).toEqual(layers.container);
+      expect(layers.vt).toEqual(layers.container);
+      expect(pty).toEqual(layers.container);
+    },
+    { viewport: FLOOD_START },
+  );
 });
 
 // ============================================================================

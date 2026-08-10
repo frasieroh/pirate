@@ -29,8 +29,15 @@ import {
   SERVER_OUTPUT,
 } from "./protocol";
 
-/** The wait after the last resize event, before pirate sends a resize frame. */
-const RESIZE_DEBOUNCE_MS = 100;
+/**
+ * The wait after the last resize event, before pirate sends a resize frame.
+ *
+ * Measurement, `web/bench/resize-storm.spec.ts`, fast drag: 100 ms gave a
+ * settle of 111 ms median and 175 ms p95, and 50 ms gave 59 ms and 59 ms. A
+ * value under the 40 ms between two size changes of that drag stops the
+ * coalesce. The drag then sends one frame per step, and the p95 grows again.
+ */
+const RESIZE_DEBOUNCE_MS = 50;
 /** The first reconnect wait. Each further attempt doubles it. */
 const RECONNECT_MIN_MS = 250;
 /** The largest reconnect wait. */

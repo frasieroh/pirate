@@ -1421,31 +1421,60 @@ describe("the theme", () => {
  *
  * The client of `src/main.ts` holds a debounce, so it applies one size per
  * drag. This storm applies a size for every step, which is the harder input:
- * the renderer takes 12 grid sizes and 12 canvas sizes while the flood runs.
+ * the renderer takes a grid size and a canvas size for each step while the
+ * flood runs.
+ *
+ * # The cost of one storm
+ *
+ * Each `grid.resize` reallocates the drawing buffer of the WebGL2 context.
+ * Under `--enable-unsafe-swiftshader` that reallocation runs on the CPU, and
+ * back-to-back calls in one task queue up behind each other. Measurement in
+ * this Chromium, at a load average of 197: one `grid.resize` of a storm costs
+ * 1.4 s to 8.9 s, a storm of 12 steps costs 47 s inside `page.evaluate`, and
+ * a storm of 6 steps costs 31 s. The cost holds when the canvas gets smaller,
+ * so it follows the load and not the canvas area.
+ *
+ * The default test timeout is 30 s. A timeout closes the shared browser of
+ * `tests/harness.ts`, and every later test of the run then fails with
+ * `Target page, context or browser has been closed`. Three guards keep this
+ * block away from that state:
+ *
+ * - One storm serves the three tests below.
+ * - The step count is 6, not 12.
+ * - The hook carries its own timeout, `STORM_TIMEOUT_MS`.
  */
 describe("the resize storm", () => {
   /** Size changes of one storm. */
-  const STEPS = 12;
+  const STEPS = 6;
 
   /** Lines that the flood writes on each side of one size change. */
   const LINES_PER_STEP = 3;
 
   /** Paints after the last size change. These take the dirty-row path. */
-  const SETTLE_STEPS = 4;
+  const SETTLE_STEPS = 2;
 
-  /** Run one storm on a fresh grid of 60 by 23 cells. */
-  async function storm(): Promise<StormResult> {
+  /**
+   * The timeout of the storm hook, in milliseconds.
+   *
+   * The worst measured storm of 6 steps costs 31 s. This value holds a factor
+   * of about 4 over that number, because a timeout here fails every later
+   * test of the whole run and not this block alone.
+   */
+  const STORM_TIMEOUT_MS = 120_000;
+
+  /** The one storm that every test of this block reads. */
+  let result: StormResult;
+
+  beforeAll(async () => {
     await make(60, 23);
-    return page.evaluate(
+    result = await page.evaluate(
       (options: StormOptions) =>
         (globalThis as unknown as { __grid: GridApi }).__grid.storm(options) as never,
       { steps: STEPS, linesPerStep: LINES_PER_STEP, settleSteps: SETTLE_STEPS },
     );
-  }
+  }, STORM_TIMEOUT_MS);
 
-  test("a flood during a storm drops no line of output", async () => {
-    const result = await storm();
-
+  test("a flood during a storm drops no line of output", () => {
     // The flood ends every line with CR LF, so the flood alone leaves the last
     // row empty. The last mark of the storm holds that row.
     expect(result.text[result.text.length - 1]).toBe(`mark ${result.marked}`);
@@ -1465,9 +1494,7 @@ describe("the resize storm", () => {
     }
   });
 
-  test("a flood during a storm corrupts no row of the canvas", async () => {
-    const result = await storm();
-
+  test("a flood during a storm corrupts no row of the canvas", () => {
     // Every paint of a mark took the dirty-row path. A paint that wrote every
     // row would hide a fault of that path.
     expect(result.settlePaints.length).toBe(STEPS + SETTLE_STEPS);
@@ -1492,9 +1519,7 @@ describe("the resize storm", () => {
     expect(result.patternColors.map(show)).toEqual(expected);
   });
 
-  test("the grid size, the sent size, and the VT size agree after a storm", async () => {
-    const result = await storm();
-
+  test("the grid size, the sent size, and the VT size agree after a storm", () => {
     // The size that the client rule computed last is the size of the VT
     // terminal and the size of the grid.
     expect({ cols: result.vtCols, rows: result.vtRows }).toEqual({
