@@ -24,7 +24,9 @@
  * The stages of one storm, in order:
  *
  * - `debounce` is the last size change to the `fit` that follows it.
- *   `RESIZE_DEBOUNCE_MS` of `src/main.ts` holds this wait at 50 ms.
+ *   `RESIZE_DEBOUNCE_MS` of `src/main.ts` holds this wait at 20 ms. The fast
+ *   drag of this bench steps every 40 ms, so a debounce under that step stops
+ *   the coalesce here. Read `bench/whole-path.e2e.ts` for the settle.
  * - `fit` is `fit` of the renderer, plus the resize of the VT and of the grid.
  * - `trip` is the resize frame to the first byte of the redraw that answers it.
  * - `output` is the first byte of the redraw to the last byte of it, and
@@ -68,7 +70,7 @@ const STEPS = 12;
  * own copy, because the bench must fail when the product value changes under
  * it without a new measurement.
  */
-const RESIZE_DEBOUNCE_MS = 50;
+const RESIZE_DEBOUNCE_MS = 20;
 
 /**
  * Milliseconds between two steps of a fast drag.

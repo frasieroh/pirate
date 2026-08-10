@@ -20,5 +20,5 @@
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.tests.json && tsc --noEmit -p tsconfig.e2e.json"
   },
   "type": "module",
-  "version": "0.2.0"
+  "version": "0.3.0"
 }
