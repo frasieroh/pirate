@@ -33,9 +33,13 @@ import {
  * The wait after the last resize event, before pirate sends a resize frame.
  *
  * Measurement, `web/bench/resize-storm.spec.ts`, fast drag: 100 ms gave a
- * settle of 111 ms median and 175 ms p95, and 50 ms gave 59 ms and 59 ms. A
- * value under the 40 ms between two size changes of that drag stops the
- * coalesce. The drag then sends one frame per step, and the p95 grows again.
+ * settle of 111 ms median and 175 ms p95, and 50 ms gave 59 ms and 59 ms.
+ *
+ * The fast drag of that bench steps every 40 ms. A debounce under that step
+ * stops the coalesce. The drag then sends one frame per step, and the p95
+ * grows again. The 40 ms is the shortest step that `setViewportSize` holds,
+ * so it is a limit of the harness. A drag of the window frame steps every
+ * 16 ms at 60 Hz. A value under 50 ms therefore stays unmeasured.
  */
 const RESIZE_DEBOUNCE_MS = 50;
 /** The first reconnect wait. Each further attempt doubles it. */

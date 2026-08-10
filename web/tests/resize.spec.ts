@@ -17,7 +17,6 @@ import {
   idle,
   server,
   size,
-  viewportText,
   waitFor,
   withClient,
 } from "./harness";
@@ -70,6 +69,41 @@ interface LayerSizes {
   grid: CellSize;
   /** The VT terminal. */
   vt: CellSize;
+}
+
+/**
+ * Every row of the buffer that holds text, scrollback included.
+ *
+ * `viewportText` of the harness reads the viewport alone. A flood of more
+ * lines than the rows of the viewport pushes the early lines into the
+ * scrollback, and a drop there stays out of the viewport.
+ */
+function bufferText(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const term = (
+      globalThis as unknown as {
+        __pirate: {
+          term: {
+            buffer: {
+              active: {
+                length: number;
+                getLine(index: number): { translateToString(trim?: boolean): string } | undefined;
+              };
+            };
+          };
+        };
+      }
+    ).__pirate.term;
+    const buffer = term.buffer.active;
+    const out: string[] = [];
+    for (let index = 0; index < buffer.length; index += 1) {
+      const text = buffer.getLine(index)?.translateToString(true) ?? "";
+      if (text.length > 0) {
+        out.push(text);
+      }
+    }
+    return out;
+  });
 }
 
 /**
@@ -256,7 +290,7 @@ test("a flood of output during a resize storm loses no line and corrupts none", 
       }
       await idle(debounce + 600);
 
-      const rows = (await viewportText(page)).filter((row) => row.length > 0);
+      const rows = await bufferText(page);
 
       // eslint-disable-next-line no-console
       console.log(
@@ -274,9 +308,11 @@ test("a flood of output during a resize storm loses no line and corrupts none", 
       for (let index = 1; index < numbers.length; index += 1) {
         expect(numbers[index]).toBe(numbers[index - 1] + 1);
       }
-      // The last line of the flood is on the screen.
+      // The buffer holds the first line and the last line of the flood, and
+      // the count matches. A drop inside the scrollback fails this check.
+      expect(numbers[0]).toBe(1);
       expect(numbers[numbers.length - 1]).toBe(sent);
-      expect(numbers.length).toBeGreaterThan(1);
+      expect(numbers.length).toBe(sent);
     },
     { viewport: FLOOD_START },
   );
