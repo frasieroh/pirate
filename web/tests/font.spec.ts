@@ -261,10 +261,10 @@ test("the font size survives a page reload", async () => {
  * The line height control.
  *
  * The line height is a multiplier of the cell height of the font metric.
- * This wave writes no renderer option, so the cell count of the grid holds
- * and the client sends no resize frame. The debounced pass is therefore the
- * measurable property, and `countFits` counts it: `src/main.ts` calls
- * `grid.fit()` one time in each pass.
+ * The renderer takes this multiplier, so the cell grows, the row count of the
+ * grid falls, and the client sends one resize frame. The debounced pass is
+ * therefore the measurable property, and `countFits` counts it: `src/main.ts`
+ * calls `grid.fit()` one time in each pass.
  */
 
 /** The text of the line height label. */
@@ -304,7 +304,7 @@ test("the line height starts at 1.0, and the decrease button is disabled there",
   });
 });
 
-test("one line height change asks for exactly one fit, and sends no resize frame", async () => {
+test("one line height change asks for exactly one fit, and sends one resize frame", async () => {
   const stub = server();
 
   await withClient(async (page) => {
@@ -335,10 +335,12 @@ test("one line height change asks for exactly one fit, and sends no resize frame
     expect(fits).toBe(1);
     expect(state.lineHeight).toBe(1.1);
     expect(await lineValue(page)).toBe("1.1");
-    // The renderer takes no line height in this wave, so the cell count holds
-    // and the client sends no frame for it.
-    expect(after - before).toBe(0);
-    expect(afterSize).toEqual(beforeSize);
+    // The renderer takes the line height, so the cell grows and the client
+    // sends one frame. Measurement: one press gives 1.1, and the grid goes
+    // from 109x38 to 109x34.
+    expect(after - before).toBe(1);
+    expect(afterSize.rows).toBeLessThan(beforeSize.rows);
+    expect(afterSize.cols).toBe(beforeSize.cols);
   });
 });
 

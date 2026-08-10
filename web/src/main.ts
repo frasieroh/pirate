@@ -127,6 +127,18 @@ async function main(): Promise<void> {
    */
   let lineHeight = stored.lineHeight;
 
+  /**
+   * The renderer, from the moment `GridRenderer.create` returns.
+   *
+   * The setter of `state.lineHeight` runs before that moment if a caller
+   * writes in the await window of `create`. A read of the `const grid`
+   * binding in that window throws a `ReferenceError`, because the binding is
+   * in its temporal dead zone. This name is undefined there instead, and
+   * `create` takes the `lineHeight` variable, so a write in the window
+   * reaches the first atlas.
+   */
+  let renderer: GridRenderer | undefined;
+
   const state: ClientState = {
     connections: 0,
     connected: false,
@@ -144,7 +156,7 @@ async function main(): Promise<void> {
         return;
       }
       lineHeight = next;
-      grid.setLineHeight(next);
+      renderer?.setLineHeight(next);
     },
     repeatRate: stored.repeatRate,
     repeatDelayMs: REPEAT_DELAY_MS,
@@ -197,9 +209,10 @@ async function main(): Promise<void> {
   const vt = await loadVt();
   const grid = await GridRenderer.create(container, {
     fontSize: stored.fontSize,
-    lineHeight: stored.lineHeight,
+    lineHeight,
     theme: stored[stored.mode],
   });
+  renderer = grid;
   const firstFit = grid.fit();
   const vtTerm: VtTerminal = vt.createTerminal(firstFit.cols, firstFit.rows);
 
