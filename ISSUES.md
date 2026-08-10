@@ -323,3 +323,22 @@ that the author missed. Only the subject lines were read here, not the reports.
 
 **A fix needs:** a review of those five commits by an engineer that did not write
 them.
+
+## 16. The vendored wasm module is larger than the npm module of upstream
+
+**Class:** project.
+
+**The operator sees:** nothing. The binary ships a larger wasm module than the
+one that upstream publishes on npm.
+
+**Evidence:** measured by reading `docs/building.md`. The vendored module is
+1.58 MB. The npm module of upstream is 1.39 MB. `docs/building.md:84` records
+both values.
+
+**Cause:** the build runs no `wasm-opt` pass. The pin of binaryen needs two
+exception lists in `cargo xtask verify-pins`. One of the two is necessary
+because the aqua package of binaryen publishes no linux-arm64 binary. That
+package declares `supported_envs: [darwin, amd64]`, and this repository builds
+and pins the linux-arm64 platform.
+
+**A fix needs:** a wasm optimizer that covers all four platforms.
