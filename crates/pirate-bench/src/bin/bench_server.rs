@@ -30,21 +30,13 @@
 //! the `one byte` row as the floor of that column, and read the `pipeline`
 //! report for the cost that pirate adds.
 
-use std::net::SocketAddr;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures_util::{SinkExt as _, StreamExt as _};
 use pirate::protocol::{ClientFrame, ServerFrame};
 use pirate::terminal::ScreenTerminal;
-use pirate::{router, AppState};
-use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::tungstenite::handshake::client::generate_key;
-use tokio_tungstenite::tungstenite::http::Request;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use pirate_bench::harness::{connect, fixture_dir, next_frame, send, start, write_script};
+use pirate_bench::stats::{median, ms2, ms3, quantile};
 
 /// Silence that ends one measurement.
 const QUIET: Duration = Duration::from_millis(400);
@@ -62,8 +54,6 @@ const ROWS: u16 = 50;
 /// system gives about an eighth of that, so the pipeline report uses the size
 /// that the measurement found and not the size that the code asks for.
 const PTY_CHUNK: usize = 1024;
-
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// What one replay of one fixture cost.
 struct Sample {
@@ -174,10 +164,10 @@ fn pipeline_report(scenarios: &[(String, PathBuf)]) -> Result<(), Box<dyn std::e
             name,
             bytes.len(),
             chunks.len(),
-            millis(&parse),
-            millis(&encode),
+            ms3(median(&parse)),
+            ms3(median(&encode)),
             dump_size,
-            millis(&dumped),
+            ms3(median(&dumped)),
         );
     }
     Ok(())
@@ -216,13 +206,7 @@ async fn round_trip_report() -> Result<(), Box<dyn std::error::Error>> {
         samples.push(at.elapsed());
     }
 
-    let mut micros: Vec<u128> = samples.iter().map(Duration::as_micros).collect();
-    micros.sort_unstable();
-    #[allow(clippy::cast_precision_loss)]
-    let at = |q: f64| -> String {
-        let index = ((micros.len() as f64 - 1.0) * q).round() as usize;
-        format!("{:.3} ms", micros[index] as f64 / 1000.0)
-    };
+    let at = |q: f64| -> String { ms3(quantile(&samples, q)) };
     println!(
         "  {:<12} {:>11} {:>11} {:>11}",
         "trips", "median", "p95", "p99"
@@ -235,15 +219,6 @@ async fn round_trip_report() -> Result<(), Box<dyn std::error::Error>> {
         at(0.99)
     );
     Ok(())
-}
-
-/// The median of a list of durations, as a string in milliseconds.
-fn millis(values: &[Duration]) -> String {
-    let mut micros: Vec<u128> = values.iter().map(Duration::as_micros).collect();
-    micros.sort_unstable();
-    #[allow(clippy::cast_precision_loss)]
-    let ms = micros[micros.len() / 2] as f64 / 1000.0;
-    format!("{ms:.3} ms")
 }
 
 /// Replay one fixture through the whole server, once.
@@ -325,18 +300,13 @@ async fn replay(
 
 /// Print the median of every column.
 fn print_row(name: &str, samples: &[Sample]) {
-    let median = |mut values: Vec<u128>| -> u128 {
-        values.sort_unstable();
-        values[values.len() / 2]
-    };
     let micros = |pick: fn(&Sample) -> Duration| -> String {
-        let value = median(samples.iter().map(|s| pick(s).as_micros()).collect());
-        #[allow(clippy::cast_precision_loss)]
-        let ms = value as f64 / 1000.0;
-        format!("{ms:.2} ms")
+        ms2(median(&samples.iter().map(pick).collect::<Vec<_>>()))
     };
     let count = |pick: fn(&Sample) -> usize| -> u128 {
-        median(samples.iter().map(|s| pick(s) as u128).collect())
+        let mut values: Vec<u128> = samples.iter().map(|s| pick(s) as u128).collect();
+        values.sort_unstable();
+        values[values.len() / 2]
     };
 
     let frames = count(|s| s.frames);
@@ -352,67 +322,4 @@ fn print_row(name: &str, samples: &[Sample]) {
         micros(|s| s.first),
         micros(|s| s.last),
     );
-}
-
-// --- The server and the socket --- //
-
-async fn start(shell: PathBuf) -> Result<SocketAddr, Box<dyn std::error::Error>> {
-    let state = Arc::new(AppState::plain(None, shell));
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    tokio::spawn(async move {
-        let _ = axum::serve(pirate::NoDelay(listener), router(state)).await;
-    });
-    Ok(addr)
-}
-
-/// Open one WebSocket to `/ws`.
-///
-/// `/ws` answers 403 when the `Origin` header is absent, and `connect_async` on
-/// a URL sends no such header. This function therefore builds the request, with
-/// the five WebSocket headers that tungstenite writes from the map.
-async fn connect(addr: SocketAddr) -> Result<Socket, Box<dyn std::error::Error>> {
-    let request = Request::builder()
-        .method("GET")
-        .uri(format!("ws://{addr}/ws"))
-        .header("Host", addr.to_string())
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "websocket")
-        .header("Sec-WebSocket-Version", "13")
-        .header("Sec-WebSocket-Key", generate_key())
-        .header("Origin", format!("http://{addr}"))
-        .body(())?;
-    let (socket, _) = tokio_tungstenite::connect_async(request).await?;
-    Ok(socket)
-}
-
-async fn send(
-    socket: &mut Socket,
-    frame: ClientFrame<'_>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    socket.send(Message::binary(frame.encode())).await?;
-    Ok(())
-}
-
-/// The next binary frame, or None when the stream stays quiet for `quiet`.
-async fn next_frame(socket: &mut Socket, quiet: Duration) -> Option<Vec<u8>> {
-    loop {
-        match tokio::time::timeout(quiet, socket.next()).await {
-            Err(_) | Ok(None) | Ok(Some(Err(_))) => return None,
-            Ok(Some(Ok(Message::Binary(bytes)))) => return Some(bytes.to_vec()),
-            Ok(Some(Ok(_))) => {}
-        }
-    }
-}
-
-fn write_script(dir: &Path, name: &str, body: &str) -> std::io::Result<PathBuf> {
-    let path = dir.join(name);
-    std::fs::write(&path, body)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
-    Ok(path)
-}
-
-/// `crates/pirate-bench/fixtures`, from the manifest directory of this crate.
-fn fixture_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
