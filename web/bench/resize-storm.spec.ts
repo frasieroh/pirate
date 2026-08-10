@@ -33,7 +33,9 @@
  * - `draw` is that paint.
  *
  * The six add up to `settle`, the time from the last size change of the drag to
- * the paint that shows the new size.
+ * the paint that shows the new size. The addition holds inside one storm.
+ * Each column of the report is the median of that column alone, so the printed
+ * columns do not add up to the printed settle.
  *
  * This file asserts no time. A threshold on a duration fails on a busy
  * machine, and CI must never fail on a latency number. The assertions cover
@@ -42,8 +44,8 @@
  */
 
 import { expect, test } from "bun:test";
-import { idle, server, size, withClient } from "../tests/harness";
-import type { Stub } from "../tests/stub-server";
+import { idle, server, size, viewportText, waitFor, withClient } from "../tests/harness";
+import type { FrameSpec, Stub } from "../tests/stub-server";
 import {
   instrument,
   resetTimings,
@@ -161,13 +163,18 @@ interface Replies {
  *
  * The returned function stops the responder. The caller resets `replies`
  * before each measured storm.
+ *
+ * The scan starts at the end of `received`, never at 0. A frame that arrived
+ * before this responder started already got its answer from the responder
+ * before it, and a second answer sends a screen of stale bytes into the client
+ * that the next storm measures.
  */
 function respondToResizes(
   stub: Stub,
   replies: Replies,
   build: (cols: number, rows: number) => Uint8Array,
 ): () => void {
-  let seen = 0;
+  let seen = stub.received.length;
   const timer = setInterval(() => {
     const frames = stub.received;
     for (; seen < frames.length; seen += 1) {
@@ -260,6 +267,43 @@ function report(name: string, samples: StormBudget[], redraws: number[], bytes: 
 }
 
 /**
+ * Make sure that the six stages are a complete split of the settle.
+ *
+ * Each stage is a forward interval, so none of the six is less than zero. The
+ * six are consecutive, so they add up to the settle. A negative stage says
+ * that `stormBudget` paired the last resize frame with a size change that
+ * follows it, which happens when the final step of the drag holds the cell
+ * count and sends no frame. The split is then meaningless.
+ *
+ * These are correctness assertions, not thresholds. No value of a clock on a
+ * busy machine can fail them.
+ */
+function checkStages(samples: StormBudget[]): void {
+  for (const b of samples) {
+    const stages = [b.debounceMs, b.fitMs, b.roundTripMs, b.outputMs, b.waitMs, b.drawMs];
+    expect(Math.min(...stages)).toBeGreaterThanOrEqual(0);
+    expect(stages.reduce((sum, stage) => sum + stage, 0)).toBeCloseTo(b.settleMs, 6);
+    // The parse is the part of the output that ran inside the wasm VT.
+    expect(b.parseMs).toBeLessThanOrEqual(b.outputMs + 1e-6);
+  }
+}
+
+/**
+ * A line that the stub writes into the normal screen before each H3 run.
+ *
+ * `__pirate.term` publishes no `isAlternateScreen`, so the test reads the
+ * buffer instead. DEC mode 1049 gives an empty alternate screen and it hides
+ * the normal one, so this marker is in the viewport of a normal run and out of
+ * the viewport of an alternate run.
+ */
+const MARKER = "the-normal-screen-of-the-h3-run";
+
+/** True while this marker is in the viewport. */
+async function markerVisible(page: Page): Promise<boolean> {
+  return (await viewportText(page)).join("").includes(MARKER);
+}
+
+/**
  * Split the round trip at the stub.
  *
  * `up` is the resize frame of the page to the answer of the stub. It holds the
@@ -275,6 +319,41 @@ function wireReport(name: string, ups: number[], downs: number[]): void {
       `down ${median(downs).toFixed(1).padStart(6)} ms (p95 ${p95(downs).toFixed(1)})\n`,
   );
 }
+
+test("the responder answers no resize frame from before it started", async () => {
+  // Three scenarios share one stub, and each one starts its own responder.
+  // A responder that scans from 0 answers every frame of the scenarios before
+  // it, so the client takes a burst of stale screens while the next storm
+  // starts. This test drives the responder against a stub of its own, so it
+  // needs no browser.
+  const received: Uint8Array[] = [new Uint8Array([0x01, 0x00, 0x50, 0x00, 0x18])];
+  const sent: Uint8Array[] = [];
+  const stub = {
+    received,
+    open: true,
+    send(frames: FrameSpec[]): void {
+      for (const frame of frames) {
+        sent.push(frame.bytes as Uint8Array);
+      }
+    },
+  } as unknown as Stub;
+  const replies: Replies = { count: 0, bytes: 0, lastBytes: 0, lastAt: 0 };
+
+  const stop = respondToResizes(stub, replies, sigwinchRedraw);
+  try {
+    await idle(POLL_MS * 20);
+    // The frame that arrived first stays unanswered.
+    expect(replies.count).toBe(0);
+
+    // A frame that arrives after the start still gets its redraw.
+    received.push(new Uint8Array([0x01, 0x00, 0x5a, 0x00, 0x1e]));
+    await idle(POLL_MS * 20);
+    expect(replies.count).toBe(1);
+    expect(sent.length).toBe(1);
+  } finally {
+    stop();
+  }
+}, 30_000);
 
 test("a resize storm settles one debounce after the drag stops", async () => {
   const stub = server();
@@ -320,6 +399,7 @@ test("a resize storm settles one debounce after the drag stops", async () => {
           // Every storm reached a paint. `stormBudget` throws when it finds
           // none, so a full sample list is that proof.
           expect(samples.length).toBe(REPEATS);
+          checkStages(samples);
 
           if (drag.stepMs < RESIZE_DEBOUNCE_MS) {
             // The debounce swallows the drag. One drag of 12 size changes
@@ -356,11 +436,33 @@ test("the alternate screen does not change the settle of a resize storm", async 
       await withClient(
         async (page) => {
           await instrument(page);
+          // The client sends a resize frame when the socket opens, and the
+          // responder answers it with a full-screen redraw. That redraw opens
+          // with a clear, so the marker goes out after it.
+          await idle(SETTLE_MS);
+          stub.send([
+            { tag: 0x00, bytes: new TextEncoder().encode(`\x1b[H\x1b[2J${MARKER}`) },
+          ]);
+          await waitFor(
+            () => markerVisible(page),
+            (visible) => visible,
+            "the marker in the normal screen",
+          );
           if (screen === "alternate") {
             // `ESC [ ? 1049 h` enters the alternate screen, as vim does.
             stub.send([{ tag: 0x00, bytes: new TextEncoder().encode("\x1b[?1049h") }]);
-            await idle(200);
           }
+          // The verdict on H3 needs the two runs to differ in the buffer. A
+          // lost `ESC [ ? 1049 h` gives two normal runs and a comparison of
+          // nothing against nothing. This wait is the proof that the two runs
+          // differ, and it throws when the buffer does not switch. Nothing in
+          // the drag sends `ESC [ ? 1049 l`, and a clear does not leave the
+          // alternate screen, so the buffer holds for the whole run.
+          await waitFor(
+            () => markerVisible(page),
+            (visible) => visible === (screen === "normal"),
+            `the marker of the ${screen} screen`,
+          );
 
           const samples: StormBudget[] = [];
           const counts: number[] = [];
@@ -371,6 +473,7 @@ test("the alternate screen does not change the settle of a resize storm", async 
             bytes.push(replies.bytes);
           }
           report(`${screen} screen`, samples, counts, bytes);
+          checkStages(samples);
           // The comparison takes the settle without the trip. The trip of this
           // harness holds tens of milliseconds that belong to no client.
           settles[screen] = median(samples.map((b) => b.settleMs - b.roundTripMs));
