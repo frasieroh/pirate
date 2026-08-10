@@ -294,6 +294,16 @@ Child `pager`, 12 size changes per storm, 7 runs.
 | paint | 2.5 to 7.8 ms | 6.0 to 8.6 ms |
 | TOTAL | 159 to 175 ms | 167 to 182 ms |
 
+CAUTION: do not compare the `one browser main-thread task` row with a figure
+of another graphics stack. The `long task` row of the harness report measured
+it, and that row counts main thread time alone. The software rasterizer works
+on the raster thread and the compositor thread, and this row holds none of
+that work. These values sit above the 50 ms threshold of the browser, so the
+threshold does not make them zero. The `0 ms` cell of the canvas-area sweep
+below is the other case. This row is main thread time that the browser
+observed. It is not a complete account of the cost. Read "The GPU path" for
+the limits of the row.
+
 **Software.**
 
 The settle measured 158.6 ms, 166.8 ms and 175.1 ms as the median across three
@@ -311,6 +321,10 @@ are wrapped, and all four read under 1 ms. A CPU profile puts about 5 ms in
 JavaScript and in wasm. The rest is engine-internal work that the canvas resize
 starts.
 
+The `long task` row of the harness report measured this task, under the
+software rasterizer. Read the CAUTION under the table of "The whole path, last
+resize to paint" before you compare this figure with another graphics stack.
+
 The task scales with the canvas area.
 
 | Canvas | Widest long task | Backed by a command |
@@ -327,6 +341,13 @@ sizes the work from it.
 CAUTION: this table comes from software WebGL2. No sweep of the canvas area
 has run on a real GPU yet. Read "The GPU path" below for the first GPU number
 of this task, at one canvas size.
+
+CAUTION: do not compare these three figures with a figure of another path or
+another harness. The `long task` row measured them, and "The GPU path" below
+gives the limits of that row. The 50 ms threshold of the browser makes the
+`0 ms` cell of the 400 x 300 canvas a threshold artifact. That cell means less
+than 50 ms, and it does not mean no cost. This document holds no replacement
+figure for the sweep.
 
 **Software.**
 
@@ -348,16 +369,30 @@ minute of each other, at a 1-minute load average of 2.29 and 2.12.
 
 **Software** for the first column, **GPU** for the second.
 
-The real GPU removes 41.7 ms of the total, 108.5 ms down to 66.8 ms. The stage
-that carries it is `child + wire`, 51.4 ms down to 9.0 ms.
+The real GPU removes 41.7 ms of the total, 108.5 ms down to 66.8 ms. One stage
+carries that difference. `child + wire` falls from 51.4 ms to 9.0 ms, which is
+42.4 ms. The other three stages move 1 ms or less each. These two rows are the
+whole evidence of this section. No other row separates the two paths.
 
-CAUTION: this table gives no `long task` row. The browser reports a long task
-only above a 50 ms threshold of main-thread time, and the software rasterizer
-runs on the raster and compositor threads, so the row reads 0.0 ms on both
-paths on an idle machine. A `long task` figure from this task is not evidence.
-The `main stall` row is not independent evidence either: `widestGap` seeds its
-marks with the window edges, so the stall is always bounded above by
-`child + wire`.
+A column of this table does not sum to its `TOTAL`. The stages tile the
+measured window per run, at `web/bench/whole-path.ts:542-556`. Each cell is an
+independent median over the 7 runs, and `TOTAL` is the median of the 7 run
+totals. The default column sums to 108.2 ms against a 108.5 ms median total.
+The GPU column sums to 65.5 ms against a 66.8 ms median total.
+
+CAUTION: this table gives no `long task` row. Do not use the `long task` row of
+the harness report to compare these two paths. The browser reports a long task
+only above a 50 ms threshold, and it counts main thread time alone. The
+software rasterizer works on the raster thread and the compositor thread. On an
+idle machine this row reads 0.0 ms on both paths, and the row is bimodal with
+machine load. A full trace of a default-path storm held zero long task events.
+The observer is live on both paths:
+`PerformanceObserver.supportedEntryTypes` holds `longtask`, and `observe()` is
+accepted.
+
+The `main stall` row is not independent evidence. `widestGap` in
+`web/bench/whole-path.ts:576` seeds its marks with the window edges, so
+`main stall` is always equal to or less than `child + wire`.
 
 About 42 ms of every headless figure in this document is an artifact of the
 software rasterizer, and not a cost that the operator pays.
@@ -391,6 +426,11 @@ through, and every step gives a full redraw.
 | H1, bytes or parse | refuted | a 56-byte redraw and a 4145-byte redraw give the same client settle, `local` 120.9 to 122.6 ms and 116.3 to 122.5 ms. Parse is 0.1 ms |
 | H2, the resize path | supported | the debounce holds 105 ms and the canvas-area task holds 47 to 58 ms of a 159 to 175 ms total |
 | H3, the alternate screen | refuted | alternate minus normal was +0.2, +0.6, -0.8, +2.4, -4.7, -2.5, -3.6 and -0.5 ms, so the sign changes and it is noise |
+
+The canvas-area task of the H2 row comes from the `long task` row, which "The
+GPU path" withdraws for a comparison across graphics stacks. The `child + wire`
+rows of "The GPU path" carry the same verdict without that row. The verdict
+stays.
 
 **Software.**
 
@@ -618,8 +658,10 @@ This track produced these items. They are a list and not a design.
    at `web/src/terminal.ts:518`. A VT220-class terminal sends
    `ESC [ ? 62 ; 22 c`. This is the cause of symptom 2.
 2. **The canvas-area long task.** One browser main-thread task holds 47 to
-   62 ms after a canvas resize, and it scales with the canvas area. Get a GPU
-   number first. The current number comes from software WebGL2.
+   62 ms after a canvas resize, and it scales with the canvas area. The
+   `long task` row measured it under software WebGL2. That row cannot give the
+   GPU number, for the reason in "The GPU path". A sweep of the canvas area
+   needs a measurement that holds on both paths first.
 3. **`dump()` carries the active screen only.**
    `crates/pirate/src/terminal.rs:150`. A client that joins while a program
    holds the alternate screen shows 2 rows where 38 belong, after the program
