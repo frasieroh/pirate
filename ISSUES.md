@@ -337,8 +337,9 @@ both values.
 
 **Cause:** the build runs no `wasm-opt` pass. The pin of binaryen needs two
 exception lists in `cargo xtask verify-pins`. One of the two is necessary
-because the aqua package of binaryen publishes no linux-arm64 binary. That
-package declares `supported_envs: [darwin, amd64]`, and this repository builds
-and pins the linux-arm64 platform.
+because the aqua package of binaryen publishes no linux-arm64 binary. The
+[aqua registry entry for `WebAssembly/binaryen`](https://github.com/aquaproj/aqua-registry/blob/e831e00a99f512934dd18533d8a1447b86b3aefd/pkgs/WebAssembly/binaryen/registry.yaml#L12-L14)
+declares `supported_envs: [darwin, amd64]`, and this repository builds and pins
+the linux-arm64 platform.
 
 **A fix needs:** a wasm optimizer that covers all four platforms.
