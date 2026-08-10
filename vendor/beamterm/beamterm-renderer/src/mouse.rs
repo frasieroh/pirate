@@ -530,6 +530,11 @@ impl SelectionState {
             Selecting { current, .. } => {
                 *current = Some((col, row));
             },
+            // CHANGED FROM UPSTREAM: pirate added this attribute. Clippy
+            // reports `collapsible_match` here, and the lint job of pirate
+            // runs with `-D warnings`. The attribute holds the upstream shape
+            // of this arm.
+            #[allow(clippy::collapsible_match)]
             MaybeSelecting { start } => {
                 if (col, row) != *start {
                     *self = Selecting { start: *start, current: Some((col, row)) };

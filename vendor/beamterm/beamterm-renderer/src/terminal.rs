@@ -27,7 +27,11 @@ use crate::{
 ///
 /// ```rust,no_run
 /// // Enable selection handler with options
-/// use beamterm_renderer::{MouseSelectOptions, Terminal, mouse::SelectionMode};
+// CHANGED FROM UPSTREAM: pirate corrected the two paths of the import line
+// below. `MouseSelectOptions` lives in the `mouse` module, and `SelectionMode`
+// lives at the crate root. The upstream line swaps them, so the doctest does
+// not compile.
+/// use beamterm_renderer::{SelectionMode, Terminal, mouse::MouseSelectOptions};
 ///
 /// let terminal = Terminal::builder("#canvas")
 ///     .mouse_selection_handler(

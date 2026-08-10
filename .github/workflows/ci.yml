@@ -152,6 +152,15 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The vendored beamterm tree is a separate Cargo workspace, so
+      # `--workspace` above does not reach it. The two steps below run its
+      # tests and its lints on the host target.
+      - name: Run clippy on the vendored beamterm workspace
+        run: cargo clippy --locked --manifest-path vendor/beamterm/Cargo.toml --all-targets -- -D warnings
+
+      - name: Test the vendored beamterm workspace
+        run: cargo test --locked --manifest-path vendor/beamterm/Cargo.toml
+
       # Cache 5. The key matches the one in the e2e and linux jobs.
       - name: Cache node_modules
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

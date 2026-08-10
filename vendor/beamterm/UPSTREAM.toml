@@ -51,4 +51,17 @@ files_changed = [
     "beamterm-core/Cargo.toml",
     # The `emojis` dev dependency goes with the deleted test suite.
     "beamterm-unicode/Cargo.toml",
+    # The dynamic atlas takes a line height multiplier. The rasterizer splits
+    # the extra height into a top pad and a bottom pad.
+    "beamterm-renderer/src/gl/canvas_rasterizer.rs",
+    "beamterm-renderer/src/gl/dynamic_atlas.rs",
+    # `withDynamicAtlas` takes the line height between the font size and
+    # `auto_resize_canvas_css`.
+    "beamterm-renderer/src/wasm.rs",
+    # The import line of the doctest at line 28 names the two paths the other
+    # way round, and that doctest does not compile.
+    "beamterm-renderer/src/terminal.rs",
+    # Clippy reports `collapsible_match` at the `MaybeSelecting` arm, and the
+    # lint job of pirate runs with `-D warnings`.
+    "beamterm-renderer/src/mouse.rs",
 ]
