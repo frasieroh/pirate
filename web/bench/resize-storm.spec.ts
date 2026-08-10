@@ -24,7 +24,7 @@
  * The stages of one storm, in order:
  *
  * - `debounce` is the last size change to the `fit` that follows it.
- *   `RESIZE_DEBOUNCE_MS` of `src/main.ts` holds this wait at 100 ms.
+ *   `RESIZE_DEBOUNCE_MS` of `src/main.ts` holds this wait at 50 ms.
  * - `fit` is `fit` of the renderer, plus the resize of the VT and of the grid.
  * - `trip` is the resize frame to the first byte of the redraw that answers it.
  * - `output` is the first byte of the redraw to the last byte of it, and
@@ -68,7 +68,7 @@ const STEPS = 12;
  * own copy, because the bench must fail when the product value changes under
  * it without a new measurement.
  */
-const RESIZE_DEBOUNCE_MS = 100;
+const RESIZE_DEBOUNCE_MS = 50;
 
 /**
  * Milliseconds between two steps of a fast drag.

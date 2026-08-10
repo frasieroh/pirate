@@ -72,6 +72,30 @@ interface LayerSizes {
 }
 
 /**
+ * Read `value` until two reads, `gapMs` apart, give the same result.
+ *
+ * A fixed wait after a storm is not enough on a loaded machine. The resize
+ * callbacks of the browser then arrive after the read, and the client fits
+ * after it. This poll waits for the client to stop instead.
+ */
+async function afterQuiet<T>(value: () => Promise<T>, gapMs: number): Promise<T> {
+  let last = JSON.stringify(await value());
+  const state = await waitFor(
+    async () => {
+      await idle(gapMs);
+      const now = await value();
+      const text = JSON.stringify(now);
+      const same = text === last;
+      last = text;
+      return { now, same };
+    },
+    (read) => read.same,
+    "the client to stop after the storm",
+  );
+  return state.now;
+}
+
+/**
  * Every row of the buffer that holds text, scrollback included.
  *
  * `viewportText` of the harness reads the viewport alone. A flood of more
@@ -288,9 +312,7 @@ test("a flood of output during a resize storm loses no line and corrupts none", 
         stub.send([{ tag: 0x00, text: batch }]);
         await idle(STORM_STEP_MS);
       }
-      await idle(debounce + 600);
-
-      const rows = await bufferText(page);
+      const rows = await afterQuiet(() => bufferText(page), debounce + 200);
 
       // eslint-disable-next-line no-console
       console.log(
@@ -337,12 +359,17 @@ test("after a resize storm the grid, the VT, and the PTY hold one size", async (
         });
         await idle(STORM_STEP_MS);
       }
-      await idle(debounce + 600);
-
-      const layers = await layerSizes(page);
-      const frames = resizeFrames(stub.received);
-      const last = frames[frames.length - 1];
-      const pty = { cols: last[1] * 256 + last[2], rows: last[3] * 256 + last[4] };
+      const state = await afterQuiet(async () => {
+        const sizes = await layerSizes(page);
+        const frames = resizeFrames(stub.received);
+        const last = frames[frames.length - 1];
+        return {
+          ...sizes,
+          pty: { cols: last[1] * 256 + last[2], rows: last[3] * 256 + last[4] },
+        };
+      }, debounce + 200);
+      const layers = state;
+      const pty = state.pty;
 
       // eslint-disable-next-line no-console
       console.log(
