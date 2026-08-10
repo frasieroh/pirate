@@ -22,6 +22,14 @@
 export { loadVt, Vt, type VtWasmSource } from "./wasm";
 export { VtTerminal } from "./terminal";
 export {
+  answerOf,
+  DA1_ANSWER,
+  QueryScanner,
+  type Query,
+  type QueryContext,
+  type QueryEvent,
+} from "./query";
+export {
   VtCellFlags,
   VtKey,
   VtKeyAction,

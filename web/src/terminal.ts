@@ -23,7 +23,15 @@ import type { BeamtermRenderer } from "@beamterm/renderer/web";
 
 import { GridRenderer, type FitResult } from "./render";
 import type { Theme } from "./theme";
-import { VtKey, VtKeyAction, VtMods, type VtTerminal } from "./vt";
+import {
+  answerOf,
+  QueryScanner,
+  VtKey,
+  VtKeyAction,
+  VtMods,
+  type QueryContext,
+  type VtTerminal,
+} from "./vt";
 
 /**
  * The `BeamtermRenderer` inside a `GridRenderer`.
@@ -294,6 +302,21 @@ export class PirateTerminal {
   private readonly container: HTMLElement;
   private readonly field: HTMLTextAreaElement;
   private readonly decoder = new TextDecoder();
+  private readonly encoder = new TextEncoder();
+  /**
+   * The scanner that finds the queries which the wasm engine leaves open.
+   *
+   * `src/vt/query.ts` names each query and the evidence for each answer.
+   */
+  private readonly queries = new QueryScanner();
+  /**
+   * The state that an answer reports.
+   *
+   * The modes come from the engine. The background comes from the theme that
+   * this facade holds: the engine reports 0,0,0 for the background of a new
+   * terminal, and `src/render/palette.ts` paints the background of the theme.
+   */
+  private readonly queryContext: QueryContext;
   private keyHandler: KeyEventHandler | undefined;
   private dataCallback: ((data: string) => void) | undefined;
   private disposed = false;
@@ -328,6 +351,11 @@ export class PirateTerminal {
         theme = next;
         options.renderer.setTheme(next);
       },
+    };
+
+    this.queryContext = {
+      isModeSet: (mode: number): boolean => this.vt.getMode(mode),
+      background: (): string => this.options.theme.background,
     };
 
     this.field = makeTextField();
@@ -432,12 +460,31 @@ export class PirateTerminal {
    * This is an own property of the instance, not a method of the prototype, so
    * a caller can replace it and observe every write. `web/bench/instrument.ts`
    * measures the parse time that way.
+   *
+   * The query scanner reads the same bytes first. A query that it holds
+   * splits the write: the bytes up to the end of the query go to the parser,
+   * the parser gives back its own answers, and the answer of the scanner goes
+   * out after them. A host that sends `ESC [ 6 n ESC [ c` therefore reads the
+   * CPR answer before the DA1 answer, as it does from a real terminal. The
+   * answer is built after that write, so it reports the state that the query
+   * asks about.
    */
   write = (data: Uint8Array | string): void => {
     if (this.disposed) {
       return;
     }
-    this.vt.write(data);
+    const bytes = typeof data === "string" ? this.encoder.encode(data) : data;
+    let at = 0;
+    for (const event of this.queries.feed(bytes)) {
+      this.vt.write(bytes.subarray(at, event.end));
+      at = event.end;
+      this.pumpResponse();
+      const answer = answerOf(event.query, this.queryContext);
+      if (answer !== null) {
+        this.dataCallback?.(answer);
+      }
+    }
+    this.vt.write(bytes.subarray(at));
     this.pumpResponse();
   };
 
