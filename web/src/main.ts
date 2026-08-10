@@ -133,9 +133,9 @@ async function main(): Promise<void> {
    * The setter of `state.lineHeight` runs before that moment if a caller
    * writes in the await window of `create`. A read of the `const grid`
    * binding in that window throws a `ReferenceError`, because the binding is
-   * in its temporal dead zone. This name is undefined there instead, and
-   * `create` takes the `lineHeight` variable, so a write in the window
-   * reaches the first atlas.
+   * in its temporal dead zone. This name is undefined there instead, so the
+   * setter reaches no method in the window. The call site of `create` carries
+   * a write of the window to the atlas.
    */
   let renderer: GridRenderer | undefined;
 
@@ -207,12 +207,23 @@ async function main(): Promise<void> {
   // facade is what `tests/theme.spec.ts` measures, and the session survives
   // because the state machine below it never moves.
   const vt = await loadVt();
+  const startLineHeight = lineHeight;
   const grid = await GridRenderer.create(container, {
     fontSize: stored.fontSize,
-    lineHeight,
+    lineHeight: startLineHeight,
     theme: stored[stored.mode],
   });
   renderer = grid;
+  // `create` reads its argument at the call, and `renderer` is undefined until
+  // the line above. A write to `state.lineHeight` in the await window of
+  // `create` therefore reaches neither the argument nor the setter. This
+  // compare carries such a write to the atlas, so the state and the pixels
+  // agree at the end of the window. No caller writes in the window today: the
+  // record that holds the setter reaches `src/font.ts` through `installFont`,
+  // which runs later in this function.
+  if (lineHeight !== startLineHeight) {
+    grid.setLineHeight(lineHeight);
+  }
   const firstFit = grid.fit();
   const vtTerm: VtTerminal = vt.createTerminal(firstFit.cols, firstFit.rows);
 
