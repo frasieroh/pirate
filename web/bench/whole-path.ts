@@ -66,8 +66,12 @@ const WEBGL_ARGS = ["--enable-unsafe-swiftshader"];
  * machine. Headless Chromium reaches no GPU, so `WEBGL_ARGS` is the only way
  * to a WebGL2 context there.
  *
- * The GPU path answers one question of this benchmark: how much of `long task`
- * is the software rasterizer. Use `renderer` below to read which stack ran.
+ * The GPU path answers one question of this benchmark: how much of
+ * `child + wire` is the software rasterizer. Read `main stall` beside it. The
+ * `long task` row answers nothing here, because it counts main thread time
+ * above a 50 ms threshold, and the rasterizer runs off the main thread.
+ *
+ * Use `renderer` below to read which stack ran.
  *
  * ```text
  * cd web && PIRATE_E2E=1 PIRATE_GPU=1 bun test ./bench/whole-path.e2e.ts --timeout 600000

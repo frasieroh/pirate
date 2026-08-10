@@ -335,32 +335,34 @@ of this task, at one canvas size.
 Command:
 `cd web && PIRATE_E2E=1 PIRATE_GPU=1 bun test ./bench/whole-path.e2e.ts --timeout 600000`.
 Child `pager`, 12 size changes per storm, 7 runs. Both runs sat within one
-minute of each other, at a 1-minute load average of 2.3 to 2.6.
+minute of each other, at a 1-minute load average of 2.29 and 2.12.
 
 | Stage | Default path, headless | GPU path, headed |
 |---|---|---|
 | renderer | ANGLE (Google, Vulkan 1.3.0 SwiftShader Device) | ANGLE (Apple, ANGLE Metal Renderer: Apple M5) |
-| debounce | 54.1 ms | 51.8 ms |
-| child + wire | 59.9 ms | 11.0 ms |
-| of that, browser long task | 55.0 ms | 0.0 ms |
-| of that, main-thread stall | 55.4 ms | 6.6 ms |
+| debounce | 53.0 ms, p95 54.6 ms | 52.0 ms, p95 52.8 ms |
+| child + wire | 51.4 ms, p95 56.7 ms | 9.0 ms, p95 16.2 ms |
 | stream | 0.1 ms | 0.1 ms |
-| paint | 3.0 ms | 4.0 ms |
-| TOTAL | 116.8 ms, p95 125.1 ms | 66.9 ms, p95 75.4 ms |
+| paint | 3.7 ms, p95 7.1 ms | 4.4 ms, p95 7.0 ms |
+| TOTAL | 108.5 ms, p95 117.0 ms | 66.8 ms, p95 75.9 ms |
 
 **Software** for the first column, **GPU** for the second.
 
-The browser long task is a property of the software rasterizer. It falls from
-55.0 ms to 0.0 ms on the GPU. About 55 ms of every headless figure in this
-document is an artifact of the rasterizer, and not a cost that the operator
-pays.
+The real GPU removes 41.7 ms of the total, 108.5 ms down to 66.8 ms. The stage
+that carries it is `child + wire`, 51.4 ms down to 9.0 ms.
 
-The main thread still stalls 6.6 ms on the GPU. The long task is 0 ms there,
-and the stall is not. The long task observer reports nothing under a 50 ms
-task. Read the main-stall row, and not the long-task row alone, when a stall
-sits near 50 ms.
+CAUTION: this table gives no `long task` row. The browser reports a long task
+only above a 50 ms threshold of main-thread time, and the software rasterizer
+runs on the raster and compositor threads, so the row reads 0.0 ms on both
+paths on an idle machine. A `long task` figure from this task is not evidence.
+The `main stall` row is not independent evidence either: `widestGap` seeds its
+marks with the window edges, so the stall is always bounded above by
+`child + wire`.
 
-On the GPU the largest single stage is the debounce, 51.8 ms of a 66.9 ms
+About 42 ms of every headless figure in this document is an artifact of the
+software rasterizer, and not a cost that the operator pays.
+
+On the GPU the largest single stage is the debounce, 52.0 ms of a 66.8 ms
 total.
 
 ### The flicker

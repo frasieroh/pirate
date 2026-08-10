@@ -41,9 +41,17 @@
  * cd web && PIRATE_E2E=1 PIRATE_GPU=1 bun test ./bench/whole-path.e2e.ts --timeout 600000
  * ```
  *
- * The `long task` row holds the compositor, so the two paths give different
- * numbers there. Each report prints the renderer string of the run. Read that
- * string before you read the numbers.
+ * Read `child + wire` and `main stall` to compare the two paths. The software
+ * rasterizer adds its time there.
+ *
+ * Do not read `long task` for this comparison. The browser reports a long task
+ * only above 50 ms, so the row is a step and not a measurement. It reads
+ * 0.0 ms on both paths on an idle machine, and it jumps to about 55 ms on a
+ * busy one. The rasterizer runs off the main thread, and a long task counts
+ * main thread time alone.
+ *
+ * Each report prints the renderer string of the run. Read that string before
+ * you read the numbers.
  *
  * # The stages
  *
