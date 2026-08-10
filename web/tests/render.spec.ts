@@ -77,6 +77,44 @@ interface Sample {
   fy?: number;
 }
 
+/** One simulated resize storm, with the output that ran beside it. */
+interface StormOptions {
+  /** Size changes of the container. */
+  steps: number;
+  /** Lines that the flood writes before and after each size change. */
+  linesPerStep: number;
+  /** Paints after the last size change. Each one writes lines and draws. */
+  settleSteps: number;
+}
+
+/** What one simulated resize storm left behind. */
+interface StormResult {
+  /** The size that the rule of the client computed last, in cells. */
+  sentCols: number;
+  sentRows: number;
+  /** The size of the VT terminal after the storm. */
+  vtCols: number;
+  vtRows: number;
+  /** The size of the grid after the storm. */
+  gridCols: number;
+  gridRows: number;
+  /** The size that `fit` reports for the final container box. */
+  fitCols: number;
+  fitRows: number;
+  /** Lines that the flood wrote. */
+  written: number;
+  /** Marks that the storm wrote at the last row. */
+  marked: number;
+  /** Rows that each paint of a mark wrote. */
+  settlePaints: number[];
+  /** Rows that the paint of the second pattern wrote. */
+  patternPaint: number[];
+  /** The painted color of column 1 of each row, after that paint. */
+  patternColors: number[];
+  /** Each row of the viewport, with the trailing blanks removed. */
+  text: string[];
+}
+
 /** The page-side API that `install` puts on `globalThis`. */
 interface GridApi {
   make(options: {
@@ -90,6 +128,7 @@ interface GridApi {
   draw(): void;
   drawAndSample(samples: Sample[]): number[];
   cellSignature(col: number, row: number): number;
+  storm(options: StormOptions): StormResult;
   call(name: string, args?: unknown[]): unknown;
   state(): {
     containerChildren: string[];
@@ -307,6 +346,165 @@ async function install(where: Page): Promise<void> {
           hash = Math.imul(hash ^ data[i], 16777619);
         }
         return hash >>> 0;
+      };
+
+      /**
+       * The painted color at the center of one cell of each row.
+       *
+       * This paints nothing. The caller draws first. The origin of `readPixels`
+       * is the bottom left corner, so the conversion is
+       * `glY = canvas.height - 1 - topY`.
+       */
+      box.rowColors = (col: number): number[] => {
+        const gl = context();
+        const canvas = box.canvas as HTMLCanvasElement;
+        const rows = box.grid.rows as number;
+        const cellWidth = canvas.width / (box.grid.cols as number);
+        const cellHeight = canvas.height / rows;
+        const pixel = new Uint8Array(4);
+        const out: number[] = [];
+        for (let row = 0; row < rows; row += 1) {
+          const x = Math.floor((col + 0.5) * cellWidth);
+          const top = Math.floor((row + 0.5) * cellHeight);
+          gl.readPixels(
+            x,
+            canvas.height - 1 - top,
+            1,
+            1,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            pixel,
+          );
+          out.push((pixel[0] << 16) | (pixel[1] << 8) | pixel[2]);
+        }
+        return out;
+      };
+
+      /** The character of one cell, as `symbolOf` of the module builds it. */
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const symbolOf = (cell: any, x: number, y: number): string => {
+        if (cell.width === 0) {
+          return "";
+        }
+        if (cell.graphemeLength > 0) {
+          return box.term.getGraphemeString(x, y) as string;
+        }
+        return cell.codepoint === 0 ? " " : String.fromCodePoint(cell.codepoint);
+      };
+
+      /**
+       * Run one resize storm with a flood of output beside it.
+       *
+       * Each step takes the rule of the client: read `fit`, then give the same
+       * size to the VT terminal and to the grid. `applyFit` of `src/main.ts`
+       * and `resize` of `src/terminal.ts` hold that rule. The flood writes
+       * before the size change and after it, so a line lands on both sides of
+       * every resize.
+       *
+       * A mark is a write at the last row with no line feed. It scrolls
+       * nothing, so it makes one row dirty and the paint that follows it takes
+       * the dirty-row path. A mark closes each step and each settle step, so
+       * the canvas that the hashes read is the work of that path at the size
+       * that the storm ended with.
+       */
+      box.storm = (options: {
+        steps: number;
+        linesPerStep: number;
+        settleSteps: number;
+      }): unknown => {
+        const grid = box.grid;
+        const term = box.term;
+        const container = box.container as HTMLElement;
+        let written = 0;
+        const flood = (): void => {
+          let text = "";
+          for (let line = 0; line < options.linesPerStep; line += 1) {
+            written += 1;
+            text += `\u001b[2K\u001b[3${(written % 7) + 1}mline ${written}\u001b[0m\r\n`;
+          }
+          if (text.length > 0) {
+            term.write(text);
+          }
+        };
+
+        let marked = 0;
+        const settlePaints: number[] = [];
+        const mark = (): void => {
+          marked += 1;
+          const home = `\u001b[${term.rows};1H`;
+          term.write(`${home}\u001b[2Kmark ${marked}${home}`);
+          grid.draw(term);
+          settlePaints.push((grid.lastDrawnRows as readonly number[]).length);
+        };
+
+        let sent = { cols: grid.cols as number, rows: grid.rows as number };
+        for (let step = 1; step <= options.steps; step += 1) {
+          flood();
+          grid.draw(term);
+          container.style.width = `${600 - step * 24}px`;
+          container.style.height = `${400 - step * 16}px`;
+          const dims = grid.fit() as { cols: number; rows: number };
+          if (dims.cols !== term.cols || dims.rows !== term.rows) {
+            term.resize(dims.cols, dims.rows);
+            grid.resize(dims.cols, dims.rows);
+          }
+          sent = dims;
+          flood();
+          grid.draw(term);
+          mark();
+        }
+        for (let step = 0; step < options.settleSteps; step += 1) {
+          mark();
+        }
+
+        const viewport = term.getViewport();
+        const text: string[] = [];
+        for (let y = 0; y < term.rows; y += 1) {
+          let line = "";
+          for (let x = 0; x < term.cols; x += 1) {
+            line += symbolOf(viewport[y * term.cols + x], x, y);
+          }
+          text.push(line.replace(/[ ]+$/, ""));
+        }
+
+        // The pattern fills every row with full blocks, one color for each
+        // row. The second write takes the even rows to color 7 alone, so the
+        // paint that follows it writes those rows and no other one. The colors
+        // that the canvas then holds are the colors of the terminal, cell for
+        // cell, at the size that the storm ended with.
+        const blocks = "█".repeat(term.cols as number);
+        let first = "";
+        for (let row = 1; row <= term.rows; row += 1) {
+          first += `\u001b[${row};1H\u001b[3${((row - 1) % 6) + 1}m${blocks}\u001b[0m`;
+        }
+        term.write(first);
+        grid.draw(term);
+        let second = "";
+        for (let row = 1; row <= term.rows; row += 2) {
+          second += `\u001b[${row};1H\u001b[37m${blocks}\u001b[0m`;
+        }
+        term.write(second);
+        grid.draw(term);
+        const patternPaint = Array.from(grid.lastDrawnRows as readonly number[]);
+        const patternColors = box.rowColors(1) as number[];
+
+        const fit = grid.fit() as { cols: number; rows: number };
+        return {
+          sentCols: sent.cols,
+          sentRows: sent.rows,
+          vtCols: term.cols,
+          vtRows: term.rows,
+          gridCols: grid.cols,
+          gridRows: grid.rows,
+          fitCols: fit.cols,
+          fitRows: fit.rows,
+          written,
+          marked,
+          settlePaints,
+          text,
+          patternPaint,
+          patternColors,
+        };
       };
 
       box.call = (name: string, args: unknown[] = []): unknown => {
@@ -1207,6 +1405,113 @@ describe("the theme", () => {
           .canvas.id,
     );
     expect(canvasAfter).toBe(canvasBefore);
+  });
+});
+
+// ============================================================================
+// The resize storm
+// ============================================================================
+
+/**
+ * A drag of the window, with output that arrives while the drag runs.
+ *
+ * `storm` of the page-side API takes the rule of the client for each size
+ * change: read `fit`, then give the same size to the VT terminal and to the
+ * grid. The flood writes numbered lines before each size change and after it.
+ *
+ * The client of `src/main.ts` holds a debounce, so it applies one size per
+ * drag. This storm applies a size for every step, which is the harder input:
+ * the renderer takes 12 grid sizes and 12 canvas sizes while the flood runs.
+ */
+describe("the resize storm", () => {
+  /** Size changes of one storm. */
+  const STEPS = 12;
+
+  /** Lines that the flood writes on each side of one size change. */
+  const LINES_PER_STEP = 3;
+
+  /** Paints after the last size change. These take the dirty-row path. */
+  const SETTLE_STEPS = 4;
+
+  /** Run one storm on a fresh grid of 60 by 23 cells. */
+  async function storm(): Promise<StormResult> {
+    await make(60, 23);
+    return page.evaluate(
+      (options: StormOptions) =>
+        (globalThis as unknown as { __grid: GridApi }).__grid.storm(options) as never,
+      { steps: STEPS, linesPerStep: LINES_PER_STEP, settleSteps: SETTLE_STEPS },
+    );
+  }
+
+  test("a flood during a storm drops no line of output", async () => {
+    const result = await storm();
+
+    // The flood ends every line with CR LF, so the flood alone leaves the last
+    // row empty. The last mark of the storm holds that row.
+    expect(result.text[result.text.length - 1]).toBe(`mark ${result.marked}`);
+
+    const lines = result.text.slice(0, -1);
+    expect(lines.length).toBe(result.gridRows - 1);
+    for (const line of lines) {
+      expect(line).toMatch(/^line \d+$/);
+    }
+
+    // The numbers run without a gap, and the last line that the flood wrote is
+    // on the screen. A dropped write breaks one of the two.
+    const numbers = lines.map((line) => Number(line.slice("line ".length)));
+    expect(numbers[numbers.length - 1]).toBe(result.written);
+    for (let i = 1; i < numbers.length; i += 1) {
+      expect(numbers[i]).toBe(numbers[i - 1] + 1);
+    }
+  });
+
+  test("a flood during a storm corrupts no row of the canvas", async () => {
+    const result = await storm();
+
+    // Every paint of a mark took the dirty-row path. A paint that wrote every
+    // row would hide a fault of that path.
+    expect(result.settlePaints.length).toBe(STEPS + SETTLE_STEPS);
+    expect(Math.max(...result.settlePaints)).toBeLessThan(result.gridRows);
+
+    // The last paint of the pattern wrote the even rows. It wrote fewer rows
+    // than the grid holds, so it took the dirty-row path.
+    const even = result.patternColors.map((_, row) => row).filter((row) => row % 2 === 0);
+    for (const row of even) {
+      expect(result.patternPaint).toContain(row);
+    }
+    expect(result.patternPaint.length).toBeLessThan(result.gridRows);
+
+    // Each row of the canvas holds the color that the cell of that row holds.
+    // A stale row, a row at an old position, and a canvas at an old size each
+    // break one of these colors.
+    const named = [THEME.red, THEME.green, THEME.yellow, THEME.blue, THEME.magenta, THEME.cyan];
+    const expected = result.patternColors.map((_, row) =>
+      row % 2 === 0 ? THEME.white : named[row % 6],
+    );
+    expect(result.patternColors.length).toBe(result.gridRows);
+    expect(result.patternColors.map(show)).toEqual(expected);
+  });
+
+  test("the grid size, the sent size, and the VT size agree after a storm", async () => {
+    const result = await storm();
+
+    // The size that the client rule computed last is the size of the VT
+    // terminal and the size of the grid.
+    expect({ cols: result.vtCols, rows: result.vtRows }).toEqual({
+      cols: result.sentCols,
+      rows: result.sentRows,
+    });
+    expect({ cols: result.gridCols, rows: result.gridRows }).toEqual({
+      cols: result.sentCols,
+      rows: result.sentRows,
+    });
+
+    // A `fit` of the final container box gives that same size again, so the
+    // storm left no size change that the client would still have to apply.
+    expect({ cols: result.fitCols, rows: result.fitRows }).toEqual({
+      cols: result.sentCols,
+      rows: result.sentRows,
+    });
   });
 });
 

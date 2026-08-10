@@ -143,14 +143,14 @@ test("a DECRQM query reports the state of the mode", async () => {
   const stub = server();
 
   await withClient(async () => {
-    // Mode 2004 is off in a new terminal, and the engine holds one boolean
-    // for a mode, so the answer is 0, "mode not recognized". The same query
+    // Mode 2004 is bracketed paste, which `src/input.ts:231` honors. It is
+    // off in a new terminal, so the answer is 2, "reset". The same query
     // after the set reports 1.
     stub.send([{ tag: 0x00, text: `${ESC}[?2004$p` }]);
-    expect(await waitForInput(stub, 1)).toEqual([`${ESC}[?2004;0$y`]);
+    expect(await waitForInput(stub, 1)).toEqual([`${ESC}[?2004;2$y`]);
     stub.send([{ tag: 0x00, text: `${ESC}[?2004h${ESC}[?2004$p` }]);
     expect(await waitForInput(stub, 2)).toEqual([
-      `${ESC}[?2004;0$y`,
+      `${ESC}[?2004;2$y`,
       `${ESC}[?2004;1$y`,
     ]);
   });

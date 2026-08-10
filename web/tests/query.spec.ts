@@ -126,19 +126,42 @@ describe("the queries that the scanner leaves open", () => {
 });
 
 describe("DECRQM", () => {
-  test("a set mode reports 1", () => {
+  // The answer reports 1 or 2 for a mode that this client honors, and 0,
+  // "mode not recognized", for every other mode. `HONORED_MODES` in
+  // `src/vt/query.ts` names the evidence in the client for each entry.
+
+  test("the cursor key mode reports 1 when it is set", () => {
+    // DEC mode 1, DECCKM. `src/vt/terminal.ts:539` reads it for each key.
+    expect(answers(`${ESC}[?1$p`, context([1]))).toEqual([`${ESC}[?1;1$y`]);
+  });
+
+  test("the cursor key mode reports 2 when it is reset", () => {
+    expect(answers(`${ESC}[?1$p`)).toEqual([`${ESC}[?1;2$y`]);
+  });
+
+  test("bracketed paste reports 1 when it is set", () => {
+    // DEC mode 2004. `src/input.ts:231` wraps a paste when it is set.
     expect(answers(`${ESC}[?2004$p`, context([2004]))).toEqual([`${ESC}[?2004;1$y`]);
   });
 
-  test("a mode that the terminal does not hold reports 0", () => {
-    // 0 is "mode not recognized". The engine gives one boolean for a mode, so
-    // a reset mode and an unknown mode cannot be told apart.
+  test("bracketed paste reports 2 when it is reset", () => {
+    expect(answers(`${ESC}[?2004$p`)).toEqual([`${ESC}[?2004;2$y`]);
+  });
+
+  test("a mode that the client does not honor reports 0", () => {
+    // The engine holds mode 2026, synchronized output, but no code under
+    // `src/` reads it. An answer of 1 or 2 would name a capability that the
+    // renderer does not have.
+    expect(answers(`${ESC}[?2026$p`, context([2026]))).toEqual([`${ESC}[?2026;0$y`]);
+  });
+
+  test("a mode that no terminal holds reports 0", () => {
     expect(answers(`${ESC}[?12345$p`)).toEqual([`${ESC}[?12345;0$y`]);
   });
 
   test("the answer carries the mode of the query", () => {
-    expect(answers(`${ESC}[?1049$p`, context([1049, 2004]))).toEqual([
-      `${ESC}[?1049;1$y`,
+    expect(answers(`${ESC}[?2004$p`, context([1, 2004]))).toEqual([
+      `${ESC}[?2004;1$y`,
     ]);
   });
 

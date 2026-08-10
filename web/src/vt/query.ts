@@ -41,11 +41,10 @@
  * DA1, `ESC [ c` and `ESC [ 0 c`, gets `ESC [ ? 62 ; 22 c`. 62 is the VT220
  * class and 22 is ANSI color.
  *
- * DECRQM, `ESC [ ? Ps $ p`, gets `ESC [ ? Ps ; Pm $ y`. Pm is 1, "set", when
- * `isModeSet` answers true. Pm is 0, "mode not recognized", for every other
- * mode. `ghostty_terminal_get_mode` gives one boolean, so a mode that is
- * reset and a mode that the module does not hold give the same value, and 0
- * is the truthful report of that ignorance.
+ * DECRQM, `ESC [ ? Ps $ p`, gets `ESC [ ? Ps ; Pm $ y`. `HONORED_MODES` holds
+ * the modes that this client honors. For a mode on that list, Pm is 1 when
+ * `isModeSet` answers true and 2, "reset", when it answers false. For every
+ * other mode Pm is 0, "mode not recognized".
  *
  * OSC 11, `ESC ] 11 ; ?`, gets the background of the theme, in the
  * `rgb:rrrr/gggg/bbbb` form of xterm, with the terminator of the query. The
@@ -135,6 +134,34 @@ const OSC_MAX = 4096;
 /** The answer for DA1: a VT220 with ANSI color. */
 export const DA1_ANSWER = "\x1b[?62;22c";
 
+/**
+ * The DEC private modes that this client honors.
+ *
+ * A mode gets an entry only when code under `web/src/` changes behavior with
+ * it. The comment on each entry names that code. A mode that the wasm engine
+ * holds, and that no client code reads, gets no entry: an answer of "set" or
+ * "reset" for such a mode names a capability that this client does not have,
+ * and a program then uses a feature that the client drops.
+ *
+ * DECRQM reports 1 or 2 for a mode on this list. It reports 0, "mode not
+ * recognized", for every other mode.
+ */
+const HONORED_MODES: ReadonlySet<number> = new Set([
+  // DECCKM, the application form of the cursor keys. `src/vt/terminal.ts:539`
+  // reads it before each key encode and gives it to the key encoder.
+  1,
+  // Bracketed paste. `src/input.ts:231` wraps a paste with the markers
+  // `ESC [ 200 ~` and `ESC [ 201 ~` when the mode is set.
+  2004,
+]);
+
+/** "set". */
+const MODE_SET = 1;
+/** "reset". */
+const MODE_RESET = 2;
+/** "mode not recognized". */
+const MODE_UNKNOWN = 0;
+
 /** Where the scanner is in the byte stream. */
 enum State {
   /** Outside a sequence. */
@@ -158,8 +185,8 @@ export interface QueryContext {
   /**
    * True when the DEC private mode `mode` is set.
    *
-   * A mode that the terminal does not hold gives false, and DECRQM then
-   * reports "mode not recognized".
+   * `answerOf` calls this for a mode on `HONORED_MODES` alone. A mode that
+   * the terminal does not hold gives false.
    */
   isModeSet(mode: number): boolean;
 
@@ -201,15 +228,21 @@ export function answerOf(query: Query, context: QueryContext): string | null {
   switch (query.kind) {
     case "da1":
       return DA1_ANSWER;
-    case "decrqm": {
-      const value = context.isModeSet(query.mode) ? 1 : 0;
-      return `\x1b[?${query.mode};${value}$y`;
-    }
+    case "decrqm":
+      return `\x1b[?${query.mode};${valueOfMode(query.mode, context)}$y`;
     case "osc11": {
       const color = rgbOfHex(context.background());
       return color === null ? null : `\x1b]11;${color}${query.terminator}`;
     }
   }
+}
+
+/** The DECRPM value for one DEC private mode. */
+function valueOfMode(mode: number, context: QueryContext): number {
+  if (!HONORED_MODES.has(mode)) {
+    return MODE_UNKNOWN;
+  }
+  return context.isModeSet(mode) ? MODE_SET : MODE_RESET;
 }
 
 export class QueryScanner {
